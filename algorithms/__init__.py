@@ -29,6 +29,8 @@ _ALGORITHM_METADATA = {
         "RMVPEPitchAlgorithm",
         ["torch"],
     ),
+    "DIO": ("dio", "DIOPitchAlgorithm", ["pyworld"]),
+    "Harvest": ("harvest", "HarvestPitchAlgorithm", ["pyworld"]),
 }
 
 # The _REGISTRY now acts as a cache for lazily loaded algorithms.
