@@ -117,6 +117,8 @@ The benchmark includes implementations of these algorithms:
 - [YAAPT](https://bjbschmitt.github.io/AMFM_decompy/pYAAPT.html) - Yet Another Algorithm for Pitch Tracking
 - [RAPT](https://pysptk.readthedocs.io/en/latest/generated/pysptk.sptk.rapt.html) - Robust Algorithm for Pitch Tracking
 - [SWIPE](https://pysptk.readthedocs.io/en/latest/generated/pysptk.sptk.swipe.html) - Sawtooth Waveform Inspired Pitch Estimator
+- [DIO](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder) - Distributed Inline-filter Operation: multi-band zero-crossing F0 estimator from the WORLD vocoder (via pyworld), with StoneMask refinement
+- [Harvest](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder) - High-performance F0 estimator using band-pass filter candidates refined with instantaneous frequency and contour smoothing (via pyworld)
 
 ## 🤝 Contributing
 
