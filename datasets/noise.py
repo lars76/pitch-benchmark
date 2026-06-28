@@ -2,6 +2,7 @@ import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torchaudio
 
@@ -18,8 +19,10 @@ class CHiMeNoiseDataset(torch.utils.data.Dataset):
         chime_noise_ratio_range: Tuple[float, float] = (0.0, 1.0),
         power_threshold: float = 1e-8,
         fallback_snr_db: float = -35.0,
+        seed: int = 0,
         **kwargs,
     ):
+        self.seed = int(seed)
         self.base_dataset = base_dataset
         self.background_snr_range = background_snr_range
         self.voice_gain_range = voice_gain_range
@@ -40,7 +43,7 @@ class CHiMeNoiseDataset(torch.utils.data.Dataset):
 
         # Find matching files
         suffix = f".{chime_sample_rate // 1000}kHz.wav"
-        chime_files = list(chunks_dir.rglob(f"*{suffix}"))
+        chime_files = sorted(chunks_dir.rglob(f"*{suffix}"))   # sorted -> deterministic cache order
 
         if not chime_files:
             raise ValueError(f"No CHiME files found with suffix {suffix}")
@@ -58,7 +61,7 @@ class CHiMeNoiseDataset(torch.utils.data.Dataset):
                 noise_dir = Path(noise_dir)
                 if not noise_dir.exists():
                     raise ValueError(f"Noise directory not found: {noise_dir}")
-                noise_files = list(noise_dir.rglob("*.wav"))
+                noise_files = sorted(noise_dir.rglob("*.wav"))
                 if noise_files:
                     self._load_noise_files(noise_files)
 
@@ -66,8 +69,8 @@ class CHiMeNoiseDataset(torch.utils.data.Dataset):
             raise RuntimeError("No noise files available after loading")
 
         # Initialize noise selection
-        self.available_noise_indices = list(range(len(self.noise_cache)))
-        random.shuffle(self.available_noise_indices)
+        self._noise_perm = list(range(len(self.noise_cache)))
+        random.Random(self.seed).shuffle(self._noise_perm)
 
     def __len__(self):
         return len(self.base_dataset)
@@ -95,27 +98,25 @@ class CHiMeNoiseDataset(torch.utils.data.Dataset):
             except Exception as e:
                 print(f"Error loading {path}: {str(e)}")
 
-    def _get_mixed_noise(self, target_length: int) -> torch.Tensor:
-        """Get mixed CHiME + Gaussian noise with configurable ratio"""
+    def _get_mixed_noise(
+        self, target_length: int, idx: int, rng: random.Random, gen: torch.Generator
+    ) -> torch.Tensor:
+        """Get mixed CHiME + Gaussian noise (per-sample-deterministic via rng/gen)."""
         if target_length <= 0:
             return torch.empty(0)
 
-        if not self.available_noise_indices:
-            self.available_noise_indices = list(range(len(self.noise_cache)))
-            random.shuffle(self.available_noise_indices)
-
-        noise_idx = self.available_noise_indices.pop()
+        noise_idx = self._noise_perm[idx % len(self._noise_perm)]
         chime_noise = self._get_noise_segment(
-            self.noise_cache[noise_idx], target_length
+            self.noise_cache[noise_idx], target_length, rng
         )
 
-        gaussian_noise = torch.randn(target_length)
+        gaussian_noise = torch.randn(target_length, generator=gen)
         if target_length > 1:
             power = gaussian_noise.pow(2).mean()
             if power > self.power_threshold:
                 gaussian_noise = gaussian_noise / power.sqrt()
 
-        chime_ratio = random.uniform(*self.chime_noise_ratio_range)
+        chime_ratio = rng.uniform(*self.chime_noise_ratio_range)
         mixed_noise = (
             torch.sqrt(torch.tensor(chime_ratio)) * chime_noise
             + torch.sqrt(torch.tensor(1 - chime_ratio)) * gaussian_noise
@@ -161,8 +162,16 @@ class CHiMeNoiseDataset(torch.utils.data.Dataset):
         if audio.dim() > 1:
             audio = audio.squeeze(0)
 
+        # Per-sample RNGs from SeedSequence(seed, idx): noise is a pure function of (seed, idx),
+        # so it is reproducible and worker-safe.
+        py_seed, torch_seed = (
+            int(x) for x in np.random.SeedSequence([self.seed, int(idx)]).generate_state(2, dtype=np.uint32)
+        )
+        rng = random.Random(py_seed)
+        gen = torch.Generator().manual_seed(torch_seed)
+
         # Apply random voice gain
-        voice_gain_db = random.uniform(*self.voice_gain_range)
+        voice_gain_db = rng.uniform(*self.voice_gain_range)
         voice_scale = 10 ** (voice_gain_db / 20)
         audio = audio * voice_scale
 
@@ -174,9 +183,9 @@ class CHiMeNoiseDataset(torch.utils.data.Dataset):
             return sample
 
         # Apply background noise
-        background_noise = self._get_mixed_noise(chunk_length)
+        background_noise = self._get_mixed_noise(chunk_length, int(idx), rng, gen)
         if background_noise.numel() > 0:
-            background_snr = random.uniform(*self.background_snr_range)
+            background_snr = rng.uniform(*self.background_snr_range)
             audio = self._apply_voice_aware_snr(
                 audio, background_noise, background_snr, periodicity
             )
@@ -193,7 +202,7 @@ class CHiMeNoiseDataset(torch.utils.data.Dataset):
         return sample
 
     def _get_noise_segment(
-        self, noise: torch.Tensor, target_length: int
+        self, noise: torch.Tensor, target_length: int, rng: random.Random
     ) -> torch.Tensor:
         """Extract noise segment without redundant normalization"""
         if target_length <= 0:
@@ -201,7 +210,7 @@ class CHiMeNoiseDataset(torch.utils.data.Dataset):
 
         noise_len = noise.size(0)
         if noise_len >= target_length:
-            start = random.randint(0, noise_len - target_length)
+            start = rng.randint(0, noise_len - target_length)
             return noise[start : start + target_length]
         else:
             # Repeat noise to cover target length

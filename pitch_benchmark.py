@@ -401,6 +401,7 @@ if __name__ == "__main__":
         chime_home_dir=args.chime_dir,
         background_snr_range=(args.snr_min, args.snr_max),
         voice_gain_range=(args.voice_gain_min, args.voice_gain_max),
+        seed=args.seed,   # per-sample deterministic noise = f(seed, idx)
     )
 
     for algo_name in args.algorithms:
