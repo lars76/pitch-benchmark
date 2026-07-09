@@ -1,0 +1,150 @@
+[project]
+name = "pitch-benchmark"
+version = "0.1.0"
+description = "Benchmark for monophonic pitch-detection algorithms."
+readme = "README.md"
+license = "MIT"                 # SPDX expression (PEP 639)
+license-files = ["LICENSE"]
+authors = [{ name = "Lars Nieradzik", email = "l.nieradzik@gmail.com" }]
+requires-python = ">=3.10,<3.11"
+# NOTE: pinned to Python 3.10 on purpose. basic-pitch forces tensorflow<2.15.1 on
+# Python >=3.11 (Linux), which conflicts with the TF 2.19 that CREPE/SPICE need; on 3.10
+# it uses tflite-runtime/coremltools instead and imposes no TF pin. 3.10 is also what the
+# original frozen environment used (tflite-runtime cp310).
+dependencies = [
+    # core / reporting
+    "numpy",
+    "scipy",
+    "pandas",
+    "matplotlib",
+    "tqdm",
+    "tabulate",
+    # audio I/O + DSP (datasets, plus the pYIN and RMVPE trackers)
+    "librosa",
+    "soundfile",
+    "resampy",
+    # torch stack (GPU backend selected per-platform below: CUDA on Linux, MPS/CPU on macOS).
+    # Every dataset needs torch (datasets/base.py); RMVPE and TorchCREPE build on it.
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    # pysptk / pyworld / torchcrepe / tensorflow-hub import pkg_resources at runtime,
+    # which setuptools 81 removed -> keep setuptools<81 in the runtime env.
+    "setuptools<81",
+    "pyroomacoustics>=0.10.1",
+]
+
+[project.optional-dependencies]
+# One extra per algorithm backend; the extra name matches the algorithms/ module, so the runtime
+# install hint ("uv sync --extra <name>") is correct by construction. pYIN (librosa) and RMVPE
+# (torch) are covered by the core above and need no extra.
+#   A few algorithms: uv sync --extra dio --extra swipe
+#   Full benchmark:   uv sync --all-extras            (or: uv sync --extra all)
+# tensorflow stays CPU on every platform on purpose: tensorflow[and-cuda] and torch's CUDA wheels
+# disagree on nvidia-* versions and cannot co-resolve; CREPE/SPICE are tiny, so CPU TF is fine.
+# NOTE: do not add a [tool.uv] conflicts entry for basicpitch vs crepe/spice. On Python 3.10 (our
+# pin) basic-pitch uses tflite/coreml and pulls no TensorFlow, so they coexist; a conflicts
+# declaration is unconditional and would needlessly break --all-extras here.
+crepe      = ["crepe", "tensorflow>=2.19", "hmmlearn"]
+spice      = ["tensorflow>=2.19", "tensorflow-hub"]
+torchcrepe = ["torchcrepe"]
+# penn 1.0.0 pulls torbi, whose macOS MPS backend fails to compile and crashes on import;
+# 0.0.14 (the original pinned version) has no torbi and works on macOS + Linux/CUDA.
+penn       = ["penn==0.0.14"]
+praat      = ["praat-parselmouth"]
+rapt       = ["pysptk"]
+reaper     = ["pyreaper"]
+swipe      = ["pysptk"]
+yaapt      = ["amfm-decompy"]
+# basic-pitch pulls only coremltools (macOS) / tflite-runtime (Linux), but algorithms/basicpitch.py
+# loads the ONNX model (Model(FilenameSuffix.onnx)), so onnxruntime must be requested explicitly --
+# otherwise `uv sync --extra basicpitch` builds an env where BasicPitch fails at construction.
+basicpitch = ["basic-pitch", "onnxruntime"]
+swiftf0    = ["swift-f0"]
+dio        = ["pyworld"]
+harvest    = ["pyworld"]
+# Dataset extra (not an algorithm backend; whitelisted in tests/test_algorithm_extras.py):
+# SpeechSynth's exact_f0 resynthesis (datasets/speechsynth.py) drives WORLD's synthesizer with the
+# label contour, so it needs pyworld even when the DIO/Harvest trackers are not installed.
+speechsynth = ["pyworld"]
+# Full benchmark: every backend at once (reproduces the original flat dependency set).
+all = [
+    "torchcrepe",
+    "tensorflow>=2.19",
+    "tensorflow-hub",
+    "crepe",
+    "hmmlearn",
+    "basic-pitch",
+    "onnxruntime",
+    "penn==0.0.14",
+    "praat-parselmouth",
+    "swift-f0",
+    "pysptk",
+    "pyworld",
+    "pyreaper",
+    "amfm-decompy",
+]
+
+[tool.uv]
+package = false
+# Resolve only for the two real targets (Apple-Silicon dev + Linux/CUDA box).
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+# PyTorch backends:
+#  - Linux  -> CUDA 12.6 wheels from the PyTorch index.
+#  - macOS  -> fall back to PyPI, whose macOS wheels are CPU + MPS (no separate MPS wheel exists;
+#              PyTorch publishes no CUDA build for macOS).
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+# Legacy sdist-only packages with undeclared build dependencies. setuptools<81 is required
+# because 81 removed pkg_resources, which crepe's setup.py imports at build time.
+[tool.uv.extra-build-dependencies]
+crepe = ["setuptools<81"]
+amfm-decompy = ["setuptools<81", "numpy"]
+pysptk = ["setuptools<81", "numpy", "cython"]
+pyworld = ["setuptools<81", "numpy", "cython"]
+pyreaper = ["setuptools<81", "numpy", "cython"]
+
+[dependency-groups]
+# Test tooling. Kept OUT of [project.optional-dependencies] on purpose: the conformance test treats
+# every extra except `all` as an algorithm backend, so a "test" extra there would fail it. uv syncs
+# the `dev` group by default, so `uv run pytest tests/` works after a plain `uv sync`.
+# tomli backports tomllib (stdlib only on Python >= 3.11; this project pins 3.10).
+dev = ["pytest", "mir-eval", "tomli"]
+
+# --------------------------------------------------------------------------- #
+# Ruff: linter + formatter config (run `uvx ruff check .` / `uvx ruff format .`).
+# Makes linting reproducible; line-length matches the codebase (p90 ~82, dense comments to ~100).
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+line-length = 120   # the codebase uses dense single-line comments (p99 ~103); 120 gives headroom
+target-version = "py310"
+
+[tool.ruff.lint]
+# Explicit select (not ALL) so a ruff upgrade never silently enables new rules.
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "PIE", "RUF"]
+ignore = [
+    "RUF001", "RUF002", "RUF003",  # ambiguous-unicode: the ×, ->, and -- in comments/report text are intentional
+    "B905",                         # zip(strict=): the paired arrays are invariant-equal-length by construction here
+    "SIM108",                       # if/else -> ternary: the explicit blocks carry per-branch inline comments here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"generate_report.py" = ["E501"]   # long human-readable dataset/methodology prose strings in the report
+"tests/*" = ["E501", "E402"]      # long assertion lines; imports intentionally follow sys.path.insert
+"scripts/*" = ["E402"]            # imports intentionally follow sys.path.insert (run as scripts)
+"__init__.py" = ["F401"]          # re-export surfaces
+
+[tool.pytest.ini_options]
+# pyworld (DIO/Harvest) and pyreaper (REAPER) import the deprecated pkg_resources at import time; we
+# already pin setuptools<81 so it still works, so this warning is benign noise -- silence just it.
+filterwarnings = ["ignore:pkg_resources is deprecated:UserWarning"]

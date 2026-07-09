@@ -1,4 +1,3 @@
-from typing import Tuple
 
 import amfm_decompy.basic_tools as basic
 import amfm_decompy.pYAAPT as pYAAPT
@@ -8,7 +7,18 @@ from .base import ThresholdPitchAlgorithm
 
 
 class YAAPTPitchAlgorithm(ThresholdPitchAlgorithm):
-    """YAAPT pitch detection algorithm implementation."""
+    """YAAPT pitch detection algorithm implementation.
+
+    Timestamps: pYAAPT's `frames_pos` marks the CENTER of each frame_length window, but the
+    timestamp calibration (tests/test_time_calibration.py) shows the reported pitch content sits
+    at a fixed delay after the frame START, independent of frame_length (sweeping frame_length
+    35 -> 45 ms moves the apparent offset by exactly -frame_length/2: -8.65 -> -13.48 ms), i.e.
+    YAAPT's NCCF/spectral evidence is anchored to the front of the analysis window, not its
+    centre. We therefore stamp frame_start + NCCF_CONTENT_DELAY (measured 8.9 ms at 16 kHz and
+    10.3 ms at 22.05 kHz; the 9.6 ms mean leaves <=0.8 ms residual at both rates). Applied per
+    the calibration policy in TIMING.md (chirp -8.65 / step -10.0 agree in sign and magnitude)."""
+
+    NCCF_CONTENT_DELAY = 0.0096  # seconds after the analysis-frame start
 
     def __init__(
         self,
@@ -17,10 +27,7 @@ class YAAPTPitchAlgorithm(ThresholdPitchAlgorithm):
     ):
         super().__init__(**kwargs)
 
-        # Convert frame_length from milliseconds to samples
         self.frame_length_samples = int((frame_length / 1000.0) * self.sample_rate)
-
-        # Calculate frame spacing in milliseconds for YAAPT
         self.frame_space_ms = (self.hop_size / self.sample_rate) * 1000.0
 
         # Configure YAAPT parameters
@@ -51,7 +58,7 @@ class YAAPTPitchAlgorithm(ThresholdPitchAlgorithm):
 
     def _extract_pitch_with_threshold(
         self, audio: np.ndarray, threshold: float
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         # Create signal object for pYAAPT
         signal = basic.SignalObj(audio, self.sample_rate)
 
@@ -64,9 +71,9 @@ class YAAPTPitchAlgorithm(ThresholdPitchAlgorithm):
         # Get pitch values and voicing decisions
         pitch_values = pitch.samp_values
 
-        # use YAAPT’s own frame positions for accurate time stamps
-        # frames_pos is in samples, so divide by sample_rate to get seconds
-        times = np.array(pitch.frames_pos) / self.sample_rate
+        # frames_pos marks window centres; stamp start + measured content delay (class docstring).
+        starts = np.asarray(pitch.frames_pos, dtype=float) - self.frame_length_samples // 2
+        times = starts / self.sample_rate + self.NCCF_CONTENT_DELAY
 
         return (
             times,

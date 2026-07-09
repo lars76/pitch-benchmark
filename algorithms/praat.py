@@ -1,4 +1,3 @@
-from typing import Tuple
 
 import numpy as np
 import parselmouth
@@ -9,7 +8,7 @@ from .base import ContinuousPitchAlgorithm
 class PraatPitchAlgorithm(ContinuousPitchAlgorithm):
     def _extract_raw_pitch_and_periodicity(
         self, audio
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         sound = parselmouth.Sound(audio, self.sample_rate)
         pitch_obj = sound.to_pitch(
             time_step=self.hop_size / self.sample_rate,

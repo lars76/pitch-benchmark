@@ -12,22 +12,22 @@ A comprehensive benchmark suite evaluating pitch detection algorithms across 8 d
 
 ## Overall Results
 
-The table below shows the harmonic-mean accuracy score for each algorithm across the eight benchmark datasets. The average score determines the overall ranking.
+The table below shows the harmonic-mean accuracy score for each algorithm across the seven benchmark datasets. The average score determines the overall ranking.
 
-| **Algorithm** | **Bach10Synth** | **MDBStemSynth** | **MIR1K** | **NSynth** | **PTDB** | **PTDBNoisy** | **SpeechSynth** | **Vocadito** | **Average** |
-|---|---|---|---|---|---|---|---|---|---|
-| **SwiftF0** | 97.5% | 92.0% | 95.0% | **89.3%** | 90.4% | 74.0% | **90.7%** | 92.6% | **90.2%** |
-| RMVPE | 98.1% | 90.6% | **96.0%** | 68.2% | 88.9% | 68.5% | 90.6% | **96.4%** | 87.2% |
-| CREPE | **98.5%** | 90.5% | 95.7% | 80.2% | 79.7% | 53.8% | 88.3% | 95.6% | 85.3% |
-| PENN | 97.3% | **94.0%** | 89.0% | 63.3% | **91.0%** | **76.4%** | 84.8% | 82.4% | 84.8% |
-| Praat | 96.0% | 90.7% | 92.6% | 70.7% | 86.2% | 65.3% | 88.2% | 88.2% | 84.7% |
-| SPICE | 95.0% | 89.4% | 92.7% | 68.8% | 77.8% | 55.9% | 87.9% | 92.3% | 82.5% |
-| TorchCREPE | 96.7% | 85.1% | 71.4% | 83.8% | 78.3% | 61.2% | 79.7% | 89.0% | 80.6% |
-| pYIN | 97.5% | 90.3% | 91.2% | 74.3% | 72.1% | 43.2% | 81.4% | 79.5% | 78.7% |
-| RAPT | 91.9% | 79.6% | 82.4% | 54.6% | 68.4% | 48.9% | 74.3% | 87.5% | 73.5% |
-| SWIPE | 77.8% | 65.6% | 77.1% | 51.4% | 66.6% | 45.0% | 77.1% | 66.6% | 65.9% |
-| YAAPT | 58.5% | 39.6% | 82.0% | 6.4% | 69.8% | 51.7% | 83.5% | 88.6% | 60.0% |
-| BasicPitch | 23.7% | 12.4% | 36.5% | 77.7% | 23.1% | 12.6% | 61.2% | 17.8% | 33.1% |
+| **Algorithm** | **Bach10Synth** | **MDBStemSynth** | **MIR1K** | **NSynth** | **PTDB** | **SpeechSynth** | **Vocadito** | **Average** |
+|---|---|---|---|---|---|---|---|---|
+| **SwiftF0** | 97.5% | 92.0% | 95.0% | **89.3%** | 90.4% | **90.7%** | 92.6% | **90.2%** |
+| RMVPE | 98.1% | 90.6% | **96.0%** | 68.2% | 88.9% | 90.6% | **96.4%** | 87.2% |
+| CREPE | **98.5%** | 90.5% | 95.7% | 80.2% | 79.7% | 88.3% | 95.6% | 85.3% |
+| PENN | 97.3% | **94.0%** | 89.0% | 63.3% | **91.0%** | 84.8% | 82.4% | 84.8% |
+| Praat | 96.0% | 90.7% | 92.6% | 70.7% | 86.2% | 88.2% | 88.2% | 84.7% |
+| SPICE | 95.0% | 89.4% | 92.7% | 68.8% | 77.8% | 87.9% | 92.3% | 82.5% |
+| TorchCREPE | 96.7% | 85.1% | 71.4% | 83.8% | 78.3% | 79.7% | 89.0% | 80.6% |
+| pYIN | 97.5% | 90.3% | 91.2% | 74.3% | 72.1% | 81.4% | 79.5% | 78.7% |
+| RAPT | 91.9% | 79.6% | 82.4% | 54.6% | 68.4% | 74.3% | 87.5% | 73.5% |
+| SWIPE | 77.8% | 65.6% | 77.1% | 51.4% | 66.6% | 77.1% | 66.6% | 65.9% |
+| YAAPT | 58.5% | 39.6% | 82.0% | 6.4% | 69.8% | 83.5% | 88.6% | 60.0% |
+| BasicPitch | 23.7% | 12.4% | 36.5% | 77.7% | 23.1% | 61.2% | 17.8% | 33.1% |
 
 For a detailed breakdown of results, see [Benchmark Report](benchmark_report.md).
 
@@ -35,25 +35,57 @@ For a detailed breakdown of results, see [Benchmark Report](benchmark_report.md)
 
 ### Installation
 
-This project uses [uv](https://docs.astral.sh/uv/pip/environments/) (a fast Python package manager) for dependency management, but `conda` or `pip` will also work.
+This project uses [uv](https://docs.astral.sh/uv/). The torch backend is selected per platform
+automatically (CUDA 12.6 on Linux, CPU/MPS on macOS); TensorFlow runs on CPU. Requires Python 3.10.
+
+Each algorithm backend is an optional extra, so you install only what you want to run:
 
 ```bash
-uv venv --python 3.10
-source .venv/bin/activate
-uv pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match
+uv sync                              # core: all datasets + the pYIN and RMVPE trackers
+uv sync --extra dio --extra swipe    # a few algorithms (one --extra per backend)
+uv sync --all-extras                 # the full benchmark (every algorithm)
 ```
+
+The extra name matches the algorithm; `pYIN` and `RMVPE` are in the core and need no extra:
+
+| extra | algorithm | extra | algorithm |
+|---|---|---|---|
+| `crepe` | CREPE | `swiftf0` | SwiftF0 |
+| `spice` | SPICE | `dio` | DIO |
+| `torchcrepe` | TorchCREPE | `harvest` | Harvest |
+| `penn` | PENN | `rapt` | RAPT |
+| `praat` | Praat | `swipe` | SWIPE |
+| `yaapt` | YAAPT | `basicpitch` | BasicPitch |
+| `reaper` | REAPER | | |
+
+Prefix commands with `uv run` to use the managed environment (e.g. `uv run python ...`).
+
+### Device (CPU / CUDA / MPS)
+
+`pitch_benchmark.py --device {auto,cpu,cuda,mps}` selects the compute device for the neural trackers
+(TorchCREPE, RMVPE, PENN); the DSP/own-runtime trackers always run on CPU. `auto` (the default) picks
+`cuda → mps → cpu`. **cpu/cuda are the reproducible reference** for the leaderboard (`run.sh` pins
+`--device cpu`, or run `DEVICE=cuda ./run.sh` on a CUDA box); **mps is a local speed option** (Apple GPU)
+whose numerics differ slightly (within the 50-cent RPA tolerance). `speed_benchmark.py` defaults to CPU
+only; pass `--devices cpu mps` (or `cuda`) to also time the GPU-capable trackers.
 
 ### Dataset Setup
 
-Download the required datasets:
+**Pitch-annotated datasets** (the clean leaderboard):
 
-- [PTDB-TUG](https://www.spsc.tugraz.at/databases-and-tools/ptdb-tug-pitch-tracking-database-from-graz-university-of-technology.html) - Speech with laryngograph ground truth
-- [NSynth](https://magenta.tensorflow.org/datasets/nsynth) - Synthetic musical instruments
-- [MDB-stem-synth](https://zenodo.org/records/1481172) - Synthetic music stems
-- [MIR-1K](https://zenodo.org/records/3532216) - Vocal excerpts
-- [Vocadito](https://zenodo.org/records/5578807) - Solo vocal recordings
-- [Bach10-mf0-synth](https://zenodo.org/records/1481156/files/Bach10-mf0-syth.tar.gz) - Synthetic Bach compositions
-- [CHiME-Home](https://archive.org/details/chime-home) - Background noise for testing
+- [PTDB-TUG](https://www.spsc.tugraz.at/databases-and-tools/ptdb-tug-pitch-tracking-database-from-graz-university-of-technology.html) - Speech with laryngograph ground truth ([Pirker et al., Interspeech 2011](https://www.isca-archive.org/interspeech_2011/pirker11_interspeech.html)); v2 includes all 4718 utterances (no file exclusion list), with per-frame label quality handled by the consensus labels
+- [NSynth](https://magenta.tensorflow.org/datasets/nsynth) - Synthetic musical instruments ([Engel et al., 2017](https://arxiv.org/abs/1704.01279))
+- [MDB-stem-synth](https://zenodo.org/records/1481172) - Resynthesized MedleyDB stems with exact f0 ([Salamon et al., ISMIR 2017](http://synthdatasets.weebly.com/mdb-stem-synth.html))
+- [MIR-1K](https://zenodo.org/records/3532216) - Vocal excerpts ([Hsu & Jang, IEEE TASLP 2010](https://ieeexplore.ieee.org/document/5153305))
+- [Vocadito](https://zenodo.org/records/5578807) - Solo vocal recordings ([Bittner et al., 2021](https://arxiv.org/abs/2110.05580))
+- [Bach10-mf0-synth](https://zenodo.org/records/1481156/files/Bach10-mf0-syth.tar.gz) - Resynthesized Bach10 with exact f0 ([Duan et al., IEEE TASLP 2010](https://ieeexplore.ieee.org/document/5445037); analysis/synthesis by [Salamon et al., ISMIR 2017](http://synthdatasets.weebly.com/mdb-stem-synth.html))
+
+(SpeechSynth needs no download; it is rendered at runtime from a LightSpeech TTS checkpoint.)
+
+**Noise sources** (only for the real-noise robustness conditions `--degradation chime|demand`):
+
+- [CHiME-Home](https://archive.org/details/chime-home) - Domestic background noise ([Foster et al., WASPAA 2015](https://ieeexplore.ieee.org/document/7314880)); pass with `--chime-dir`
+- [DEMAND](https://zenodo.org/records/1227121) - Multi-environment acoustic noise ([Thiemann, Ito & Vincent, Proc. Mtgs. Acoust. 2013](https://hal.science/hal-00796707)); pass with `--demand-dir`
 
 Organize datasets in a directory structure like:
 ```
@@ -64,7 +96,8 @@ datasets/
 ├── MIR1K/
 ├── Vocadito/
 ├── Bach10Synth/
-└── chime_home/
+├── chime_home/      # noise source for --degradation chime
+└── DEMAND/          # noise source for --degradation demand
 ```
 
 ### Usage
@@ -74,51 +107,68 @@ datasets/
 python visualize_algorithms.py your_audio.wav --selected_algorithms SwiftF0 CREPE Praat
 ```
 
-**2. Speed Benchmark**
+**2. Run the whole benchmark** (clean leaderboard + robustness probe + speed + report)
+
+Edit the dataset paths at the top of `run.sh`, then:
 ```bash
-python speed_benchmark.py --signal-length 1.0 --n-runs 20
+./run.sh
+```
+It is resumable: finished results are skipped, so re-running after adding an algorithm is cheap.
+
+**3. Individual runs**
+
+Clean is the default condition (no `--chime-dir` needed):
+```bash
+uv run python pitch_benchmark.py --dataset Vocadito --data-dir datasets/vocadito
+```
+Robustness to a degradation on a small probe (capped + truncated sample):
+```bash
+uv run python pitch_benchmark.py --dataset Vocadito --data-dir datasets/vocadito \
+  --degradation pink --max-samples 30 --max-seconds 10
+```
+Degradations: `clean, white, pink, chime, demand, telephone, reverb, room` (`chime` needs `--chime-dir`, `demand` needs `--demand-dir`).
+
+**4. Speed benchmark**
+```bash
+uv run python speed_benchmark.py
 ```
 
-**3. Pitch Benchmark**
-
+**5. Generate the report**
 ```bash
-for dataset in PTDB NSynth MIR1K Vocadito MDBStemSynth Bach10Synth; do
-  python pitch_benchmark.py \
-    --dataset $dataset \
-    --data-dir datasets/$dataset \
-    --chime-dir datasets/chime_home
-done
-python pitch_benchmark.py --dataset PTDBNoisy --data-dir datasets/PTDB --chime-dir datasets/chime_home
-python pitch_benchmark.py --dataset SpeechSynth --data-dir datasets/speechsynth.pt --chime-dir audio_datasets/chime_home
-```
-
-**4. Generate Report**
-
-```bash
-python generate_report.py --results-dir results/ --output benchmark_report.md
+uv run python generate_report.py --results-dir results/ --output benchmark_report.md
 ```
 
 ### Algorithm Implementations
 
 The benchmark includes implementations of these algorithms:
 
-**Neural Networks:**
-- [SwiftF0](https://github.com/lars76/swift-f0) - Fast CNN-based pitch detection
-- [CREPE](https://github.com/marl/crepe) - CNN-based pitch estimation
-- [TorchCREPE](https://github.com/maxrmorrison/torchcrepe) - PyTorch CREPE implementation
-- [PENN](https://github.com/interactiveaudiolab/penn) - Pitch-Estimating Neural Networks
-- [BasicPitch](https://github.com/spotify/basic-pitch) - Spotify's multi-instrument pitch detector
-- [SPICE](https://www.tensorflow.org/hub/tutorials/spice) - Self-supervised pitch estimation
-- [RMVPE](https://github.com/yxlllc/RMVPE) - A Robust Model for Vocal Pitch Estimation in Polyphonic Music
+Each entry links its implementation, followed by the paper it is based on.
 
-**Classical Methods:**
-- [Praat](https://github.com/YannickJadoul/Parselmouth) - Autocorrelation-based
-- [pYIN](https://librosa.org/doc/main/generated/librosa.pyin.html) - Probabilistic YIN
-- [YAAPT](https://bjbschmitt.github.io/AMFM_decompy/pYAAPT.html) - Yet Another Algorithm for Pitch Tracking
-- [RAPT](https://pysptk.readthedocs.io/en/latest/generated/pysptk.sptk.rapt.html) - Robust Algorithm for Pitch Tracking
-- [SWIPE](https://pysptk.readthedocs.io/en/latest/generated/pysptk.sptk.swipe.html) - Sawtooth Waveform Inspired Pitch Estimator
-- [DIO](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder) - Distributed Inline-filter Operation: multi-band zero-crossing F0 estimator from the WORLD vocoder (via pyworld), with StoneMask refinement
-- [Harvest](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder) - High-performance F0 estimator using band-pass filter candidates refined with instantaneous frequency and contour smoothing (via pyworld)
+**Neural Networks:**
+- [SwiftF0](https://github.com/lars76/swift-f0) - Fast CNN spectrogram pitch detector ([Nieradzik, 2025](https://arxiv.org/abs/2508.18440))
+- [CREPE](https://github.com/marl/crepe) - CNN on the raw waveform ([Kim, Salamon, Li & Bello, ICASSP 2018](https://arxiv.org/abs/1802.06182))
+- [TorchCREPE](https://github.com/maxrmorrison/torchcrepe) - PyTorch port of CREPE ([Kim et al., 2018](https://arxiv.org/abs/1802.06182))
+- [PENN](https://github.com/interactiveaudiolab/penn) - Pitch-Estimating Neural Networks ([Morrison et al., ICASSP 2023](https://arxiv.org/abs/2301.12258))
+- [BasicPitch](https://github.com/spotify/basic-pitch) - Spotify's instrument-agnostic transcription/multipitch model ([Bittner et al., ICASSP 2022](https://arxiv.org/abs/2203.09893))
+- [SPICE](https://www.tensorflow.org/hub/tutorials/spice) - Self-supervised pitch estimation ([Gfeller et al., IEEE/ACM TASLP 2020](https://arxiv.org/abs/1910.11664))
+- [RMVPE](https://github.com/yxlllc/RMVPE) - Robust Model for Vocal Pitch Estimation in polyphonic music ([Wei, Cao, Dan & Chen, Interspeech 2023](https://arxiv.org/abs/2306.15412))
+
+**Classical / DSP Methods:**
+- [Praat](https://github.com/YannickJadoul/Parselmouth) - Autocorrelation pitch tracker (Boersma, 1993), via Parselmouth ([Jadoul et al., 2018](https://doi.org/10.1016/j.wocn.2018.07.001))
+- [REAPER](https://github.com/google/REAPER) - Robust Epoch And Pitch EstimatoR (D. Talkin, Google), via [pyreaper](https://github.com/r9y9/pyreaper)
+- [pYIN](https://librosa.org/doc/main/generated/librosa.pyin.html) - Probabilistic YIN ([Mauch & Dixon, ICASSP 2014](https://ieeexplore.ieee.org/document/6853678))
+- [YAAPT](https://bjbschmitt.github.io/AMFM_decompy/pYAAPT.html) - Yet Another Algorithm for Pitch Tracking ([Zahorian & Hu, JASA 2008](https://doi.org/10.1121/1.2967862))
+- [RAPT](https://pysptk.readthedocs.io/en/latest/generated/pysptk.sptk.rapt.html) - Robust Algorithm for Pitch Tracking (Talkin, 1995), via pysptk
+- [SWIPE](https://pysptk.readthedocs.io/en/latest/generated/pysptk.sptk.swipe.html) - Sawtooth Waveform Inspired Pitch Estimator ([Camacho & Harris, JASA 2008](https://doi.org/10.1121/1.2951592)), via pysptk
+- [DIO](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder) - Zero-crossing/candidate F0 with StoneMask refinement, from the WORLD vocoder ([Morise et al., IEICE 2016](https://doi.org/10.1587/transinf.2015EDP7457)), via pyworld
+- [Harvest](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder) - Band-pass candidate F0 refined by instantaneous frequency, from WORLD ([Morise, Interspeech 2017](https://www.isca-archive.org/interspeech_2017/morise17_interspeech.html)), via pyworld
+
+### Frame timing fairness
+
+Predictions and labels are compared frame by frame on one shared grid, so every wrapper's
+timestamps are **measured** against synthetic signals with analytically known f0
+(`tests/test_time_calibration.py`), and the same correction policy is applied to all trackers.
+See [TIMING.md](TIMING.md) for the contract, the policy, and the per-tracker calibration table.
 
 ## 🤝 Contributing
 

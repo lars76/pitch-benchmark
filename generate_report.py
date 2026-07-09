@@ -1,52 +1,282 @@
 #!/usr/bin/env python3
-"""
-Comprehensive analysis script for pitch detection benchmark results.
-Generates a detailed markdown report with tables and insights.
-"""
+"""Generate a markdown report (tables + insights) from pitch detection benchmark results."""
 
 import argparse
 import json
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
+from datasets.augment import (
+    CONDITION_FAMILIES,  # single source of truth for condition families
+)
+from metrics import PITCH_BANDS, band_label
 
-def load_all_results(results_dir: str) -> Tuple[List[Dict], List[Dict]]:
-    """Load all JSON result files from the results directory."""
+
+def _is_bad(v):
+    return v is None or (isinstance(v, (float, np.floating)) and np.isnan(v))
+
+
+def md_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Render a markdown table from header strings + rows (each a list of cell strings)."""
+    out = "| " + " | ".join(headers) + " |\n"
+    out += "|" + "---|" * len(headers) + "\n"
+    for row in rows:
+        out += "| " + " | ".join(row) + " |\n"
+    return out
+
+
+def fmt_best(value, column_values, fmt="{:.3f}", lower=False, na="N/A") -> str:
+    """Format `value`, bolding it if it is the best (max, or min if lower) of column_values."""
+    if _is_bad(value):
+        return na
+    valid = [v for v in column_values if not _is_bad(v)]
+    best = (min if lower else max)(valid) if valid else None
+    s = fmt.format(value)
+    if best is not None and abs(value - best) < 1e-9:
+        s = f"**{s}**"
+    return s
+
+
+def load_all_results(results_dir: str) -> tuple[list[dict], list[dict], list[dict]]:
+    """Load all JSON result files, split into (pitch, speed, ood) by benchmark_type."""
     pitch_results = []
     speed_results = []
+    ood_results = []
 
     for file_path in Path(results_dir).glob("*.json"):
         try:
-            with open(file_path, "r") as f:
+            with open(file_path) as f:
                 data = json.load(f)
 
-            # Distinguish between speed and pitch results
-            if data.get("metadata", {}).get("benchmark_type") == "speed":
+            # Route by benchmark_type FIRST: OOD cells also carry combined_score, so they must be
+            # split off here or they would pollute the accuracy leaderboard.
+            bt = data.get("metadata", {}).get("benchmark_type")
+            if bt == "speed":
                 speed_results.append(data)
-            elif "results" in data and "combined_score" in data.get(
-                "results", {}
-            ):
-                # This looks like a pitch benchmark result
+            elif bt == "ood":
+                ood_results.append(data)
+            elif "results" in data and "combined_score" in data.get("results", {}):
                 pitch_results.append(data)
             else:
-                print(
-                    f"Warning: Unrecognized result format in {file_path.name}"
-                )
+                print(f"Warning: Unrecognized result format in {file_path.name}")
 
         except Exception as e:
             print(f"Warning: Failed to load {file_path}: {e}")
 
-    return pitch_results, speed_results
+    return pitch_results, speed_results, ood_results
+
+
+def _dedupe_prefer_cpu(results: list[dict], key_fn) -> list[dict]:
+    """Keep one result per key_fn(metadata, parameters). A non-crashed result always beats a crashed
+    one for the same cell -- a valid result on disk must not be shadowed by a stale crash cell (e.g. an
+    `_auto_` cell written before a backend was installed, which lingers under a different device string
+    than the later `_mps_`/`_cuda_` result). Among non-crashed results prefer `device=="cpu"` (the
+    reproducible reference), else whatever ran; a crash is kept only if EVERY cell for the key crashed
+    (it then counts as 0). Device lives in the filename so cpu/gpu results coexist on disk."""
+    def rank(r):   # higher wins: (valid over crashed, then cpu over gpu)
+        m = r.get("metadata", {})
+        return (not m.get("crashed"), m.get("device") == "cpu")
+
+    chosen: dict = {}
+    for r in results:
+        k = key_fn(r.get("metadata", {}), r.get("parameters", {}))
+        cur = chosen.get(k)
+        if cur is None or rank(r) > rank(cur):
+            chosen[k] = r
+    return list(chosen.values())
+
+
+def _pitch_key(m, p):
+    # Everything the result filename encodes EXCEPT device, so only device variants collapse (a
+    # different seed/sample-rate/hop/probe-cap stays its own row).
+    return (m.get("algorithm_name"), m.get("dataset_name"), m.get("condition", "clean"),
+            bool(m.get("probe")), m.get("seed"),
+            p.get("sample_rate"), p.get("hop_size"), p.get("max_samples"), p.get("max_seconds"))
+
+
+def _ood_key(m, _p):
+    return (m.get("algorithm_name"), m.get("family"))
+
+
+# Synthetic OOD families (kept in sync with ood_benchmark.py FAMILIES): two axes.
+OOD_MECHANISMS = ["missing_f0", "unresolved", "irn", "vibrato_fast"]
+OOD_MECH_AXIS = {
+    "missing_f0": "fundamental presence (no energy at f0)",
+    "unresolved": "harmonic resolvability (high harmonics only)",
+    "irn": "noise-based periodicity (rippled noise)",
+    "vibrato_fast": "temporal dynamics (fast FM)",
+}
+OOD_RANGE_SIGNALS = ["sine", "harm", "tilt"]          # family-name prefixes of the pitch-range axis
+OOD_SIGNAL_LABEL = {
+    "sine": "sine (pure tone)", "harm": "harmonic (normal tone)", "tilt": "tilt (bright)",
+}
+OOD_BANDS = ["bass", "low", "mid", "high", "vhigh"]   # range-table column order
+OOD_CONTROL_ORDER = ["noise", "whisper"]
+
+
+def _ood_summary_vals(cells, fams):
+    """Values feeding the mean/worst summary. A crashed cell (present but None) counts as **0.0** - a
+    crash is a total failure on that signal (the process dies), so the summary must not hide it. A
+    family never run (absent from `cells`) is dropped. Per-cell rendering still shows N/A for crashes,
+    so 'crashed' and 'ran but scored 0' stay distinguishable in the detail row."""
+    out = []
+    for f in fams:
+        if f in cells:
+            v = cells[f]
+            out.append(0.0 if _is_bad(v) else float(v))
+    return out
+
+
+def _ood_collect(ood_results):
+    """-> (voiced[algo][family]=acc|None, octv[algo][family]=octave_rate, control[algo][family]=fp|None)."""
+    voiced, octv, control = defaultdict(dict), defaultdict(dict), defaultdict(dict)
+    for r in ood_results:
+        m, res = r.get("metadata", {}), r.get("results", {})
+        algo, fam, ftype = m.get("algorithm_name"), m.get("family"), m.get("family_type")
+        if not algo or not fam:
+            continue
+        if ftype == "control":
+            control[algo][fam] = None if m.get("crashed") else res.get("false_positive_rate")
+        elif m.get("crashed"):
+            voiced[algo][fam] = None                          # N/A = crashed on this signal
+        else:
+            acc = res.get("ood_accuracy")
+            voiced[algo][fam] = 0.0 if _is_bad(acc) else acc  # ran-but-untrackable is a real 0
+            octv[algo][fam] = (res.get("pitch_accuracy") or {}).get("octave_error_rate")
+    return voiced, octv, control
+
+
+def _ood_mechanism_section(voiced) -> str:
+    fams = [f for f in OOD_MECHANISMS if any(f in voiced[a] for a in voiced)]
+    summ = {a: (float(np.mean(v)), float(min(v)))
+            for a in voiced for v in [_ood_summary_vals(voiced[a], fams)] if v}
+    if not summ:
+        return ""
+    order = sorted(summ, key=lambda a: -summ[a][0])
+    means, worsts = [summ[a][0] for a in order], [summ[a][1] for a in order]
+    col_vals = {f: [voiced[a].get(f) for a in order] for f in fams}
+    headers = ["**Algorithm**", "**mean** ↑", "**worst** ↑"] + [f"**{f}**" for f in fams]
+    rows = [[a, fmt_best(summ[a][0], means, "{:.2f}"), fmt_best(summ[a][1], worsts, "{:.2f}")]
+            + [fmt_best(voiced[a].get(f), col_vals[f], "{:.2f}") for f in fams] for a in order]
+    return (
+        "### OOD mechanisms (spectral structure; probed at low-mid pitch)\n\n"
+        + md_table(headers, rows) + "\n"
+        + "A **crash counts as 0** in mean/worst (a crash is a total failure); the detail cell stays "
+        + "`N/A`. Axis: " + "; ".join(f"`{f}` = {OOD_MECH_AXIS[f]}" for f in fams) + "\n\n"
+    )
+
+
+def _ood_range_section(voiced, octv) -> str:
+    present = {s: [b for b in OOD_BANDS if any(f"{s}_{b}" in voiced[a] for a in voiced)]
+               for s in OOD_RANGE_SIGNALS}
+    present = {s: b for s, b in present.items() if b}
+    if not present:
+        return ""
+    out = (
+        "### Pitch-range coverage (one tone swept across bands)\n\n"
+        "F0 accuracy per pitch band for a tone swept bass->vhigh; `floor`/`ceil` = lowest/highest band "
+        "with accuracy >= 0.5 (the tracker's usable register). This fills the high/very-high registers "
+        "the real datasets (all bass/low/mid) never exercise. Comparing **sine vs harmonic** separates "
+        "a true range limit (both fail) from harmonic-dependence (sine fails, harmonic holds).\n\n"
+    )
+    for sig, bands in present.items():
+        def _m(a, sig=sig, bands=bands):
+            v = _ood_summary_vals(voiced[a], [f"{sig}_{b}" for b in bands])
+            return np.mean(v) if v else float("nan")
+        algos = [a for a in voiced if any(f"{sig}_{b}" in voiced[a] for b in bands)]
+        algos.sort(key=lambda a: (np.isnan(_m(a)), -(0.0 if np.isnan(_m(a)) else _m(a))))
+        col_vals = {b: [voiced[a].get(f"{sig}_{b}") for a in algos] for b in bands}
+        headers = ["**Algorithm**"] + [f"**{b}**" for b in bands] + ["**floor**", "**ceil**"]
+        rows = []
+        for a in algos:
+            cells = [fmt_best(voiced[a].get(f"{sig}_{b}"), col_vals[b], "{:.2f}") for b in bands]
+            ok = [b for b in bands
+                  if isinstance(voiced[a].get(f"{sig}_{b}"), (int, float)) and voiced[a][f"{sig}_{b}"] >= 0.5]
+            rows.append([a, *cells, ok[0] if ok else "-", ok[-1] if ok else "-"])
+        out += f"**{OOD_SIGNAL_LABEL[sig]}**\n\n" + md_table(headers, rows) + "\n"
+    return out + _ood_range_notes(voiced, octv, present)
+
+
+def _ood_range_notes(voiced, octv, present) -> str:
+    out = ""
+    for b in [x for x in ("high", "vhigh") if x in present.get("sine", []) and x in present.get("harm", [])]:
+        rng, tim = [], []
+        for a in sorted(voiced):
+            sv, hv = voiced[a].get(f"sine_{b}"), voiced[a].get(f"harm_{b}")
+            if not (isinstance(sv, (int, float)) and isinstance(hv, (int, float))):
+                continue
+            if sv < 0.5 and hv < 0.5:
+                rng.append(a)
+            elif sv < 0.5 <= hv:
+                tim.append(a)
+        parts = []
+        if rng:
+            parts.append(f"true range ceiling (sine and harmonic both fail): {', '.join(rng)}")
+        if tim:
+            parts.append(f"harmonic-dependent (sine fails, harmonic holds): {', '.join(tim)}")
+        if parts:
+            out += f"At **{b}** - " + "; ".join(parts) + ".\n\n"
+    oct_hi = {}
+    for a in octv:
+        vals = [octv[a].get(f"{s}_{b}") for s in OOD_RANGE_SIGNALS for b in ("high", "vhigh")
+                if isinstance(octv[a].get(f"{s}_{b}"), (int, float))]
+        if vals and np.mean(vals) > 0.1:
+            oct_hi[a] = float(np.mean(vals))
+    if oct_hi:
+        out += ("High-band failures that are **octave errors** (reports f0/2), not silence: "
+                + ", ".join(f"{a} ({oct_hi[a]:.2f})" for a in sorted(oct_hi, key=lambda a: -oct_hi[a]))
+                + ".\n\n")
+    return out
+
+
+def _ood_controls_section(control) -> str:
+    fams = [f for f in OOD_CONTROL_ORDER if any(f in control[a] for a in control)]
+    if not fams:
+        return ""
+    def _cm(a):                                                # lower false-positive rate = better
+        vs = [v for v in (control[a].get(f) for f in fams) if not _is_bad(v)]
+        return float(np.mean(vs)) if vs else float("inf")
+    order = sorted(control, key=_cm)
+    col_vals = {f: [control[a].get(f) for a in order] for f in fams}
+    headers = ["**Algorithm**"] + [f"**{f}**" for f in fams]
+    rows = [[a] + [fmt_best(control[a].get(f), col_vals[f], "{:.2f}", lower=True) for f in fams]
+            for a in order]
+    return (
+        "### Unvoiced controls (false-positive rate)\n\n"
+        "Correct answer is no pitch; value is the fraction of frames wrongly voiced (lower is better).\n\n"
+        + md_table(headers, rows) + "\n"
+    )
+
+
+def generate_ood_analysis(ood_results: list[dict]) -> str:
+    """OOD section: a spectral-mechanism matrix + a pitch-range matrix + unvoiced controls."""
+    if not ood_results:
+        return ""
+    voiced, octv, control = _ood_collect(ood_results)
+    out = "## Generalization / OOD (synthetic signals)\n\n"
+    out += (
+        "Out-of-distribution probe on synthetic signals with **exact labels** (no pitch detector in the "
+        "label loop). **F0 accuracy** = fraction of ground-truth-voiced frames the tracker both voices "
+        "AND places within 50 cents of the known f0 (drops for wrong pitch *and* for refusing to voice); "
+        "below 0.50 = cannot follow. `N/A` = the tracker crashed on that signal (recorded, not fatal). "
+        "Two axes below: spectral **mechanisms** and **pitch range**.\n\n"
+    )
+    return out + _ood_mechanism_section(voiced) + _ood_range_section(voiced, octv) \
+        + _ood_controls_section(control)
 
 
 def aggregate_pitch_results(
-    pitch_results: List[Dict],
-) -> Dict[str, Dict[str, List[float]]]:
-    """Aggregate pitch results by algorithm and dataset."""
+    pitch_results: list[dict],
+) -> dict[str, dict[str, list[float]]]:
+    """Aggregate pitch results by algorithm and dataset.
+
+    A recorded crash (metadata.crashed) counts as 0.0 -- a crash is a total failure, not missing data,
+    so it is scored, not dropped (same policy as the OOD table; shared metadata.crashed convention with
+    pitch_benchmark/ood_benchmark). A non-crashed NaN (a deterministically empty run, e.g. all frames
+    unvoiced) is genuinely no data and is dropped."""
     # Structure: {algorithm: {dataset: [scores]}}
     aggregated = defaultdict(lambda: defaultdict(list))
 
@@ -54,8 +284,12 @@ def aggregate_pitch_results(
         try:
             algo_name = result["metadata"]["algorithm_name"]
             dataset_name = result["metadata"]["dataset_name"]
-            combined_score = result["results"]["combined_score"]
 
+            if result["metadata"].get("crashed"):
+                aggregated[algo_name][dataset_name].append(0.0)
+                continue
+
+            combined_score = result["results"]["combined_score"]
             if combined_score is not None and not np.isnan(combined_score):
                 aggregated[algo_name][dataset_name].append(combined_score)
         except KeyError as e:
@@ -66,8 +300,8 @@ def aggregate_pitch_results(
 
 
 def aggregate_speed_results(
-    speed_results: List[Dict],
-) -> Dict[str, Dict[str, float]]:
+    speed_results: list[dict],
+) -> dict[str, dict[str, float]]:
     """Aggregate speed results by algorithm."""
     # Structure: {algorithm: {metric: value}}
     aggregated = {}
@@ -91,8 +325,8 @@ def aggregate_speed_results(
 
 
 def collect_detailed_metrics(
-    pitch_results: List[Dict],
-) -> Dict[str, Dict[str, List[Any]]]:
+    pitch_results: list[dict],
+) -> dict[str, dict[str, list[float]]]:
     """Collect detailed metrics for in-depth analysis."""
     # Structure: {algorithm: {metric: [values]}}
     metrics = defaultdict(lambda: defaultdict(list))
@@ -176,19 +410,13 @@ def generate_dataset_descriptions() -> str:
             "NSynth",
             "Music",
             "Synthetic",
-            "Single-note synthetic audio from musical instruments with accurate pitch labels. Lacks temporal/spectral complexity of real-world environments.",
+            "Single-note synthetic audio from musical instruments with accurate pitch labels. Inharmonic families (organ, mallet, synth_lead) and multiphonic-tagged notes are excluded by default, since their MIDI pitch is not a reliable single-f0 ground truth. Lacks temporal/spectral complexity of real-world environments.",
         ),
         (
             "PTDB",
             "Speech",
             "Real",
-            "Speech recordings with laryngograph signals capturing vocal fold vibrations. Ground truth derived from high-pass filtered laryngograph signals processed with RAPT algorithm.",
-        ),
-        (
-            "PTDBNoisy",
-            "Speech",
-            "Real",
-            "Subset of 347 PTDB files (7.4%) with noticeable noise that were excluded from main evaluation.",
+            "Speech recordings with simultaneous laryngograph (EGG). Ground truth is a cross-family consensus over the EGG signal (correlation: Praat + REAPER; period-marking: dEGG; instantaneous-frequency: Harvest), keeping frames where at least two of the three families agree within 50 cents and gating silence by mic energy. Frames where families voice but disagree on the f0 value are kept voiced (counted in F1) but excluded from pitch accuracy.",
         ),
         (
             "MIR1K",
@@ -218,21 +446,53 @@ def generate_dataset_descriptions() -> str:
             "SpeechSynth",
             "Speech",
             "Synthetic",
-            "Synthetic Mandarin speech generated using LightSpeech TTS model. Trained on 97.48 hours from AISHELL-3 and Biaobei datasets, providing exact pitch ground truth.",
+            "Synthetic Mandarin speech generated using LightSpeech TTS. The conditioned f0 is rendered by a neural vocoder and is faithful for smooth contours, so labels are accurate to within a few tens of cents (near-exact, not exact to the cent).",
         ),
     ]
 
     for dataset, domain, type_str, desc in dataset_info:
         descriptions += f"| **{dataset}** | {domain} | {type_str} | {desc} |\n"
 
+    # Corpus statistics: measured once (exact full pass, sr 16 kHz, hop 256) and assumed stable, so
+    # the report never needs the raw datasets. f0 stats are over in-window voiced frames; band
+    # coverage = % of voiced frames per band. If the datasets change, re-measure with
+    # `uv run python scripts/dataset_stats.py` and paste its `corpus_stats` block over the list below.
+    descriptions += "\n### Corpus Statistics\n\n"
+    descriptions += (
+        "*f0 in Hz over in-window voiced frames; band coverage = % of voiced frames per "
+        "band (bass <80, low 80-260, mid 260-650, high 650-1050, vhigh >=1050 Hz).*\n\n"
+    )
+    descriptions += (
+        "| **Dataset** | **Clips** | **Hours** | **Avg len (s)** | **Voiced %** | "
+        "**f0 p5-p50-p95** | **Band coverage** |\n"
+    )
+    descriptions += "|---|--:|--:|--:|--:|---|---|\n"
+    corpus_stats = [
+        ("NSynth", 3319, 3.7, 4.0, 53, "73-277-1480", "bass 8, low 39, mid 29, high 12, vhigh 12"),
+        ("PTDB", 4718, 9.6, 7.3, 25, "84-155-234", "bass 3, low 96, mid 1"),
+        ("MIR1K", 1000, 2.2, 8.0, 70, "121-231-390", "low 63, mid 37"),
+        ("MDBStemSynth", 230, 15.6, 243.6, 40, "73-209-704", "bass 11, low 50, mid 32, high 6"),
+        ("Vocadito", 40, 0.2, 20.4, 66, "113-219-364", "low 69, mid 31"),
+        ("Bach10Synth", 40, 0.4, 33.4, 92, "111-296-579", "low 38, mid 59, high 2"),
+        ("SpeechSynth", 219, 0.1, 1.9, 48, "125-211-272", "low 91, mid 9"),
+    ]
+    for name, clips, hours, avglen, voiced, f0r, bands in corpus_stats:
+        descriptions += (
+            f"| **{name}** | {clips} | {hours} | {avglen} | {voiced} | {f0r} | {bands} |\n"
+        )
+    descriptions += (
+        "\nThe high/vhigh bands are populated almost entirely by NSynth; the speech sets "
+        "(PTDB, SpeechSynth) sit almost entirely in the low band.\n"
+    )
+
     descriptions += "\n**Key Characteristics:**\n"
-    descriptions += "- **Synthetic datasets** provide perfect ground truth but may lack real-world complexity\n"
+    descriptions += "- **Synthetic datasets** provide highly precise ground truth (exact by construction for the DSP-resynthesized sets; within ~tens of cents for the neural-vocoded SpeechSynth) but may lack real-world complexity\n"
     descriptions += "- **Real datasets** capture natural acoustic variations but have imperfect ground truth annotations\n"
     descriptions += (
         "- **Speech datasets** focus on vocal pitch tracking challenges\n"
     )
     descriptions += "- **Music datasets** encompass instrumental and vocal music scenarios\n"
-    descriptions += "- **SpeechSynth** addresses the gap of lacking synthetic speech data with accurate pitch labels\n\n"
+    descriptions += "- **SpeechSynth** provides synthetic speech with vocoder-rendered pitch labels faithful to within a few tens of cents; treat smaller RPA/cents gaps on it as within that rendering floor\n\n"
 
     return descriptions
 
@@ -242,21 +502,34 @@ def generate_methodology_section() -> str:
     methodology = "## Benchmark Methodology\n\n"
 
     methodology += "### Evaluation Setup\n"
-    methodology += "This benchmark evaluates pitch detection algorithms across multiple datasets with different characteristics, "
-    methodology += "including synthetic and real audio from speech and music domains. Each algorithm is tested on noisy audio "
-    methodology += "generated by mixing clean datasets with CHiME background noise at various signal-to-noise ratios (10-30 dB) "
-    methodology += "and voice gain variations (-6 to +6 dB).\n\n"
+    methodology += "Algorithms are evaluated on **clean** audio across multiple datasets (synthetic and real, "
+    methodology += "speech and music). This is the headline leaderboard. **Robustness** is measured separately on a "
+    methodology += "small deterministic probe (a capped, duration-truncated sample across datasets) run through each "
+    methodology += "degradation, and reported as Δ-from-clean per condition. Per-pitch-band metrics (RPA, octave/gross "
+    methodology += "error) are reported by ground-truth f0 band. Noise/degradations are a pure function of (seed, index), "
+    methodology += "so results are reproducible regardless of run order.\n\n"
 
     methodology += "### Performance Metric Definition\n"
     methodology += "The **Overall Performance Rankings** show the **Harmonic Mean (HM)** score as percentages, computed from six complementary components:\n\n"
     methodology += "**HM = 6 / (1/RPA + 1/CA + 1/P + 1/R + 1/OA + 1/GEA)**\n\n"
     methodology += "Where:\n"
-    methodology += "- **RPA** (Raw Pitch Accuracy): Fraction of voiced frames within 50 cents of ground truth\n"
+    methodology += "- **RPA** (Raw Pitch Accuracy): fraction of frames within 50 cents of ground truth, scored where **both** the ground truth and the algorithm are voiced\n"
     methodology += "- **CA** (Cents Accuracy): exp(-mean_cents_error/500), penalizing larger deviations exponentially\n"
     methodology += "- **P** (Voicing Precision): TP/(TP+FP), fraction of predicted voiced frames that are truly voiced\n"
     methodology += "- **R** (Voicing Recall): TP/(TP+FN), fraction of truly voiced frames detected\n"
     methodology += "- **OA** (Octave Accuracy): exp(-10×octave_error_rate), robustness against octave errors\n"
     methodology += "- **GEA** (Gross Error Accuracy): exp(-5×gross_error_rate), penalizing deviations >200 cents\n\n"
+    methodology += (
+        "Zero or undefined components are floored to a small ε (not dropped), so the score "
+        "collapses toward 0 if an algorithm fully fails on any one axis, as a true harmonic mean should.\n\n"
+    )
+
+    methodology += (
+        "Pitch (RPA/CA/octave/gross) is scored only where both agree on voicing, not on every "
+        "ground-truth-voiced frame, because (1) where the ground-truth voicing is wrong, scoring every "
+        "reference frame penalizes a correct algorithm, and (2) some algorithms do not output a pitch on "
+        "every frame. Voicing quality is captured separately by P/R/F1.\n\n"
+    )
 
     methodology += "### Speed Benchmark Details\n"
     methodology += "CPU timing measurements are performed on 1-second audio signals at 22.05 kHz sample rate with 256-sample hop length. "
@@ -272,108 +545,58 @@ def generate_methodology_section() -> str:
 
 
 def generate_combined_score_table(
-    aggregated_results: Dict[str, Dict[str, List[float]]],
+    aggregated_results: dict[str, dict[str, list[float]]],
+    robustness: dict[str, float] | None = None,
 ) -> str:
     """Generate the main performance table showing combined scores as percentages."""
     if not aggregated_results:
         return "No pitch benchmark results found.\n"
 
-    # Get all unique datasets
-    all_datasets = set()
-    for algo_data in aggregated_results.values():
-        all_datasets.update(algo_data.keys())
-    all_datasets = sorted(all_datasets)
+    all_datasets = sorted({d for a in aggregated_results.values() for d in a})
 
-    # Calculate averages for each algorithm-dataset combination
+    # Per-algorithm percentage score per dataset (rounded to .1 so display ties bold together).
     table_data = []
-    for algo_name in sorted(aggregated_results.keys()):
-        row_data = {"algorithm": algo_name, "scores": [], "average": 0}
-        dataset_scores = []
+    for algo in sorted(aggregated_results):
+        scores = {
+            d: (round(float(np.mean(aggregated_results[algo][d])) * 100, 1)
+                if aggregated_results[algo].get(d) else None)
+            for d in all_datasets
+        }
+        present = [v for v in scores.values() if v is not None]
+        avg = round(float(np.mean(present)), 1) if present else None
+        table_data.append({"algo": algo, "scores": scores, "avg": avg})
 
-        for dataset in all_datasets:
-            scores = aggregated_results[algo_name].get(dataset, [])
-            if scores:
-                avg_score = np.mean(scores) * 100  # Convert to percentage
-                row_data["scores"].append(f"{avg_score:.1f}%")
-                dataset_scores.append(avg_score)
-            else:
-                row_data["scores"].append("N/A")
+    table_data.sort(key=lambda r: (r["avg"] is None, -(r["avg"] or 0)))
 
-        if dataset_scores:
-            row_data["average"] = np.mean(dataset_scores)
-
-        table_data.append(row_data)
-
-    # Sort by average performance (descending)
-    table_data.sort(key=lambda x: x["average"], reverse=True)
-
-    # Find best score in each column for highlighting
-    best_scores_per_dataset = {}
-    for dataset_idx, dataset in enumerate(all_datasets):
-        best_score = -1
-        for row in table_data:
-            if (
-                dataset_idx < len(row["scores"])
-                and row["scores"][dataset_idx] != "N/A"
-            ):
-                score_val = float(row["scores"][dataset_idx].rstrip("%"))
-                if score_val > best_score:
-                    best_score = score_val
-        best_scores_per_dataset[dataset] = best_score
-
-    # Generate markdown table
-    header = (
-        "| **Algorithm** | "
-        + " | ".join([f"**{dataset}**" for dataset in all_datasets])
-        + " | **Average** |\n"
+    col_vals = {d: [r["scores"][d] for r in table_data] for d in all_datasets}
+    avgs = [r["avg"] for r in table_data]
+    robust_vals = (
+        [round(robustness.get(r["algo"]), 1) if robustness.get(r["algo"]) is not None else None
+         for r in table_data]
+        if robustness else None
     )
-    separator = "|" + "---|" * (len(all_datasets) + 2) + "\n"
 
+    headers = (
+        ["**Algorithm**"]
+        + [f"**{d}**" for d in all_datasets]
+        + ["**Average**"]
+        + (["**Robust Δ ↓**"] if robustness else [])
+    )
     rows = []
-    for i, row in enumerate(table_data):
-        algo_name = row["algorithm"]
+    for i, r in enumerate(table_data):
+        name = f"**{r['algo']}**" if i == 0 else r["algo"]  # best overall (sorted first)
+        cells = [name] + [fmt_best(r["scores"][d], col_vals[d], "{:.1f}%") for d in all_datasets]
+        cells.append(fmt_best(r["avg"], avgs, "{:.1f}%"))
+        if robustness:
+            rv = robustness.get(r["algo"])
+            rv = round(rv, 1) if rv is not None else None
+            cells.append(fmt_best(rv, robust_vals, "{:.1f}", lower=True))
+        rows.append(cells)
 
-        # Highlight best scores in each column
-        formatted_scores = []
-        for dataset_idx, (dataset, score_str) in enumerate(
-            zip(all_datasets, row["scores"])
-        ):
-            if score_str != "N/A":
-                score_val = float(score_str.rstrip("%"))
-                if (
-                    abs(score_val - best_scores_per_dataset[dataset]) < 0.1
-                ):  # Best score
-                    formatted_scores.append(f"**{score_str}**")
-                else:
-                    formatted_scores.append(score_str)
-            else:
-                formatted_scores.append(score_str)
-
-        scores_str = " | ".join(formatted_scores)
-
-        # Highlight best average (first row after sorting)
-        if i == 0:
-            avg_str = (
-                f"**{row['average']:.1f}%**" if row["average"] > 0 else "N/A"
-            )
-            algo_name = (
-                f"**{algo_name}**"  # Bold the best overall algorithm name
-            )
-        else:
-            avg_str = f"{row['average']:.1f}%" if row["average"] > 0 else "N/A"
-
-        rows.append(f"| {algo_name} | {scores_str} | {avg_str} |\n")
-
-    return (
-        "## Overall Performance Rankings\n\n"
-        + header
-        + separator
-        + "".join(rows)
-        + "\n"
-    )
+    return "## Overall Performance Rankings\n\n" + md_table(headers, rows) + "\n"
 
 
-def generate_speed_table(speed_results: Dict[str, Dict[str, float]]) -> str:
+def generate_speed_table(speed_results: dict[str, dict[str, float]]) -> str:
     """Generate CPU speed performance table."""
     if not speed_results:
         return "No speed benchmark results found.\n"
@@ -382,598 +605,367 @@ def generate_speed_table(speed_results: Dict[str, Dict[str, float]]) -> str:
     sorted_algos = sorted(
         speed_results.items(), key=lambda x: x[1]["absolute_time_ms"]
     )
-
-    header = "| **Algorithm** | **CPU Time (ms) ↓** | **Relative Speed ↑** |\n"
-    separator = "|---|---|---|\n"
+    times = [m["absolute_time_ms"] for _, m in sorted_algos]
+    speeds = [m["relative_speed"] for _, m in sorted_algos]
 
     rows = []
     for algo_name, metrics in sorted_algos:
-        time_ms = f"{metrics['absolute_time_ms']:.1f}"
-        rel_speed = f"{metrics['relative_speed']:.2f}x"
-
-        # Bold the fastest
-        if metrics == sorted_algos[0][1]:
-            time_ms = f"**{time_ms}**"
-            rel_speed = f"**{rel_speed}**"
-            algo_name = f"**{algo_name}**"
-
-        rows.append(f"| {algo_name} | {time_ms} | {rel_speed} |\n")
+        name = f"**{algo_name}**" if metrics is sorted_algos[0][1] else algo_name
+        rows.append(
+            [
+                name,
+                fmt_best(metrics["absolute_time_ms"], times, "{:.1f}", lower=True),
+                fmt_best(metrics["relative_speed"], speeds, "{:.2f}x"),
+            ]
+        )
 
     return (
         "## Speed Performance (CPU)\n\n"
-        + header
-        + separator
-        + "".join(rows)
+        + md_table(
+            ["**Algorithm**", "**CPU Time (ms) ↓**", "**Relative Speed ↑**"], rows
+        )
         + "\n"
     )
 
 
+def _avg(d, key):
+    vals = [v for v in d.get(key, []) if not _is_bad(v)]
+    return float(np.mean(vals)) if vals else None
+
+
+def _cv(values):
+    """Coefficient of variation (std/mean); None if < 2 values or non-positive mean."""
+    v = [x for x in values if not _is_bad(x)]
+    return float(np.std(v)) / float(np.mean(v)) if len(v) > 1 and np.mean(v) > 0 else None
+
+
+def _metric_table(detailed, title, desc, columns):
+    """Render a per-algorithm metric table. columns: (header, value_fn, fmt, lower)."""
+    algos = sorted(detailed)
+    col_vals = {h: [fn(detailed[a]) for a in algos] for h, fn, _, _ in columns}
+    headers = ["**Algorithm**"] + [f"**{h}**" for h, _, _, _ in columns]
+    rows = [
+        [a] + [fmt_best(fn(detailed[a]), col_vals[h], fmt, lower=lo) for h, fn, fmt, lo in columns]
+        for a in algos
+    ]
+    return f"### {title}\n{desc}\n\n" + md_table(headers, rows) + "\n"
+
+
 def generate_detailed_analysis(
-    detailed_metrics: Dict[str, Dict[str, List[Any]]],
+    detailed_metrics: dict[str, dict[str, list[float]]],
 ) -> str:
-    """Generate detailed analysis of various metrics."""
+    """Detailed per-algorithm metric tables (averaged across datasets)."""
     if not detailed_metrics:
         return "No detailed metrics available.\n"
 
-    analysis = "## Detailed Performance Analysis\n\n"
-
-    # Voicing Detection Analysis
-    analysis += "### Voicing Detection Performance\n"
-    analysis += "Measures how well algorithms distinguish between voiced (pitched) and unvoiced (unpitched) audio segments.\n\n"
-    analysis += (
-        "| **Algorithm** | **Precision ↑** | **Recall ↑** | **F1-Score ↑** |\n"
-    )
-    analysis += "|---|---|---|---|\n"
-
-    voicing_data = []
-    for algo_name in sorted(detailed_metrics.keys()):
-        metrics = detailed_metrics[algo_name]
-        precision = (
-            np.mean(metrics.get("voicing_precision", [0]))
-            if metrics.get("voicing_precision")
-            else 0
-        )
-        recall = (
-            np.mean(metrics.get("voicing_recall", [0]))
-            if metrics.get("voicing_recall")
-            else 0
-        )
-        f1 = (
-            np.mean(metrics.get("voicing_f1", [0]))
-            if metrics.get("voicing_f1")
-            else 0
-        )
-
-        voicing_data.append(
-            {
-                "name": algo_name,
-                "precision": precision,
-                "recall": recall,
-                "f1": f1,
-            }
-        )
-
-    # Find best in each column
-    best_precision = max(voicing_data, key=lambda x: x["precision"])[
-        "precision"
-    ]
-    best_recall = max(voicing_data, key=lambda x: x["recall"])["recall"]
-    best_f1 = max(voicing_data, key=lambda x: x["f1"])["f1"]
-
-    for data in voicing_data:
-        precision_str = (
-            f"**{data['precision']:.3f}**"
-            if abs(data["precision"] - best_precision) < 1e-6
-            else f"{data['precision']:.3f}"
-        )
-        recall_str = (
-            f"**{data['recall']:.3f}**"
-            if abs(data["recall"] - best_recall) < 1e-6
-            else f"{data['recall']:.3f}"
-        )
-        f1_str = (
-            f"**{data['f1']:.3f}**"
-            if abs(data["f1"] - best_f1) < 1e-6
-            else f"{data['f1']:.3f}"
-        )
-
-        algo_name = (
-            f"**{data['name']}**"
-            if abs(data["f1"] - best_f1) < 1e-6
-            else data["name"]
-        )
-
-        analysis += (
-            f"| {algo_name} | {precision_str} | {recall_str} | {f1_str} |\n"
-        )
-
-    analysis += "\n"
-
-    # Pitch Accuracy Analysis
-    analysis += "### Pitch Accuracy Metrics\n"
-    analysis += "Detailed pitch estimation accuracy across different error types and magnitudes.\n\n"
-    analysis += "| **Algorithm** | **RPA ↑** | **RCA ↑** | **Cents Error ↓** | **RMSE (Hz) ↓** | **Octave Error ↓** | **Gross Error ↓** |\n"
-    analysis += "|---|---|---|---|---|---|---|\n"
-
-    pitch_data = []
-    for algo_name in sorted(detailed_metrics.keys()):
-        metrics = detailed_metrics[algo_name]
-        rpa = (
-            np.mean(metrics.get("pitch_rpa", [0]))
-            if metrics.get("pitch_rpa")
-            else 0
-        )
-        rca = (
-            np.mean(metrics.get("pitch_rca", [0]))
-            if metrics.get("pitch_rca")
-            else 0
-        )
-        cents = (
-            np.mean(metrics.get("pitch_cents_error", [0]))
-            if metrics.get("pitch_cents_error")
-            else 0
-        )
-        rmse = (
-            np.mean(metrics.get("pitch_rmse", [0]))
-            if metrics.get("pitch_rmse")
-            else 0
-        )
-        octave_err = (
-            np.mean(metrics.get("pitch_octave_error_rate", [0]))
-            if metrics.get("pitch_octave_error_rate")
-            else 0
-        )
-        gross_err = (
-            np.mean(metrics.get("pitch_gross_error_rate", [0]))
-            if metrics.get("pitch_gross_error_rate")
-            else 0
-        )
-
-        pitch_data.append(
-            {
-                "name": algo_name,
-                "rpa": rpa,
-                "rca": rca,
-                "cents": cents,
-                "rmse": rmse,
-                "octave_err": octave_err,
-                "gross_err": gross_err,
-            }
-        )
-
-    # Find best in each column (higher is better for RPA/RCA, lower is better for errors)
-    best_rpa = max(pitch_data, key=lambda x: x["rpa"])["rpa"]
-    best_rca = max(pitch_data, key=lambda x: x["rca"])["rca"]
-    best_cents = min(
-        [x["cents"] for x in pitch_data if x["cents"] > 0], default=0
-    )
-    best_rmse = min([x["rmse"] for x in pitch_data if x["rmse"] > 0], default=0)
-    best_octave = min(
-        [x["octave_err"] for x in pitch_data if x["octave_err"] >= 0], default=0
-    )
-    best_gross = min(
-        [x["gross_err"] for x in pitch_data if x["gross_err"] >= 0], default=0
-    )
-
-    for data in pitch_data:
-        rpa_str = (
-            f"**{data['rpa']:.3f}**"
-            if abs(data["rpa"] - best_rpa) < 1e-6
-            else f"{data['rpa']:.3f}"
-        )
-        rca_str = (
-            f"**{data['rca']:.3f}**"
-            if abs(data["rca"] - best_rca) < 1e-6
-            else f"{data['rca']:.3f}"
-        )
-        cents_str = (
-            f"**{data['cents']:.1f}**"
-            if data["cents"] > 0 and abs(data["cents"] - best_cents) < 1e-6
-            else f"{data['cents']:.1f}"
-        )
-        rmse_str = (
-            f"**{data['rmse']:.1f}**"
-            if data["rmse"] > 0 and abs(data["rmse"] - best_rmse) < 1e-6
-            else f"{data['rmse']:.1f}"
-        )
-        octave_str = (
-            f"**{data['octave_err']:.3f}**"
-            if abs(data["octave_err"] - best_octave) < 1e-6
-            else f"{data['octave_err']:.3f}"
-        )
-        gross_str = (
-            f"**{data['gross_err']:.3f}**"
-            if abs(data["gross_err"] - best_gross) < 1e-6
-            else f"{data['gross_err']:.3f}"
-        )
-
-        analysis += f"| {data['name']} | {rpa_str} | {rca_str} | {cents_str} | {rmse_str} | {octave_str} | {gross_str} |\n"
-
-    analysis += "\n**Additional Metric Definitions:**\n"
-    analysis += "- **RCA** (Raw Chroma Accuracy): Fraction with correct pitch class (note name), ignoring octave\n"
-    analysis += "- **Cents Error**: Mean absolute pitch deviation in cents (raw error, before exponential transform used in CA)\n"
-    analysis += "- **RMSE**: Root Mean Square Error in Hz\n\n"
-
-    # Smoothness Analysis
-    analysis += "### Pitch Contour Smoothness\n"
-    analysis += (
-        "Measures the temporal stability and continuity of pitch tracks.\n\n"
-    )
-    analysis += "| **Algorithm** | **Relative Smoothness ↓** | **Continuity Breaks ↓** | **Overall Smoothness Rank ↓** |\n"
-    analysis += "|---|---|---|---|\n"
-
-    smoothness_data = []
-    for algo_name in sorted(detailed_metrics.keys()):
-        metrics = detailed_metrics[algo_name]
-        rel_smooth = metrics.get("relative_smoothness", [])
-        breaks = metrics.get("continuity_breaks", [])
-
-        avg_smooth = np.nanmean(rel_smooth) if rel_smooth else np.nan
-        avg_breaks = np.nanmean(breaks) if breaks else np.nan
-
-        smoothness_data.append(
-            {
-                "name": algo_name,
-                "rel_smooth": avg_smooth,
-                "breaks": avg_breaks,
-                "smooth_rank": np.inf,
-                "breaks_rank": np.inf,
-            }
-        )
-
-    # Calculate ranks for each metric (1 = best, i.e., lowest value)
-    # Rank relative smoothness
-    valid_smooth_algos = [
-        d for d in smoothness_data if not np.isnan(d["rel_smooth"])
-    ]
-    valid_smooth_algos.sort(key=lambda x: x["rel_smooth"])
-    for rank, data in enumerate(valid_smooth_algos, 1):
-        data["smooth_rank"] = rank
-
-    # Rank continuity breaks
-    valid_breaks_algos = [
-        d for d in smoothness_data if not np.isnan(d["breaks"])
-    ]
-    valid_breaks_algos.sort(key=lambda x: x["breaks"])
-    for rank, data in enumerate(valid_breaks_algos, 1):
-        data["breaks_rank"] = rank
-
-    # Calculate combined rank (average of individual ranks)
-    for data in smoothness_data:
-        ranks = []
-        if data["smooth_rank"] != np.inf:
-            ranks.append(data["smooth_rank"])
-        if data["breaks_rank"] != np.inf:
-            ranks.append(data["breaks_rank"])
-
-        if ranks:
-            data["combined_rank"] = np.mean(ranks)
-        else:
-            data["combined_rank"] = np.inf
-
-    # Sort by combined rank for display
-    smoothness_data.sort(key=lambda x: x["combined_rank"])
-
-    # Find best values for highlighting
-    valid_smooth = [
-        x["rel_smooth"]
-        for x in smoothness_data
-        if not np.isnan(x["rel_smooth"])
-    ]
-    valid_breaks = [
-        x["breaks"] for x in smoothness_data if not np.isnan(x["breaks"])
-    ]
-
-    best_smooth = min(valid_smooth) if valid_smooth else np.nan
-    best_breaks = min(valid_breaks) if valid_breaks else np.nan
-    best_combined = min(
+    out = "## Detailed Performance Analysis\n\n"
+    out += _metric_table(
+        detailed_metrics,
+        "Voicing Detection Performance",
+        "How well algorithms distinguish voiced (pitched) from unvoiced frames.",
         [
-            x["combined_rank"]
-            for x in smoothness_data
-            if x["combined_rank"] != np.inf
+            ("Precision ↑", lambda d: _avg(d, "voicing_precision"), "{:.3f}", False),
+            ("Recall ↑", lambda d: _avg(d, "voicing_recall"), "{:.3f}", False),
+            ("F1 ↑", lambda d: _avg(d, "voicing_f1"), "{:.3f}", False),
         ],
-        default=np.inf,
+    )
+    out += _metric_table(
+        detailed_metrics,
+        "Pitch Accuracy Metrics",
+        "Pitch-estimation accuracy across error types.",
+        [
+            ("RPA ↑", lambda d: _avg(d, "pitch_rpa"), "{:.3f}", False),
+            ("RCA ↑", lambda d: _avg(d, "pitch_rca"), "{:.3f}", False),
+            ("Cents Error ↓", lambda d: _avg(d, "pitch_cents_error"), "{:.1f}", True),
+            ("RMSE (Hz) ↓", lambda d: _avg(d, "pitch_rmse"), "{:.1f}", True),
+            ("Octave Error ↓", lambda d: _avg(d, "pitch_octave_error_rate"), "{:.3f}", True),
+            ("Gross Error ↓", lambda d: _avg(d, "pitch_gross_error_rate"), "{:.3f}", True),
+        ],
+    )
+    out += _metric_table(
+        detailed_metrics,
+        "Pitch Contour Smoothness",
+        "Temporal stability of the pitch track (diagnostic).",
+        [
+            ("Relative Smoothness ↓", lambda d: _avg(d, "relative_smoothness"), "{:.3f}", True),
+            ("Continuity Breaks ↓", lambda d: _avg(d, "continuity_breaks"), "{:.3f}", True),
+        ],
     )
 
-    for data in smoothness_data:
-        smooth_str = (
-            f"{data['rel_smooth']:.3f}"
-            if not np.isnan(data["rel_smooth"])
-            else "N/A"
-        )
-        breaks_str = (
-            f"{data['breaks']:.3f}" if not np.isnan(data["breaks"]) else "N/A"
-        )
-
-        # Highlight best individual metrics
-        if (
-            not np.isnan(data["rel_smooth"])
-            and abs(data["rel_smooth"] - best_smooth) < 1e-6
-        ):
-            smooth_str = f"**{smooth_str}**"
-        if (
-            not np.isnan(data["breaks"])
-            and abs(data["breaks"] - best_breaks) < 1e-6
-        ):
-            breaks_str = f"**{breaks_str}**"
-
-        # Combined rank display and highlighting
-        if data["combined_rank"] != np.inf:
-            combined_str = f"{data['combined_rank']:.1f}"
-            if abs(data["combined_rank"] - best_combined) < 1e-6:
-                combined_str = f"**{combined_str}**"
-                algo_name = f"**{data['name']}**"  # Bold algorithm name for best overall
-            else:
-                algo_name = data["name"]
+    # Threshold table: mean (plain), std (bold-best), range (string).
+    algos = sorted(detailed_metrics)
+    stds = []
+    for a in algos:
+        thr = [t for t in detailed_metrics[a].get("optimal_threshold", []) if not _is_bad(t)]
+        stds.append(float(np.std(thr)) if thr else None)
+    rows = []
+    for a in algos:
+        thr = [t for t in detailed_metrics[a].get("optimal_threshold", []) if not _is_bad(t)]
+        if thr:
+            rows.append([
+                a,
+                f"{np.mean(thr):.3f}",
+                fmt_best(float(np.std(thr)), stds, "{:.3f}", lower=True),
+                f"{min(thr):.2f}-{max(thr):.2f}",
+            ])
         else:
-            combined_str = "N/A"
-            algo_name = data["name"]
-
-        analysis += (
-            f"| {algo_name} | {smooth_str} | {breaks_str} | {combined_str} |\n"
+            rows.append([a, "N/A", "N/A", "N/A"])
+    out += (
+        "### Optimal Threshold Analysis\n"
+        "Voicing-confidence threshold that maximizes the combined score.\n\n"
+        + md_table(
+            ["**Algorithm**", "**Mean Threshold**", "**Std Dev ↓**", "**Range**"], rows
         )
-
-    analysis += "\n**Metric Definitions:**\n"
-    analysis += "- **Relative Smoothness**: Coefficient of variation of consecutive pitch changes (std/mean of relative frame-to-frame changes)\n"
-    analysis += "- **Continuity Breaks**: Fraction of ground-truth voiced segments where predicted voicing has gaps\n"
-    analysis += "- **Overall Smoothness Rank**: Average rank across both smoothness metrics (1=best, lower is better)\n\n"
-
-    # Threshold Analysis
-    analysis += "### Optimal Threshold Analysis\n"
-    analysis += "Voicing confidence thresholds that maximize overall performance scores.\n\n"
-    analysis += (
-        "| **Algorithm** | **Mean Threshold** | **Std Dev ↓** | **Range** |\n"
+        + "\n"
     )
-    analysis += "|---|---|---|---|\n"
 
-    threshold_data = []
-    for algo_name in sorted(detailed_metrics.keys()):
-        thresholds = detailed_metrics[algo_name].get("optimal_threshold", [])
-        if thresholds:
-            mean_thresh = np.mean(thresholds)
-            std_thresh = np.std(thresholds)
-            min_thresh = np.min(thresholds)
-            max_thresh = np.max(thresholds)
-            threshold_data.append(
-                {
-                    "name": algo_name,
-                    "mean": mean_thresh,
-                    "std": std_thresh,
-                    "range": f"{min_thresh:.2f}-{max_thresh:.2f}",
-                }
-            )
-        else:
-            threshold_data.append(
-                {"name": algo_name, "mean": None, "std": None, "range": "N/A"}
-            )
-
-    # Find best (lowest std dev)
-    valid_stds = [x["std"] for x in threshold_data if x["std"] is not None]
-    best_std = min(valid_stds) if valid_stds else None
-
-    for data in threshold_data:
-        if data["mean"] is not None:
-            mean_str = f"{data['mean']:.3f}"
-            std_str = f"{data['std']:.3f}"
-            if best_std is not None and abs(data["std"] - best_std) < 1e-6:
-                std_str = f"**{std_str}**"
-            analysis += f"| {data['name']} | {mean_str} | {std_str} | {data['range']} |\n"
-        else:
-            analysis += f"| {data['name']} | N/A | N/A | N/A |\n"
-
-    analysis += "\n"
-
-    # Consistency Analysis
-    analysis += "### Algorithm Consistency\n"
-    analysis += "Measures performance stability across different datasets using Coefficient of Variation (CV = std/mean).\n\n"
-    analysis += (
-        "| **Algorithm** | **Performance CV ↓** | **Threshold CV ↓** |\n"
+    out += _metric_table(
+        detailed_metrics,
+        "Algorithm Consistency",
+        "Stability across datasets (CV = std/mean, lower = more consistent).",
+        [
+            ("Performance CV ↓", lambda d: _cv(d.get("combined_score", [])), "{:.3f}", True),
+            ("Threshold CV ↓", lambda d: _cv(d.get("optimal_threshold", [])), "{:.3f}", True),
+        ],
     )
-    analysis += "|---|---|---|\n"
+    return out
 
-    consistency_data = []
-    for algo_name in sorted(detailed_metrics.keys()):
-        # Get all combined scores for this algorithm across datasets
-        all_scores = []
-        combined_scores = detailed_metrics[algo_name].get("combined_score", [])
-        for score in combined_scores:
-            if score is not None and not np.isnan(score):
-                all_scores.append(score)
 
-        thresholds = detailed_metrics[algo_name].get("optimal_threshold", [])
+# Dataset groupings for the subset analysis (single source; descriptions derived from this).
+DATASET_GROUPS = {
+    "By Origin": {
+        "Synthetic": ["Bach10Synth", "MDBStemSynth", "SpeechSynth", "NSynth"],
+        "Real": ["MIR1K", "PTDB", "Vocadito"],
+    },
+    "By Domain": {
+        "Speech": ["PTDB", "SpeechSynth"],
+        "Music": ["Bach10Synth", "MDBStemSynth", "NSynth", "Vocadito", "MIR1K"],
+    },
+    "By Cross-Dimension": {
+        "Synthetic + Speech": ["SpeechSynth"],
+        "Synthetic + Music": ["Bach10Synth", "MDBStemSynth", "NSynth"],
+        "Real + Speech": ["PTDB"],
+        "Real + Music": ["Vocadito", "MIR1K"],
+    },
+}
 
-        perf_cv = (
-            np.std(all_scores) / np.mean(all_scores)
-            if len(all_scores) > 1 and np.mean(all_scores) > 0
-            else np.nan
-        )
-        thresh_cv = (
-            np.std(thresholds) / np.mean(thresholds)
-            if len(thresholds) > 1 and np.mean(thresholds) > 0
-            else np.nan
-        )
 
-        consistency_data.append(
-            {"name": algo_name, "perf_cv": perf_cv, "thresh_cv": thresh_cv}
-        )
-
-    # Find best (lowest CV values)
-    valid_perf_cvs = [
-        x["perf_cv"] for x in consistency_data if not np.isnan(x["perf_cv"])
-    ]
-    valid_thresh_cvs = [
-        x["thresh_cv"] for x in consistency_data if not np.isnan(x["thresh_cv"])
-    ]
-
-    best_perf_cv = min(valid_perf_cvs) if valid_perf_cvs else np.nan
-    best_thresh_cv = min(valid_thresh_cvs) if valid_thresh_cvs else np.nan
-
-    for data in consistency_data:
-        perf_cv_str = (
-            f"{data['perf_cv']:.3f}" if not np.isnan(data["perf_cv"]) else "N/A"
-        )
-        thresh_cv_str = (
-            f"{data['thresh_cv']:.3f}"
-            if not np.isnan(data["thresh_cv"])
-            else "N/A"
-        )
-
-        if (
-            not np.isnan(data["perf_cv"])
-            and abs(data["perf_cv"] - best_perf_cv) < 1e-6
-        ):
-            perf_cv_str = f"**{perf_cv_str}**"
-        if (
-            not np.isnan(data["thresh_cv"])
-            and abs(data["thresh_cv"] - best_thresh_cv) < 1e-6
-        ):
-            thresh_cv_str = f"**{thresh_cv_str}**"
-
-        analysis += f"| {data['name']} | {perf_cv_str} | {thresh_cv_str} |\n"
-
-    return analysis + "\n"
+def _subcat_score(algo_results, datasets):
+    """Pooled percentage score over the datasets in a subcategory (None if none present)."""
+    pooled = []
+    for dataset in datasets:
+        if dataset in algo_results:  # dataset_name in the JSON is always the exact registry key
+            pooled.extend(algo_results[dataset])
+    return round(float(np.mean(pooled)) * 100, 1) if pooled else None
 
 
 def generate_subset_analysis(
-    aggregated_results: Dict[str, Dict[str, List[float]]],
+    aggregated_results: dict[str, dict[str, list[float]]],
 ) -> str:
-    """Generate analysis by dataset subsets (Origin, Domain, Cross-Dimension)."""
+    """Performance by dataset subset (origin / domain / cross-dimension)."""
     if not aggregated_results:
         return ""
 
-    # Define dataset categories
-    categories = {
-        "origin": {
-            "Synthetic": [
-                "Bach10Synth",
-                "MDBStemSynth",
-                "SpeechSynth",
-                "NSynth",
-            ],
-            "Real": ["MIR1K", "PTDB", "PTDBNoisy", "Vocadito"],
-        },
-        "domain": {
-            "Speech": ["PTDB", "PTDBNoisy", "SpeechSynth"],
-            "Music": [
-                "Bach10Synth",
-                "MDBStemSynth",
-                "NSynth",
-                "Vocadito",
-                "MIR1K",
-            ],
-        },
-        "cross_dimension": {
-            "Synthetic + Speech": ["SpeechSynth"],
-            "Synthetic + Music": ["Bach10Synth", "MDBStemSynth", "NSynth"],
-            "Real + Speech": ["PTDB", "PTDBNoisy"],
-            "Real + Music": ["Vocadito", "MIR1K"],
-        },
-    }
-
     analysis = "## Performance by Dataset Subsets\n\n"
-
-    for category_name, subcategories in categories.items():
-        if category_name == "origin":
-            analysis += "### By Origin\n"
-            analysis += "- **Synthetic**: Bach10Synth, MDBStemSynth, SpeechSynth, NSynth\n"
-            analysis += "- **Real**: MIR1K, PTDB, PTDBNoisy, Vocadito\n\n"
-        elif category_name == "domain":
-            analysis += "### By Domain\n"
-            analysis += "- **Speech**: PTDB, PTDBNoisy, SpeechSynth\n"
-            analysis += "- **Music**: Bach10Synth, MDBStemSynth, NSynth, Vocadito, MIR1K\n\n"
-        elif category_name == "cross_dimension":
-            analysis += "### By Cross-Dimension\n"
-            analysis += "- **Synthetic + Speech**: SpeechSynth\n"
-            analysis += (
-                "- **Synthetic + Music**: Bach10Synth, MDBStemSynth, NSynth\n"
-            )
-            analysis += "- **Real + Speech**: PTDB, PTDBNoisy\n"
-            analysis += "- **Real + Music**: Vocadito, MIR1K\n\n"
-
-        # Create table header
-        header = (
-            "| **Algorithm** | "
-            + " | ".join([f"**{subcat}**" for subcat in subcategories.keys()])
-            + " |\n"
-        )
-        separator = "|" + "---|" * (len(subcategories) + 1) + "\n"
-
-        # Calculate averages for each algorithm-subcategory combination
-        table_data = []
-        for algo_name in sorted(aggregated_results.keys()):
-            row_data = {"algorithm": algo_name, "scores": []}
-
-            for subcat_name, datasets in subcategories.items():
-                subcat_scores = []
-                for dataset in datasets:
-                    # Map common dataset name variations
-                    dataset_variants = [
-                        dataset,
-                        dataset.replace("Synth", ""),
-                        dataset.replace("Synth", "-synth"),
-                        dataset.replace("Synth", "_synth"),
-                        dataset.lower(),
-                        dataset.upper(),
-                    ]
-
-                    for variant in dataset_variants:
-                        if variant in aggregated_results[algo_name]:
-                            scores = aggregated_results[algo_name][variant]
-                            if scores:
-                                subcat_scores.extend(scores)
-                            break
-
-                if subcat_scores:
-                    avg_score = np.mean(subcat_scores) * 100
-                    row_data["scores"].append(avg_score)
-                else:
-                    row_data["scores"].append(None)
-
-            table_data.append(row_data)
-
-        # Find best score in each column for highlighting
-        best_scores = []
-        for col_idx in range(len(subcategories)):
-            col_scores = [
-                row["scores"][col_idx]
-                for row in table_data
-                if row["scores"][col_idx] is not None
-            ]
-            best_scores.append(max(col_scores) if col_scores else None)
-
-        # Generate table rows
-        analysis += header + separator
-        for row in table_data:
-            algo_name = row["algorithm"]
-            formatted_scores = []
-
-            for i, score in enumerate(row["scores"]):
-                if score is not None:
-                    score_str = f"{score:.1f}%"
-                    # Highlight best scores
-                    if (
-                        best_scores[i] is not None
-                        and abs(score - best_scores[i]) < 0.1
-                    ):
-                        score_str = f"**{score_str}**"
-                        if (
-                            i == 0
-                        ):  # If best in first column, also bold algorithm name
-                            algo_name = (
-                                f"**{algo_name}**"
-                                if algo_name[0] != "*"
-                                else algo_name
-                            )
-                    formatted_scores.append(score_str)
-                else:
-                    formatted_scores.append("N/A")
-
-            scores_str = " | ".join(formatted_scores)
-            analysis += f"| {algo_name} | {scores_str} |\n"
-
+    for title, subcats in DATASET_GROUPS.items():
+        analysis += f"### {title}\n"
+        for name, datasets in subcats.items():
+            analysis += f"- **{name}**: {', '.join(datasets)}\n"
         analysis += "\n"
 
+        names = list(subcats)
+        table = {
+            algo: {n: _subcat_score(aggregated_results[algo], subcats[n]) for n in names}
+            for algo in sorted(aggregated_results)
+        }
+        col_vals = {n: [table[a][n] for a in table] for n in names}
+        headers = ["**Algorithm**"] + [f"**{n}**" for n in names]
+        rows = [
+            [algo] + [fmt_best(table[algo][n], col_vals[n], "{:.1f}%") for n in names]
+            for algo in table
+        ]
+        analysis += md_table(headers, rows) + "\n"
     return analysis
+
+
+def _band_weighted(pitch_results, bands, metric):
+    """{algorithm: {band: frame-weighted metric}} across datasets (None if no data)."""
+    agg = defaultdict(lambda: defaultdict(list))  # {algo: {band: [(value, frames)]}}
+    for result in pitch_results:
+        algo = result.get("metadata", {}).get("algorithm_name")
+        per_band = result.get("results", {}).get("per_band")
+        if not algo or not per_band:
+            continue
+        for band in bands:
+            cell = per_band.get(band) or {}
+            v = cell.get(metric)
+            if v is not None and not np.isnan(v):
+                agg[algo][band].append((v, cell.get("valid_frames") or 0))
+
+    table = {}
+    for algo, by_band in agg.items():
+        table[algo] = {}
+        for band in bands:
+            vals = by_band.get(band, [])
+            total = sum(f for _, f in vals)
+            if total > 0:
+                table[algo][band] = sum(v * f for v, f in vals) / total
+            elif vals:
+                table[algo][band] = float(np.mean([v for v, _ in vals]))
+            else:
+                table[algo][band] = None
+    return table
+
+
+def _band_subtable(table, bands, band_ranges, title, better, pct):
+    """Render one algorithms x bands sub-table; `better` = 'max' or 'min'; pct -> '%' else rate."""
+    if not table:
+        return ""
+    lower = better == "min"
+    fmt = "{:.1%}" if pct else "{:.3f}"
+    headers = ["**Algorithm**"] + [f"**{name}**<br>{rng}" for name, rng in band_ranges]
+    rows = []
+    for algo in sorted(table):
+        def col(b):
+            return [table[a][b] for a in table]
+        cells = [fmt_best(table[algo][b], col(b), fmt, lower=lower) for b in bands]
+        rows.append([algo, *cells])
+    return f"### {title}\n\n" + md_table(headers, rows) + "\n"
+
+
+def generate_band_analysis(pitch_results: list[dict]) -> str:
+    """Per-pitch-band RPA + octave/gross error tables (clean audio), frame-weighted.
+
+    Octave/gross are split out from RPA because the documented high-register failure is an
+    octave/gross spike that RPA (which stays high) hides.
+    """
+    band_ranges = [(name, band_label(lo, hi)) for name, lo, hi in PITCH_BANDS]
+    bands = [name for name, _ in band_ranges]
+    subtables = [
+        ("rpa", "Raw Pitch Accuracy (RPA &uarr;)", "max", True),
+        ("octave", "Octave-error rate (&darr;)", "min", False),
+        ("gross", "Gross-error rate (&darr;)", "min", False),
+    ]
+    rendered = [
+        _band_subtable(
+            _band_weighted(pitch_results, bands, metric), bands, band_ranges, title, better, pct
+        )
+        for metric, title, better, pct in subtables
+    ]
+    if not any(rendered):
+        return ""
+    return "## Performance by Pitch Band\n\n*Clean audio, by ground-truth f0 band.*\n\n" + "".join(
+        rendered
+    )
+
+
+# Per-family generalization aggregates rendered after the main robustness table. Additive precedes
+# convolutional (insertion order). `filtering` is intentionally absent: a singleton family needs no
+# mean/worst aggregate, and the >= 2-present guard in _family_aggregate_section is the general net.
+FAMILY_SECTIONS = {
+    "additive": (
+        "Additive-noise generalization",
+        "Across the additive provenances: mean drop and the **worst-provenance** drop (max over "
+        "sources). A low mean with a high worst-provenance flags a tracker robust only on some noise "
+        "types -- a generalization/overfitting signal, since a tracker's training noise is unknown.",
+    ),
+    "convolutional": (
+        "Reverberation generalization",
+        "Across the convolutional conditions (synthetic reverb + physical room): mean drop and the "
+        "**worst-case** drop (max). A low mean with a high worst flags sensitivity to one reverb "
+        "character.",
+    ),
+}
+
+
+def _family_aggregate_section(member_conds, present_conds, table, heading, blurb):
+    """Render a mean-Δ + worst-provenance-Δ table for one condition family. Returns '' unless at
+    least two of the family's conditions are present, so singletons and partial runs are skipped."""
+    conds = [c for c in member_conds if c in present_conds]
+    if len(conds) < 2:
+        return ""
+    fam_mean, fam_worst = {}, {}
+    for algo in table:
+        ds = [table[algo][c] for c in conds if table[algo][c] is not None]
+        fam_mean[algo] = float(np.mean(ds)) if ds else None
+        fam_worst[algo] = float(np.max(ds)) if ds else None   # worst provenance = largest drop
+    order = sorted(fam_worst, key=lambda a: (fam_worst[a] is None, fam_worst[a] or 0.0))
+    mvals, wvals = [fam_mean[a] for a in order], [fam_worst[a] for a in order]
+    headers = ["**Algorithm**", "**mean Δ** ↓", "**worst-provenance Δ** ↓"]
+    rows = [
+        [a, fmt_best(fam_mean[a], mvals, "{:.1f}", lower=True),
+         fmt_best(fam_worst[a], wvals, "{:.1f}", lower=True)]
+        for a in order
+    ]
+    return f"\n### {heading}\n\n{blurb}\n\n" + md_table(headers, rows) + "\n"
+
+
+def generate_robustness_analysis(probe_results: list[dict]) -> tuple[str, dict[str, float]]:
+    """Δ-from-clean (combined-score percentage points) per degradation, on the probe.
+
+    Returns (markdown_section, {algorithm: mean_delta}) where mean_delta is the average drop
+    across conditions (lower = more robust), surfaced as a column in the leaderboard.
+    """
+    scores = defaultdict(lambda: defaultdict(dict))  # {algo: {condition: {dataset: score}}}
+    for result in probe_results:
+        m = result.get("metadata", {})
+        algo, ds, cond = (
+            m.get("algorithm_name"),
+            m.get("dataset_name"),
+            m.get("condition"),
+        )
+        sc = result.get("results", {}).get("combined_score")
+        if algo and ds and cond and sc is not None and not np.isnan(sc):
+            scores[algo][cond][ds] = sc
+
+    conditions = sorted({c for a in scores for c in scores[a] if c != "clean"})
+    if not scores or not conditions:
+        return "", {}
+
+    table, mean_delta = {}, {}
+    for algo, by_cond in scores.items():
+        clean = by_cond.get("clean", {})
+        table[algo] = {}
+        deltas = []
+        for cond in conditions:
+            cd = by_cond.get(cond, {})
+            paired = [clean[d] - cd[d] for d in cd if d in clean]
+            if paired:
+                delta = float(np.mean(paired)) * 100.0
+                table[algo][cond] = delta
+                deltas.append(delta)
+            else:
+                table[algo][cond] = None
+        mean_delta[algo] = float(np.mean(deltas)) if deltas else None
+
+    analysis = "## Robustness (By Condition)\n\n"
+    analysis += (
+        "Δ-from-clean in combined-score percentage points (**lower = more robust**), measured "
+        "on the robustness probe. All conditions are label-preserving (ground-truth f0 stays "
+        "valid).\n\n"
+    )
+    order = sorted(table, key=lambda a: (mean_delta[a] is None, mean_delta[a] or 0.0))
+    col_vals = {c: [table[a][c] for a in order] for c in conditions}
+    md_vals = [mean_delta[a] for a in order]
+    headers = ["**Algorithm**"] + [f"**{c}** ↓" for c in conditions] + ["**mean Δ** ↓"]
+    rows = []
+    for algo in order:
+        cells = [algo] + [
+            fmt_best(table[algo][c], col_vals[c], "{:.1f}", lower=True) for c in conditions
+        ]
+        cells.append(fmt_best(mean_delta[algo], md_vals, "{:.1f}", lower=True))
+        rows.append(cells)
+
+    # Per-family generalization aggregates (additive, convolutional). The per-condition columns are
+    # already above; each family section surfaces the mean and the WORST-case (max) drop over its
+    # members. Uniformly-low = genuinely robust; low mean but high worst = likely overfit to one
+    # provenance/character -- the fair generalization signal, since a tracker's training data is
+    # unknown. Rendered only when >= 2 of a family's conditions are present (see FAMILY_SECTIONS).
+    family_sections = "".join(
+        _family_aggregate_section(CONDITION_FAMILIES[fam], conditions, table, heading, blurb)
+        for fam, (heading, blurb) in FAMILY_SECTIONS.items()
+    )
+    return analysis + md_table(headers, rows) + "\n" + family_sections, mean_delta
 
 
 def main():
@@ -1001,38 +993,77 @@ def main():
         return 1
 
     print(f"Loading results from {args.results_dir}...")
-    pitch_results, speed_results = load_all_results(args.results_dir)
+    pitch_results, speed_results, ood_results = load_all_results(args.results_dir)
+    pitch_results = _dedupe_prefer_cpu(pitch_results, _pitch_key)   # one row per cell, prefer cpu
+    ood_results = _dedupe_prefer_cpu(ood_results, _ood_key)         # same for OOD (no device mixing)
 
     print(
         f"Found {len(pitch_results)} pitch benchmark results and {len(speed_results)} speed benchmark results."
     )
 
-    # Process data
-    aggregated_pitch = aggregate_pitch_results(pitch_results)
-    aggregated_speed = aggregate_speed_results(speed_results)
-    detailed_metrics = collect_detailed_metrics(pitch_results)
+    # The leaderboard reports CLEAN accuracy only; degraded conditions are summarized separately
+    # (robustness). Results without a condition default to clean.
+    clean_results = [
+        r
+        for r in pitch_results
+        if r.get("metadata", {}).get("condition", "clean") == "clean"
+        and not r.get("metadata", {}).get("probe")
+    ]
+    probe_results = [
+        r for r in pitch_results if r.get("metadata", {}).get("probe")
+    ]
+    print(
+        f"Using {len(clean_results)} clean pitch results for the leaderboard, "
+        f"{len(probe_results)} probe results for robustness."
+    )
 
-    # Generate report sections
+    # Diagnostics for the "results present but nothing renders" gotchas. A run capped with
+    # --max-samples / --max-seconds is tagged as a robustness PROBE (probe=True), so it never feeds
+    # the leaderboard; and a probe with only the clean condition can't produce a robustness table
+    # (that needs paired degraded runs). Surface both clearly instead of failing silently.
+    report_note = ""
+    probe_conditions = {
+        r.get("metadata", {}).get("condition", "clean") for r in probe_results
+    }
+    if not clean_results:
+        if probe_results:
+            report_note += (
+                f"> **Note:** found {len(probe_results)} result(s) but **0 clean full-dataset "
+                "results**, so the leaderboard is empty. Runs with `--max-samples`/`--max-seconds` "
+                "are tagged as robustness **probes** and do not feed the leaderboard; re-run "
+                "**without** those caps to get a leaderboard entry.\n\n"
+            )
+        else:
+            report_note += (
+                "> **Note:** no pitch results were found in the results directory.\n\n"
+            )
+    if probe_results and probe_conditions <= {"clean"}:
+        report_note += (
+            "> **Note:** the robustness table is empty: the probe runs are all the `clean` "
+            "baseline. Robustness needs paired **degraded** probe runs "
+            "(`--degradation white|pink|chime|demand|telephone|reverb|room`).\n\n"
+        )
+    if report_note:
+        print("WARNING:\n" + report_note.replace("> ", "  ").replace("**", ""))
+
+    aggregated_pitch = aggregate_pitch_results(clean_results)
+    aggregated_speed = aggregate_speed_results(speed_results)
+    detailed_metrics = collect_detailed_metrics(clean_results)
+    robustness_section, robustness_score = generate_robustness_analysis(probe_results)
+
     print("Generating analysis report...")
 
     report = "# Pitch Detection Algorithm Benchmark Report\n\n"
-
-    # Add methodology section
+    report += report_note  # surfaces the "probe-only / empty" gotchas in the report itself
     report += generate_methodology_section()
-
-    # Add dataset descriptions
     report += generate_dataset_descriptions()
-
-    # Add main performance table
-    report += generate_combined_score_table(aggregated_pitch)
-
-    # Add speed table
+    # main performance table carries the robustness mean-Δ column
+    report += generate_combined_score_table(aggregated_pitch, robustness=robustness_score)
+    report += generate_band_analysis(clean_results)
+    report += robustness_section
+    report += generate_ood_analysis(ood_results)
     report += generate_speed_table(aggregated_speed)
-
-    # Add detailed analysis
     report += generate_detailed_analysis(detailed_metrics)
-
-    # Add subset analysis
     report += generate_subset_analysis(aggregated_pitch)
 
     # Write report

@@ -1,11 +1,14 @@
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 
+from resampling import resample_to_grid
+
+from .augment import item_seed
 from .base import PitchDataset
 
 
@@ -71,8 +74,8 @@ class LightSpeech(nn.Module):
         tone_embedding: int = 16,
         d_model: int = 512,
         layer_dropout: float = 0.2,
-        encoder_kernel_sizes: List[int] = [5, 25, 13, 9],
-        decoder_kernel_sizes: List[int] = [17, 21, 9, 3],
+        encoder_kernel_sizes: tuple[int, ...] = (5, 25, 13, 9),
+        decoder_kernel_sizes: tuple[int, ...] = (17, 21, 9, 3),
         duration_layers: int = 1,
         duration_kernel_size: int = 3,
         duration_dropout: float = 0.25,
@@ -154,25 +157,14 @@ class LightSpeech(nn.Module):
         bsz, time, feats = x.shape
         if bsz > 1:
             cumulative_durations = torch.cumsum(durations, dim=1)
-
-            # Create a range tensor for each batch item
             expanded_range = (
                 torch.arange(mel_time, device=x.device).unsqueeze(0).expand(bsz, -1)
             )
-
-            # Create a mask for valid positions
             mask = expanded_range.unsqueeze(1) >= cumulative_durations.unsqueeze(2)
-
-            # Calculate source indices
             source_indices = mask.long().sum(dim=1)
-
-            # Clamp the indices to handle cases where mel_time > total_duration
+            # Clamp indices for the case mel_time > total_duration.
             source_indices = torch.clamp(source_indices, 0, time - 1)
-
-            # Create the gather indices tensor
             gather_indices = source_indices.unsqueeze(-1).expand(-1, -1, feats)
-
-            # Gather the input tensor based on the calculated indices
             return torch.gather(x, 1, gather_indices)
         else:
             indices = torch.arange(time, device=x.device)
@@ -186,11 +178,11 @@ class LightSpeech(nn.Module):
         speakers: Tensor,
         tokens: Tensor,
         tones: Tensor,
-        pitches: Optional[Tensor] = None,
-        periodicity: Optional[Tensor] = None,
-        durations: Optional[Tensor] = None,
-        mels: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        pitches: Tensor | None = None,
+        periodicity: Tensor | None = None,
+        durations: Tensor | None = None,
+        mels: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         x = torch.cat(
             (self.embed_tokens(tokens), self.embed_tones(tones)), dim=-1
         ).transpose(1, 2)
@@ -244,19 +236,52 @@ class LightSpeech(nn.Module):
 
 class PitchDatasetSpeechSynth(PitchDataset):
     """
-    Implementation of PitchDataset using synthetic speech generation with LightSpeech.
+    Synthetic Mandarin speech with EXACT pitch/voicing ground truth, generated on the fly.
 
-    This dataset generates synthetic speech samples using a LightSpeech TTS model and vocoder,
-    providing audio along with corresponding pitch and periodicity labels. The dataset
-    generates samples for each speaker, using Chinese words.
+    How a sample is made (default, exact_f0=True):
+      1. A LightSpeech TTS model (trained in lars76/fastspeech2-clean on AISHELL-3 + biaobei +
+         more, 219 speakers) INVENTS a per-frame f0/periodicity contour and a mel spectrogram for
+         a random Chinese word sequence. The contour is a generative output, not a measurement of
+         any waveform -- it becomes the label.
+      2. A HiFi-GAN vocoder renders the mel to audio. This audio is used only as a TIMBRE DONOR.
+      3. WORLD re-synthesizes the final waveform FROM the label contour: CheapTrick (spectral
+         envelope) and D4C (aperiodicity) analyze the donor's voice character, and
+         pyworld.synthesize generates the excitation with pulses placed at exactly 1/f0(t) of the
+         label, silence/noise where the label is unvoiced.
+
+    No pitch DETECTION happens anywhere in this pipeline: pitch flows from the labels into the
+    waveform, never the other way, so the labels are true by construction (WORLD's DIO/Harvest
+    estimators are NOT used; only its synthesizer is). Verified empirically against
+    timestamp-calibrated trackers: 4-8 cents label floor and +0.95 ms label-offset consensus,
+    the same exactness class as MDB-stem-synth / Bach10Synth (see TIMING.md).
+
+    Why the imposition step exists: the raw HiFi-GAN audio does NOT realize the conditioning
+    contour faithfully (~25 cents median deviation; 42 cents residual even after a per-utterance
+    linear fit) because LightSpeech's decoder was trained with mistimed pitch labels (index-warped
+    PENN targets in the upstream preprocessing) and learned to treat pitch conditioning as a soft
+    hint. exact_f0=False returns that raw audio with the therefore-mislabeled contour, for
+    listening/debugging only -- never for benchmarking.
+
+    Character caveats (documented, accepted): the audio is analysis/synthesis (WORLD-vocoded)
+    rather than raw neural speech, and the invented prosody is somewhat idealized. Exactness of
+    the ground truth is the property this corpus exists for.
+
+    Requires pyworld for the default exact_f0 path: `uv sync --extra speechsynth` (also included
+    in the dio/harvest extras and in --all-extras).
 
     Args:
-        root_file (str): Path to the LightSpeech model file. Defaults to "lightspeech.pt"
-        samples_per_speaker (int): Number of samples per speaker. Defaults to 10
+        root_dir (str): Path to the TTS model checkpoint (LightSpeech architecture).
+            Defaults to "datasets/speechsynth.pt".
+        samples_per_speaker (int): Number of samples per speaker. Defaults to 1
         word_range (Tuple): Range of words per generated sample. Defaults to (3, 9)
         periodicity_threshold (float): Threshold for periodicity detection. Defaults to 0.4
         device (str): Device to run inference on. Defaults to "cuda"
-        vocoder_name (str): Vocoder model name. Defaults to "hifigan_lj_ft_t2_v1"
+        vocoder_name (Optional[str]): Vocoder model name; None (default) uses the vocoder recorded
+            in the checkpoint (the artifact knows what it was built for)
+        exact_f0 (bool): Re-synthesize with the label f0 imposed (see above). Defaults to True
+        seed (int): Corpus seed; sample idx is a pure function of (checkpoint, seed, idx) via a
+            per-index private RNG, so the corpus is identical across runs, processes and access
+            orders. Deliberately independent of the benchmark run seed. Defaults to 0
         use_cache (bool): Whether to cache generated samples. Defaults to True
         **kwargs: Additional arguments passed to PitchDataset
     """
@@ -266,16 +291,18 @@ class PitchDatasetSpeechSynth(PitchDataset):
 
     def __init__(
         self,
-        root_dir: str = "lightspeech.pt",
+        root_dir: str = "datasets/speechsynth.pt",
         samples_per_speaker: int = 1,
-        word_range: Tuple = (3, 9),
+        word_range: tuple = (3, 9),
         periodicity_threshold: float = 0.4,
         device: str = "cuda",
-        vocoder_name: str = "hifigan_lj_ft_t2_v1",
+        vocoder_name: str | None = None,
+        exact_f0: bool = True,
+        seed: int = 0,
         use_cache: bool = True,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(use_cache=use_cache, **kwargs)
 
         if device == "cuda" and not torch.cuda.is_available():
             device = "cpu"
@@ -286,8 +313,8 @@ class PitchDatasetSpeechSynth(PitchDataset):
         self.periodicity_threshold = periodicity_threshold
         self.device = torch.device(device)
         self.vocoder_name = vocoder_name
-        self.use_cache = use_cache
-        self.data_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.exact_f0 = exact_f0
+        self.seed = seed
 
         self._initialize_models()
 
@@ -301,9 +328,9 @@ class PitchDatasetSpeechSynth(PitchDataset):
                 self.model_file, map_location=self.device, weights_only=False
             )
         except FileNotFoundError:
-            raise FileNotFoundError(f"Model file '{self.model_file}' not found")
+            raise FileNotFoundError(f"Model file '{self.model_file}' not found") from None
         except Exception as e:
-            raise IOError(f"Error loading model file '{self.model_file}': {str(e)}")
+            raise OSError(f"Error loading model file '{self.model_file}': {e!s}") from e
 
         # Initialize LightSpeech model
         self.tts_model = (
@@ -317,7 +344,11 @@ class PitchDatasetSpeechSynth(PitchDataset):
         )
         self.tts_model.load_state_dict(state_dict["state_dict"], strict=True)
 
-        # Initialize vocoder
+        # Initialize vocoder. None -> the one recorded in the checkpoint: the artifact knows what
+        # it was built for (an earlier hardcoded default silently used hifigan_lj_ft_t2_v1, an
+        # LJSpeech-finetuned single-speaker vocoder, while the checkpoint records the universal one).
+        if self.vocoder_name is None:
+            self.vocoder_name = state_dict.get("vocoder_name", "hifigan_universal_v1")
         try:
             self.vocoder = torch.hub.load(
                 "lars76/bigvgan-mirror",
@@ -327,7 +358,7 @@ class PitchDatasetSpeechSynth(PitchDataset):
                 verbose=False,
             ).to(self.device)
         except Exception as e:
-            raise RuntimeError(f"Error loading vocoder: {str(e)}")
+            raise RuntimeError(f"Error loading vocoder: {e!s}") from e
 
         # Store model parameters and dictionaries
         self.num_speakers = state_dict["num_speakers"]
@@ -341,7 +372,7 @@ class PitchDatasetSpeechSynth(PitchDataset):
         # Extract available pinyin words (excluding special tokens)
         self.available_words = [
             word
-            for word in self.pinyin_to_ipa.keys()
+            for word in self.pinyin_to_ipa
             if not word.startswith("<") and not word.endswith(">")
         ]
 
@@ -373,7 +404,7 @@ class PitchDatasetSpeechSynth(PitchDataset):
 
         return ipa_string.strip()
 
-    def _convert_ipa_to_tokens(self, ipa_text: str) -> Tuple[List[int], List[int]]:
+    def _convert_ipa_to_tokens(self, ipa_text: str) -> tuple[list[int], list[int]]:
         """Convert IPA text to token and tone IDs."""
         token_ids = []
         tone_ids = []
@@ -403,23 +434,25 @@ class PitchDatasetSpeechSynth(PitchDataset):
 
         return token_ids, tone_ids
 
-    def _generate_word_sequence(self) -> Tuple[List[int], List[int]]:
-        """Generate a sequence of real words and convert to tokens."""
-        # Select random number of words within range
-        num_words = random.randint(*self.word_range)
-        selected_words = random.sample(
+    def _generate_word_sequence(self, idx: int) -> tuple[list[int], list[int]]:
+        """Generate sample `idx`'s word sequence and convert to tokens.
+
+        The words come from a PRIVATE RNG seeded per (dataset seed, idx) -- the same pattern the
+        augmentation layer uses (datasets/augment.py) -- so sample `idx` is a pure function of
+        (checkpoint, seed, idx). Drawing from the GLOBAL `random` stream instead would make each
+        sample depend on everything that consumed the stream earlier (other libraries, access
+        order, cache state), silently changing the corpus between otherwise-identical runs. The
+        default seed is a constant, deliberately DECOUPLED from the benchmark run seed: the corpus
+        stays fixed across runs (like every file-backed dataset) and the run seed varies only the
+        augmentation noise."""
+        rng = random.Random(item_seed(self.seed, idx))
+        num_words = rng.randint(*self.word_range)
+        selected_words = rng.sample(
             self.available_words, min(num_words, len(self.available_words))
         )
-
-        # Create pinyin text with default tones
         pinyin_text = " ".join(selected_words)
-
-        # Convert to IPA
         ipa_text = self._convert_pinyin_to_ipa(pinyin_text)
-
-        # Convert to tokens
         token_ids, tone_ids = self._convert_ipa_to_tokens(ipa_text)
-
         return token_ids, tone_ids
 
     def get_group(self, idx: int) -> str:
@@ -437,66 +470,102 @@ class PitchDatasetSpeechSynth(PitchDataset):
     )
     @torch.inference_mode()
     def _generate_tts_sample(
-        self, speaker_id: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate a single TTS sample with audio, pitch, and periodicity."""
-        # Generate word sequence
-        token_ids, tone_ids = self._generate_word_sequence()
+        self, speaker_id: int, idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate sample `idx` (audio, pitch, periodicity) for `speaker_id`."""
+        token_ids, tone_ids = self._generate_word_sequence(idx)
 
-        # Always add silence at beginning and end
+        # Pad with silence at both ends.
         sil_token = self.ipa_to_token["<sil>"]
-        token_ids = [sil_token] + token_ids + [sil_token]
-        tone_ids = [1] + tone_ids + [1]
+        token_ids = [sil_token, *token_ids, sil_token]
+        tone_ids = [1, *tone_ids, 1]
 
-        # Convert to tensors
         speaker_id_tensor = torch.tensor([speaker_id], dtype=torch.long).to(self.device)
         tokens_tensor = torch.tensor([token_ids], dtype=torch.long).to(self.device)
         tone_ids_tensor = torch.tensor([tone_ids], dtype=torch.long).to(self.device)
 
         try:
-            # Generate mel spectrogram and features
-            mel, dur, pitch, periodicity = self.tts_model(
+            mel, _dur, pitch, periodicity = self.tts_model(
                 speaker_id_tensor, tokens_tensor, tone_ids_tensor
             )
 
-            # Generate waveform
             wav = self.vocoder(mel.transpose(1, 2)).flatten().cpu()
 
-            # Convert pitch
+            # De-normalize the model's pitch output back to Hz, binarize voicing, and zero the
+            # contour on unvoiced frames (pitch > 0 <=> voiced, the shared label contract).
             pitch = 75.3236 * pitch.flatten().cpu() + 224.5344
             periodicity = (
                 periodicity.flatten().cpu() > self.periodicity_threshold
             ).float()
+            pitch = pitch * periodicity
 
-            # Process the sample using parent class method
+            # Labels are at the mel frame rate; the vocoder upsamples each mel frame to
+            # (len(wav)/len(pitch)) samples, so the native hop in seconds is that ratio over the
+            # vocoder sample rate. Mel frame i is NOT centered at i*hop: the upstream preprocessing
+            # (lars76/fastspeech2-clean, compute_mel) pads (n_fft - hop)/2 with center=False, so
+            # the analysis window centre sits at i*hop + (hop-1)/2 samples (+5.8 ms at 22.05 kHz).
+            # Anchoring the contour there keeps the imposed f0 in sync with the donor envelope's
+            # phonetic content (and is the honest stamp for the exact_f0=False debug path).
+            native_hop = (wav.numel() / pitch.numel()) / self.vocoder.sampling_rate
+            mel_center = (self.vocoder.hop_size - 1) / 2 / self.vocoder.sampling_rate
+            label_times = np.arange(pitch.numel()) * native_hop + mel_center
+
+            if self.exact_f0:
+                wav, pitch, periodicity, label_times = self._impose_f0(wav, pitch, label_times)
+
             wav, pitch, periodicity = self.process_sample(
-                wav, pitch, periodicity, self.vocoder.sampling_rate
+                wav, pitch, periodicity, self.vocoder.sampling_rate, label_times=label_times
             )
 
             return wav, pitch, periodicity
 
         except Exception as e:
-            raise RuntimeError(f"Error during TTS generation: {str(e)}")
+            raise RuntimeError(f"Error during TTS generation: {e!s}") from e
 
-    def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, int]]:
-        if not 0 <= idx < len(self):
-            raise IndexError(
-                f"Index {idx} out of range for dataset of size {len(self)}"
-            )
+    def _impose_f0(
+        self, wav: torch.Tensor, pitch: torch.Tensor, label_times: np.ndarray
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
+        """WORLD-resynthesize the neural audio with the label contour IMPOSED (class docstring).
 
+        Returns (wav, pitch, periodicity, label_times) on WORLD's 5 ms analysis grid; the
+        synthesized waveform realizes exactly that f0, so the labels are true by construction."""
+        # Lazy: only the exact_f0 path needs pyworld.
+        try:
+            import pyworld
+        except ImportError as e:
+            raise ImportError(
+                "SpeechSynth's exact_f0 resynthesis needs pyworld; install it with "
+                "`uv sync --extra speechsynth` (also included in the dio/harvest extras)."
+            ) from e
+
+        fs = self.vocoder.sampling_rate
+        x = np.ascontiguousarray(wav.numpy().astype(np.float64))
+        frame_period_s = pyworld.default_frame_period / 1000.0  # 5 ms
+        t = np.arange(int(len(x) / fs / frame_period_s) + 1) * frame_period_s
+        # Label contour onto WORLD's grid at true times, gap-aware (never interpolates through
+        # the unvoiced 0 sentinel) -- the benchmark's one resampler.
+        f0, _ = resample_to_grid(
+            pitch.numpy(),
+            (pitch.numpy() > 0).astype(np.float64),
+            label_times,
+            t,
+            voicing_kind="nearest",
+        )
+        f0 = np.ascontiguousarray(f0)
+        envelope = pyworld.cheaptrick(x, f0, t, fs)
+        aperiodicity = pyworld.d4c(x, f0, t, fs)
+        y = pyworld.synthesize(f0, envelope, aperiodicity, fs, pyworld.default_frame_period)
+        pitch = torch.from_numpy(f0).float()
+        return torch.from_numpy(y).float(), pitch, (pitch > 0).float(), t
+
+    def _load_sample(self, idx: int) -> dict[str, torch.Tensor | int]:
         # Calculate which speaker this sample belongs to
         speaker_id = idx // self.samples_per_speaker
 
-        if idx not in self.data_cache or not self.use_cache:
-            try:
-                waveform, pitch, periodicity = self._generate_tts_sample(speaker_id)
-
-                if self.use_cache:
-                    self.data_cache[idx] = (waveform, pitch, periodicity)
-            except Exception as e:
-                raise RuntimeError(f"Error generating sample at index {idx}: {str(e)}")
-        else:
-            waveform, pitch, periodicity = self.data_cache[idx]
+        try:
+            waveform, pitch, periodicity = self._generate_tts_sample(speaker_id, idx)
+        except Exception as e:
+            raise RuntimeError(f"Error generating sample at index {idx}: {e!s}") from e
 
         return {
             "audio": waveform.float(),

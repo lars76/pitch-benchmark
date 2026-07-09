@@ -1,251 +1,102 @@
 import argparse
 import gc
+import importlib.util
 import json
 import os
 import random
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Dict
 
 import numpy as np
 import torch
-from scipy.ndimage import find_objects, label
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from algorithms import get_algorithm, list_algorithms
-from datasets import CHiMeNoiseDataset, get_pitch_dataset, list_pitch_datasets
+from algorithms import (
+    build_algorithm,
+    get_algorithm,
+    list_algorithms,
+    resolve_requested_algorithms,
+)
+from datasets import (
+    REGISTRY,
+    Augment,
+    Truncate,
+    build_pipeline,
+    get_pitch_dataset,
+    list_pitch_datasets,
+    subset,
+)
+from metrics import (
+    DEFAULT_THRESHOLDS,
+    MetricAccumulator,
+    is_voiced,
+    summarize_threshold_sweep,
+    to_json_safe,
+)
 
 
-def evaluate_voicing_detection(
-    pred_voiced: np.ndarray, true_voiced: np.ndarray
-) -> Dict:
-    true_pos = np.sum(pred_voiced & true_voiced)
-    false_pos = np.sum(pred_voiced & ~true_voiced)
-    false_neg = np.sum(~pred_voiced & true_voiced)
-    precision = true_pos / (true_pos + false_pos) if (true_pos + false_pos) > 0 else 0.0
-    recall = true_pos / (true_pos + false_neg) if (true_pos + false_neg) > 0 else 0.0
-    f1 = (
-        0.0
-        if (precision + recall) == 0
-        else 2 * precision * recall / (precision + recall)
-    )
-    return {"precision": precision, "recall": recall, "f1": f1}
-
-
-def evaluate_pitch_accuracy(
-    pitch_pred: np.ndarray,
-    pitch_true: np.ndarray,
-    valid_mask: np.ndarray,
-    epsilon: float = 50.0,
-    gross_error_threshold: float = 200.0,
-) -> Dict:
-    if len(pitch_pred) != len(pitch_true):
-        raise ValueError(
-            f"Length mismatch: pred={len(pitch_pred)}, true={len(pitch_true)}"
-        )
-
-    if not np.any(valid_mask):
-        return {
-            "rmse": np.nan,
-            "cents_error": np.nan,
-            "rpa": np.nan,
-            "rca": np.nan,
-            "octave_error_rate": np.nan,
-            "gross_error_rate": np.nan,
-            "valid_frames": 0,
-        }
-
-    pred = pitch_pred[valid_mask]
-    true = pitch_true[valid_mask]
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        cents_diff = np.abs(1200 * np.log2(pred / true))
-
-    rpa = np.nanmean(cents_diff < epsilon)
-    wrapped_cents_diff = cents_diff % 1200
-    chroma_diff = np.minimum(wrapped_cents_diff, 1200 - wrapped_cents_diff)
-    rca = np.nanmean(chroma_diff < epsilon)
-    gross_error_rate = np.nanmean(cents_diff > gross_error_threshold)
-
-    relative_error = np.abs(pred - true) / (true + np.finfo(float).eps)
-    octave_errors = np.logical_or(
-        relative_error > 0.4, (cents_diff > 1100) & (cents_diff < 1300)
-    )
-    octave_error_rate = np.nanmean(octave_errors)
-
+def _failure_dict(skipped_samples: int) -> dict:
+    """NaN-filled result for an algorithm whose run was invalidated (a clip raised, or no data)."""
     return {
-        "rmse": np.sqrt(np.nanmean((pred - true) ** 2)),
-        "cents_error": np.nanmean(cents_diff),
-        "rpa": rpa,
-        "rca": rca,
-        "octave_error_rate": octave_error_rate,
-        "gross_error_rate": gross_error_rate,
-        "valid_frames": int(np.sum(valid_mask)),
+        "voicing_detection": {"f1": np.nan, "precision": np.nan, "recall": np.nan},
+        "pitch_accuracy": {
+            "rmse": np.nan, "cents_error": np.nan, "rpa": np.nan, "rca": np.nan,
+            "octave_error_rate": np.nan, "gross_error_rate": np.nan, "valid_frames": 0,
+        },
+        "smoothness_metrics": {"relative_smoothness": np.nan, "continuity_breaks": np.nan},
+        "combined_score": np.nan,
+        "optimal_threshold": np.nan,
+        "threshold_sweep": [],
+        "coverage": {"clips_evaluated": 0, "clips_skipped": skipped_samples},
     }
-
-
-def evaluate_pitch_smoothness(
-    pitch_pred: np.ndarray, pred_voicing: np.ndarray, true_voicing: np.ndarray
-) -> Dict[str, float]:
-    relative_smoothness, continuity_breaks = np.nan, np.nan
-    voiced_idx = np.where(pred_voicing)[0]
-    if len(voiced_idx) >= 2:
-        consecutive_mask = np.diff(voiced_idx) == 1
-        starts_idx = voiced_idx[:-1][consecutive_mask]
-        ends_idx = voiced_idx[1:][consecutive_mask]
-        if starts_idx.size > 0:
-            pitch_starts = pitch_pred[starts_idx]
-            pitch_ends = pitch_pred[ends_idx]
-            valid_pairs_mask = (pitch_starts > 0) & (pitch_ends > 0)
-            if np.any(valid_pairs_mask):
-                pitch_starts = pitch_starts[valid_pairs_mask]
-                pitch_ends = pitch_ends[valid_pairs_mask]
-                rel_changes = np.abs(pitch_ends - pitch_starts) / (pitch_starts + 1e-8)
-                mean_chg, std_chg = np.mean(rel_changes), np.std(rel_changes)
-                if mean_chg > 1e-9:
-                    relative_smoothness = std_chg / mean_chg
-                else:
-                    relative_smoothness = 0.0 if std_chg < 1e-8 else np.nan
-
-    labeled_segments, num_segments = label(true_voicing)
-    if num_segments > 0:
-        gt_segments = find_objects(labeled_segments)
-        break_count = 0
-        total_relevant_segments = 0
-        for seg_slice_tuple in gt_segments:
-            seg_slice = seg_slice_tuple[0]
-            if seg_slice.stop - seg_slice.start > 1:
-                total_relevant_segments += 1
-                if not np.all(pred_voicing[seg_slice]):
-                    break_count += 1
-        if total_relevant_segments > 0:
-            continuity_breaks = break_count / total_relevant_segments
-
-    return {
-        "relative_smoothness": float(relative_smoothness),
-        "continuity_breaks": float(continuity_breaks),
-    }
-
-
-def calculate_processed_metrics(voicing_metrics: Dict, pitch_metrics: Dict) -> Dict:
-    cents_error = pitch_metrics.get("cents_error", 500)
-    if cents_error is None:
-        cents_error = 500
-
-    octave_error_rate = pitch_metrics.get("octave_error_rate", 1.0)
-    if octave_error_rate is None:
-        octave_error_rate = 1.0
-
-    gross_error_rate = pitch_metrics.get("gross_error_rate", 1.0)
-    if gross_error_rate is None:
-        gross_error_rate = 1.0
-
-    return {
-        "rpa": pitch_metrics.get("rpa", 0.0),
-        "cents_accuracy": np.exp(-cents_error / 500.0),
-        "voicing_recall": voicing_metrics.get("recall", 0.0),
-        "voicing_precision": voicing_metrics.get("precision", 0.0),
-        "octave_accuracy": np.exp(-octave_error_rate * 10.0),
-        "gross_error_accuracy": np.exp(-gross_error_rate * 5.0),
-        "voicing_f1": voicing_metrics.get("f1", 0.0),
-        "rca": pitch_metrics.get("rca", 0.0),
-        "rmse_hz": pitch_metrics.get("rmse", np.nan),
-        "cents_error": pitch_metrics.get("cents_error", np.nan),
-        "octave_error_rate": pitch_metrics.get("octave_error_rate", np.nan),
-        "gross_error_rate": pitch_metrics.get("gross_error_rate", np.nan),
-    }
-
-
-def calculate_combined_score(voicing_metrics: Dict, pitch_metrics: Dict) -> float:
-    processed = calculate_processed_metrics(voicing_metrics, pitch_metrics)
-    components = [
-        processed["rpa"],
-        processed["cents_accuracy"],
-        processed["voicing_recall"],
-        processed["voicing_precision"],
-        processed["octave_accuracy"],
-        processed["gross_error_accuracy"],
-    ]
-    valid_components = [c for c in components if c and c > 0 and not np.isnan(c)]
-    if not valid_components:
-        return 0.0
-    return len(valid_components) / sum(1.0 / c for c in valid_components)
 
 
 def run_single_evaluation(
-    dataset: Dataset, algorithm_class: object, thresholds: np.ndarray
-) -> Dict:
+    dataset: Dataset,
+    algorithm_class: object,
+    thresholds: np.ndarray,
+    device: str = "auto",
+) -> tuple[dict, bool]:
+    """Evaluate one algorithm on one dataset with a streaming, O(1)-memory threshold sweep.
+
+    Metrics fold in one clip at a time (metrics.MetricAccumulator, one per threshold), so runner
+    memory is independent of dataset size and clip length, and identical to evaluating on the fully
+    concatenated arrays.
+
+    Returns ``(metrics, crashed)``. ``crashed`` is True only when a clip raised (e.g. OOM); the caller
+    stamps it into ``metadata.crashed`` so the report counts it as 0 (not dropped) and the failed cell
+    is cached like any other. A deterministically empty run (all clips unvoiced, or no finite
+    threshold) returns crashed=False -- it is a normal cached result.
+
+    Memory: device cache is released once per algorithm at teardown, NOT per clip. PyTorch's
+    caching allocator reuses freed blocks within a run, so emptying per clip only adds malloc churn;
+    the per-call peak is already bounded by each algorithm's internal windowing. A light periodic
+    gc() guards against reference cycles left by some DSP libraries.
     """
-    Runs a full evaluation for a single algorithm on a given dataset.
-
-    This function incorporates:
-    1. Strict Failure Handling: If processing any sample fails, the entire
-       run for that algorithm is invalidated, and a result with NaN values
-       is returned.
-    2. Memory Leak Prevention: Explicitly clears GPU cache and calls the
-       garbage collector after each sample to prevent memory accumulation.
-    """
-
-    def _get_failure_dict() -> Dict:
-        """Returns a dictionary structured for a failed run."""
-        return {
-            "voicing_detection": {
-                "f1": np.nan,
-                "precision": np.nan,
-                "recall": np.nan,
-            },
-            "pitch_accuracy": {
-                "rmse": np.nan,
-                "cents_error": np.nan,
-                "rpa": np.nan,
-                "rca": np.nan,
-                "octave_error_rate": np.nan,
-                "gross_error_rate": np.nan,
-                "valid_frames": 0,
-            },
-            "smoothness_metrics": {
-                "relative_smoothness": np.nan,
-                "continuity_breaks": np.nan,
-            },
-            "combined_score": np.nan,
-            "optimal_threshold": np.nan,
-        }
-
-    def _to_json_safe(d: Dict) -> Dict:
-        """Converts numpy types in a dictionary to JSON-serializable types."""
-        safe_dict = {}
-        for key, value in d.items():
-            if isinstance(value, dict):
-                safe_dict[key] = _to_json_safe(value)
-            elif isinstance(value, np.integer):
-                safe_dict[key] = int(value)
-            elif isinstance(value, np.floating):
-                safe_dict[key] = None if np.isnan(value) else float(value)
-            elif isinstance(value, np.ndarray):
-                safe_dict[key] = value.tolist()
-            else:
-                safe_dict[key] = value
-        return safe_dict
-
     algo_name = algorithm_class.get_name()
-    algo = algorithm_class(
-        sample_rate=dataset.sample_rate,
-        hop_size=dataset.hop_size,
-        fmin=dataset.fmin,
-        fmax=dataset.fmax,
-    )
+    # Construction can fail (e.g. a missing backend/model like BasicPitch's ONNX runtime). Record it as
+    # a crash -- same convention as a per-clip failure -- so one tracker's bad env can't abort the run.
+    try:
+        algo = build_algorithm(
+            algorithm_class, dataset.sample_rate, dataset.hop_size, dataset.fmin, dataset.fmax,
+            device=device,
+        )
+    except Exception as e:
+        tqdm.write(f"FATAL: {algo_name} failed to build ({e}). Recording as crashed.")
+        return to_json_safe(_failure_dict(0)), True
 
-    threshold_results = {t: defaultdict(list) for t in thresholds}
+    accumulators = [MetricAccumulator() for _ in thresholds]
     skipped_samples = 0
+    clips_evaluated = 0
     did_fail = False
 
+    # Iterate the dataset directly (one sample dict at a time, in order), single-process on purpose:
+    # the per-dataset in-memory decode cache (built on the first algorithm's pass) is reused by every
+    # later algorithm only when the dataset lives in this process; DataLoader workers would re-decode
+    # per algorithm and discard that cache each epoch.
     sample_pbar = tqdm(
-        range(len(dataset)),
-        desc=f"{algo_name}",
-        leave=False,
-        unit=" samples",
+        range(len(dataset)), desc=f"{algo_name}", leave=False, unit=" samples"
     )
 
     for idx in sample_pbar:
@@ -253,30 +104,26 @@ def run_single_evaluation(
             sample = dataset[idx]
             audio = sample["audio"].numpy()
             true_pitch = sample["pitch"].numpy()
-            true_voicing = sample["periodicity"].numpy()
+            true_voicing = sample["periodicity"].numpy()   # voicing confidence in [0,1]
+            # Optional GT pitch-confidence (laryngograph speech datasets); None elsewhere -> RPA not gated.
+            pc = sample.get("pitch_conf")
+            pc = pc.numpy() if pc is not None else None
 
-            if not true_voicing.any():
+            if not is_voiced(true_voicing).any():
                 skipped_samples += 1
                 continue
 
-            results = algo.extract_pitch(audio, thresholds=list(thresholds))
-
-            if not isinstance(results, list):
-                raise TypeError(f"Algorithm returned invalid type: {type(results)}")
-
-            for i, threshold in enumerate(thresholds):
-                if i >= len(results):
-                    break
-                pred_pitch, pred_voicing, _ = results[i]
-                data = threshold_results[threshold]
-                data["all_pred_voicing"].append(pred_voicing)
-                data["all_true_voicing"].append(true_voicing)
-                data["all_pred_pitch"].append(pred_pitch)
-                data["all_true_pitch"].append(true_pitch)
-                data["all_voiced_mask"].append(pred_voicing & true_voicing)
-                data["all_smoothness_metrics"].append(
-                    evaluate_pitch_smoothness(pred_pitch, pred_voicing, true_voicing)
+            results = algo.extract_pitch(
+                audio, thresholds=list(thresholds), compute_notes=False
+            )
+            if len(results) != len(thresholds):
+                raise ValueError(
+                    f"Expected {len(thresholds)} results, got {len(results)}"
                 )
+
+            for acc, (pred_pitch, pred_voicing, _) in zip(accumulators, results):
+                acc.update(pred_pitch, pred_voicing, true_pitch, true_voicing, pitch_conf=pc)
+            clips_evaluated += 1
 
         except Exception as e:
             tqdm.write(
@@ -284,71 +131,40 @@ def run_single_evaluation(
                 f"Aborting this algorithm. Error: {e}"
             )
             did_fail = True
-            break  # Exit the loop immediately on first failure
+            break
 
         finally:
-            # Explicitly clean up memory to prevent leaks
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
+            # Cycle insurance: some DSP libs leave reference cycles holding arrays. Python's GC
+            # collects these anyway; an occasional explicit pass bounds the lag cheaply. No per-clip
+            # empty_cache (see docstring).
+            if (idx + 1) % 200 == 0:
+                gc.collect()
 
     sample_pbar.close()
 
-    if did_fail:
-        del algo
-        gc.collect()
-        return _to_json_safe(_get_failure_dict())
+    # Release the model + this algorithm's cached device memory before the next algorithm builds.
+    # The right place for empty_cache: it returns the now-unused reserved pool to other processes.
+    # (TensorFlow keeps its own pool until the process exits, by design.)
+    del algo
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+    if did_fail or clips_evaluated == 0:
+        return to_json_safe(_failure_dict(skipped_samples)), did_fail
 
     if skipped_samples > 0:
         tqdm.write(f"  ({algo_name} skipped {skipped_samples} unvoiced samples)")
 
-    best_score = -1
-    best_metrics = None
-
-    for threshold, data in threshold_results.items():
-        if not data["all_pred_voicing"]:
-            continue
-
-        global_pred_voicing = np.concatenate(data["all_pred_voicing"])
-        global_true_voicing = np.concatenate(data["all_true_voicing"])
-        global_pred_pitch = np.concatenate(data["all_pred_pitch"])
-        global_true_pitch = np.concatenate(data["all_true_pitch"])
-        global_voiced_mask = np.concatenate(data["all_voiced_mask"])
-
-        voicing_metrics = evaluate_voicing_detection(
-            global_pred_voicing, global_true_voicing
-        )
-        pitch_metrics = evaluate_pitch_accuracy(
-            global_pred_pitch, global_true_pitch, global_voiced_mask
-        )
-        smoothness_aggregated = (
-            {
-                key: np.nanmean([m[key] for m in data["all_smoothness_metrics"] if m])
-                for key in data["all_smoothness_metrics"][0]
-            }
-            if data["all_smoothness_metrics"]
-            and data["all_smoothness_metrics"][0] is not None
-            else {"relative_smoothness": np.nan, "continuity_breaks": np.nan}
-        )
-        combined_score = calculate_combined_score(voicing_metrics, pitch_metrics)
-
-        if not np.isnan(combined_score) and combined_score > best_score:
-            best_score = combined_score
-            best_metrics = {
-                "voicing_detection": voicing_metrics,
-                "pitch_accuracy": pitch_metrics,
-                "smoothness_metrics": smoothness_aggregated,
-                "combined_score": combined_score,
-                "optimal_threshold": threshold,
-            }
-
-    del algo
-    gc.collect()
-
-    if best_metrics is None:
-        return _to_json_safe(_get_failure_dict())
-
-    return _to_json_safe(best_metrics)
+    best_idx, best_metrics = summarize_threshold_sweep(accumulators, thresholds)
+    if best_idx < 0:
+        return to_json_safe(_failure_dict(skipped_samples)), False
+    best_metrics["coverage"] = {
+        "clips_evaluated": clips_evaluated, "clips_skipped": skipped_samples,
+    }
+    return to_json_safe(best_metrics), False
 
 
 if __name__ == "__main__":
@@ -361,32 +177,60 @@ if __name__ == "__main__":
         "--dataset", type=str, required=True, choices=list_pitch_datasets()
     )
     required.add_argument("--data-dir", type=str, required=True)
-    required.add_argument("--chime-dir", type=str, required=True)
     required.add_argument("--output-dir", type=str, default="results")
+    # --chime-dir / --demand-dir are only needed for the "chime" / "demand" degradations.
+    parser.add_argument("--chime-dir", type=str, default=None)
+    parser.add_argument("--demand-dir", type=str, default=None)
+    parser.add_argument(
+        "--degradation",
+        type=str,
+        default="clean",
+        choices=list(REGISTRY),
+    )
+    # Robustness probe: cap clips and/or truncate duration (clean leaderboard uses neither).
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--max-seconds", type=float, default=None)
     parser.add_argument(
         "--algorithms",
         type=str,
         nargs="+",
-        default=list_algorithms(),
-        choices=list_algorithms(),
+        default=None,  # None => run every installed algorithm (resolved after parsing)
+        choices=list_algorithms(),  # all known names; an uninstalled one is reported by get_algorithm
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--snr-min", type=float, default=10.0)
-    parser.add_argument("--snr-max", type=float, default=30.0)
-    parser.add_argument("--voice-gain-min", type=float, default=-6.0)
-    parser.add_argument("--voice-gain-max", type=float, default=6.0)
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--hop-size", type=int, default=256)
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Compute device for the device-aware trackers (auto picks cuda->mps->cpu). Pin cpu or "
+        "cuda for reproducible leaderboard numbers; mps is a local speed option (numerics differ).",
+    )
     args = parser.parse_args()
 
-    if args.snr_min >= args.snr_max:
-        raise ValueError("snr-min must be less than snr-max.")
+    # Resolve the algorithm set. No --algorithms flag => run every algorithm whose backend is
+    # installed, so a partial install (uv sync --extra ...) just works. An explicit list is honored
+    # exactly; a named-but-uninstalled backend raises a precise error in the loop below.
+    args.algorithms = resolve_requested_algorithms(
+        args.algorithms, report_skipped=True, on_empty=parser.error
+    )
+
+    # Validate every degradation prerequisite up front: a missing dir or backend would otherwise
+    # surface only after expensive setup (dataset scan / model load), deep in the eval loop.
+    if args.degradation == "chime" and not args.chime_dir:
+        parser.error("--chime-dir is required when --degradation chime")
+    if args.degradation == "demand" and not args.demand_dir:
+        parser.error("--demand-dir is required when --degradation demand")
+    if args.degradation == "room" and importlib.util.find_spec("pyroomacoustics") is None:
+        parser.error("--degradation room requires pyroomacoustics (core dependency; run `uv sync`)")
 
     os.makedirs(args.output_dir, exist_ok=True)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    thresholds = np.linspace(0.0, 1.0, 11)
+    thresholds = DEFAULT_THRESHOLDS
 
     print(
         f"--- Starting benchmark for dataset '{args.dataset}' with seed {args.seed} ---"
@@ -396,67 +240,95 @@ if __name__ == "__main__":
         sample_rate=args.sample_rate,
         hop_size=args.hop_size,
     )
-    noisy_dataset = CHiMeNoiseDataset(
-        base_dataset=base_dataset,
-        chime_home_dir=args.chime_dir,
-        background_snr_range=(args.snr_min, args.snr_max),
-        voice_gain_range=(args.voice_gain_min, args.voice_gain_max),
-        seed=args.seed,   # per-sample deterministic noise = f(seed, idx)
+
+    # Robustness probe: cap (built-in Subset) + truncate. The clean leaderboard sets neither
+    # (full datasets); robustness runs share one probe across conditions.
+    is_probe = bool(args.max_samples or args.max_seconds)
+    if args.max_samples and args.max_samples < len(base_dataset):
+        idxs = sorted(
+            {round(i) for i in np.linspace(0, len(base_dataset) - 1, args.max_samples)}
+        )
+        base_dataset = subset(base_dataset, idxs)
+    if args.max_seconds:
+        base_dataset = Truncate(base_dataset, args.max_seconds)
+
+    # One augmentation layer applies the chosen pipeline (clean = empty = pass-through).
+    pipeline = build_pipeline(
+        args.degradation, chime_dir=args.chime_dir, demand_dir=args.demand_dir,
+        sample_rate=args.sample_rate,
     )
+    eval_dataset = Augment(base_dataset, pipeline, seed=args.seed)
 
     for algo_name in args.algorithms:
         algo_class = get_algorithm(algo_name)
-        # Create a unique string from all key experimental parameters
+        # Device only changes results for device-aware trackers (DSP/own-runtime are cpu). It is part
+        # of the cache key AND the filename, so cpu/gpu results coexist rather than overwrite -- a cpu
+        # re-run no longer clobbers a gpu file, and the leaderboard cannot silently mix devices.
+        effective_device = algo_class.resolve_effective_device(args.device)
         param_str = (
-            f"sr{int(args.sample_rate / 1000)}k_"  # e.g., sr16k
-            f"hop{args.hop_size}_"  # e.g., hop256
-            f"snr{int(args.snr_min)}-{int(args.snr_max)}_"  # e.g., snr10-40
-            f"gain{int(args.voice_gain_min)}-{int(args.voice_gain_max)}"  # e.g., gain-6-6
+            f"{args.degradation}_"  # condition, e.g. clean / chime / pink
+            # probe runs encode their size so a different probe doesn't reuse stale results
+            + (f"probe-n{args.max_samples}-t{args.max_seconds}_" if is_probe else "")
+            + f"sr{int(args.sample_rate / 1000)}k_"  # e.g., sr16k
+            + f"hop{args.hop_size}_"  # e.g., hop256
+            + effective_device  # cpu / cuda / mps
         )
         result_path = os.path.join(
             args.output_dir,
             f"{args.dataset}_{algo_name}_{param_str}_seed{args.seed}.json",
         )
+        # Cache-as-done: any existing result is skipped, a recorded crash included (it is a finished
+        # failed cell -- delete the file to force a re-run).
         if os.path.exists(result_path):
             tqdm.write(f"Skipping: {os.path.basename(result_path)} already exists.")
             continue
 
         start_time = time.time()
-        metrics = run_single_evaluation(
-            dataset=noisy_dataset,
+        metrics, crashed = run_single_evaluation(
+            dataset=eval_dataset,
             algorithm_class=algo_class,
             thresholds=thresholds,
+            device=args.device,
         )
         execution_time = time.time() - start_time
+
+        if crashed:
+            tqdm.write(f"  ({algo_name} crashed; recorded as a failed cell -- delete the file to redo)")
 
         score = metrics.get("combined_score")
         threshold = metrics.get("optimal_threshold")
 
         tqdm.write(
             f"Finished {algo_name} in {execution_time:.2f}s. "
-            f"Score: {score if score is not None else 'N/A':.4f} @ "
-            f"Threshold: {threshold if threshold is not None else 'N/A':.2f}"
+            f"Score: {f'{score:.4f}' if score is not None else 'N/A'} @ "
+            f"Threshold: {f'{threshold:.2f}' if threshold is not None else 'N/A'}"
         )
 
         full_result = {
             "metadata": {
                 "algorithm_name": algo_name,
                 "dataset_name": args.dataset,
+                "condition": args.degradation,
+                "probe": is_probe,
                 "seed": args.seed,
+                "device": effective_device,
+                "crashed": crashed,   # recorded failure -> report counts it as 0 (shared with ood_benchmark)
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "execution_time_seconds": round(execution_time, 2),
             },
             "parameters": {
                 "sample_rate": args.sample_rate,
                 "hop_size": args.hop_size,
-                "snr_range": (args.snr_min, args.snr_max),
-                "voice_gain_range": (args.voice_gain_min, args.voice_gain_max),
+                "max_samples": args.max_samples,
+                "max_seconds": args.max_seconds,
+                "fmin": eval_dataset.fmin,
+                "fmax": eval_dataset.fmax,
             },
             "results": metrics,
         }
 
         with open(result_path, "w") as f:
-            json.dump(full_result, f, indent=4)
+            json.dump(to_json_safe(full_result), f, indent=4)
         print(f"Success: Saved result to {os.path.basename(result_path)}")
 
     print(f"\n--- Benchmark run for seed {args.seed} finished. ---")

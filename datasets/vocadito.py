@@ -1,7 +1,6 @@
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
 
-import numpy as np
+import librosa
 import pandas as pd
 import torch
 import torchaudio
@@ -24,9 +23,14 @@ class PitchDatasetVocadito(PitchDataset):
 
     fmin = 80
     fmax = 1000
+    # Constant timing correction (seconds) added to the F0 annotation timestamps: the label-offset
+    # sweep (scripts/check_dataset_alignment.py, TIMING.md) measures the annotation content a
+    # systematic +2.7 ms after the CSV timestamps, agreeing to 0.1 ms across three calibrated
+    # reference trackers (+2.65/+2.77/+2.73 ms) -- an annotation-tool frame convention offset.
+    F0_LABEL_OFFSET_SECONDS = 0.0027
 
     def __init__(self, root_dir: str, use_cache: bool = True, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(use_cache=use_cache, **kwargs)
 
         self.root_dir = Path(root_dir)
         if not self.root_dir.exists():
@@ -47,7 +51,8 @@ class PitchDatasetVocadito(PitchDataset):
             ]
         ):
             raise FileNotFoundError(
-                "A required directory or file (Audio, Annotations/F0, Annotations/Notes, or vocadito_metadata.csv) was not found."
+                "A required directory or file (Audio, Annotations/F0, Annotations/Notes, "
+                "or vocadito_metadata.csv) was not found."
             )
 
         # Load metadata for grouping
@@ -55,12 +60,7 @@ class PitchDatasetVocadito(PitchDataset):
             self.metadata = pd.read_csv(self.metadata_path)
             self.metadata.set_index("track_id", inplace=True)
         except Exception as e:
-            raise IOError(f"Error loading metadata file {self.metadata_path}: {str(e)}")
-
-        self.use_cache = use_cache
-        self.data_cache: Dict[
-            int, Dict[str, Union[torch.Tensor, Path, List[Dict]]]
-        ] = {}
+            raise OSError(f"Error loading metadata file {self.metadata_path}: {e!s}") from e
 
         # Find all valid wav-annotation pairs
         self.wav_f0_notes_pairs = self._find_wav_f0_notes_pairs()
@@ -69,7 +69,7 @@ class PitchDatasetVocadito(PitchDataset):
                 f"No valid wav-F0-notes annotation pairs found in '{root_dir}'"
             )
 
-    def _find_wav_f0_notes_pairs(self) -> List[Tuple[Path, Path, Path]]:
+    def _find_wav_f0_notes_pairs(self) -> list[tuple[Path, Path, Path]]:
         """
         Find matching WAV, F0 CSV, and Notes CSV annotation file pairs.
 
@@ -86,12 +86,10 @@ class PitchDatasetVocadito(PitchDataset):
             file_stem = wav_path.stem  # e.g., 'vocadito_1'
             f0_csv_path = self.annot_f0_dir / f"{file_stem}_f0.csv"
             # Using Annotator 1's notes for consistency in benchmarking
-            notes_csv_path = (
-                self.annot_notes_dir / f"{file_stem}_notesA1.csv"
-            )  # NEW: Notes CSV path
+            notes_csv_path = self.annot_notes_dir / f"{file_stem}_notesA1.csv"
 
             if f0_csv_path.exists() and notes_csv_path.exists():
-                pairs.append((wav_path, f0_csv_path, notes_csv_path))  # NEW:
+                pairs.append((wav_path, f0_csv_path, notes_csv_path))
             else:
                 if not f0_csv_path.exists():
                     print(
@@ -103,32 +101,7 @@ class PitchDatasetVocadito(PitchDataset):
                     )
         return pairs
 
-    def _load_f0_annotation(self, csv_path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Load F0 and compute periodicity from a vocadito F0 CSV annotation.
-
-        The CSV files contain timestamps and F0 values in Hz.
-        A value of 0.0 Hz indicates that no F0 is present (unvoiced).
-
-        Args:
-            csv_path (Path): Path to the F0 CSV annotation file.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-                - pitch (torch.Tensor): F0 values in Hz.
-                - periodicity (torch.Tensor): Binary periodicity (1.0 for voiced, 0.0 for unvoiced).
-        """
-        try:
-            data = pd.read_csv(csv_path, header=None).values
-            # Column 1 (index 1) contains the F0 values
-            pitch = torch.from_numpy(data[:, 1]).float()
-            # Periodicity is true where pitch is greater than 0
-            periodicity = (pitch > 0).float()
-            return pitch, periodicity
-        except Exception as e:
-            raise IOError(f"Error loading annotation file {csv_path}: {str(e)}")
-
-    def _load_notes_annotation(self, csv_path: Path) -> List[Dict]:
+    def _load_notes_annotation(self, csv_path: Path) -> list[dict]:
         """Load and convert annotations to standardized format."""
         notes = []
         try:
@@ -140,7 +113,7 @@ class PitchDatasetVocadito(PitchDataset):
                 end = start + duration
 
                 # Convert Hz to MIDI
-                midi_pitch = 12 * (np.log2(pitch_hz / 440.0)) + 69
+                midi_pitch = librosa.hz_to_midi(pitch_hz)
 
                 notes.append(
                     {
@@ -150,7 +123,7 @@ class PitchDatasetVocadito(PitchDataset):
                     }
                 )
         except Exception as e:
-            print(f"Warning: Error loading {csv_path}: {str(e)}")
+            print(f"Warning: Error loading {csv_path}: {e!s}")
             return []
         return notes
 
@@ -167,55 +140,33 @@ class PitchDatasetVocadito(PitchDataset):
         singer_id = self.metadata.loc[track_id, "singer_id"]
         return str(singer_id)
 
-    def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, Path]]:
+    def _load_sample(self, idx: int) -> dict[str, torch.Tensor | Path]:
+        """Load one sample: audio, F0, periodicity, and musical notes.
+
+        Returns a dict with "audio", "pitch" (F0 Hz), "periodicity", "notes" (list of dicts with
+        'start'/'end'/'midi_pitch'), and "wav_path".
         """
-        Get a sample from the dataset, including audio, F0, periodicity, and musical notes.
+        wav_path, f0_csv_path, notes_csv_path = self.wav_f0_notes_pairs[idx]
 
-        Args:
-            idx (int): Index of the sample to retrieve.
+        try:
+            waveform, sr = torchaudio.load(wav_path)
+            waveform = waveform.squeeze()
+        except Exception as e:
+            raise OSError(f"Error loading audio file {wav_path}: {e!s}") from e
 
-        Returns:
-            Dict[str, Union[torch.Tensor, Path, List[Dict]]]: A dictionary containing:
-                - "audio" (torch.Tensor): The processed audio waveform.
-                - "pitch" (torch.Tensor): The processed ground truth F0 values in Hz.
-                - "periodicity" (torch.Tensor): The processed ground truth periodicity values.
-                - "notes" (List[Dict]): A list of dictionaries, each representing a musical note
-                                         with 'start', 'pitch_hz', and 'duration' keys.
-                - "wav_path" (Path): The original path to the audio file.
-        """
-        if not 0 <= idx < len(self):
-            raise IndexError(
-                f"Index {idx} out of range for dataset of size {len(self)}"
-            )
+        times, pitch, periodicity = self._load_csv_f0_annotation(f0_csv_path)
+        times = times + self.F0_LABEL_OFFSET_SECONDS  # measured annotation offset (class comment)
+        notes = self._load_notes_annotation(notes_csv_path)
 
-        if idx in self.data_cache and self.use_cache:
-            return self.data_cache[idx]
-        else:
-            wav_path, f0_csv_path, notes_csv_path = self.wav_f0_notes_pairs[idx]
+        # Process the sample (resample labels at their true annotation timestamps)
+        waveform, pitch, periodicity, notes = self.process_sample(
+            waveform, pitch, periodicity, sr, notes, label_times=times
+        )
 
-            try:
-                waveform, sr = torchaudio.load(wav_path)
-                waveform = waveform.squeeze()
-            except Exception as e:
-                raise IOError(f"Error loading audio file {wav_path}: {str(e)}")
-
-            pitch, periodicity = self._load_f0_annotation(f0_csv_path)
-            notes = self._load_notes_annotation(notes_csv_path)
-
-            # Process the sample using the method from the base class
-            waveform, pitch, periodicity, notes = self.process_sample(
-                waveform, pitch, periodicity, sr, notes
-            )
-
-            sample_dict = {
-                "audio": waveform,
-                "pitch": pitch,
-                "periodicity": periodicity,
-                "notes": notes,
-                "wav_path": wav_path,
-            }
-
-            if self.use_cache:
-                self.data_cache[idx] = sample_dict
-
-            return sample_dict
+        return {
+            "audio": waveform,
+            "pitch": pitch,
+            "periodicity": periodicity,
+            "notes": notes,
+            "wav_path": wav_path,
+        }

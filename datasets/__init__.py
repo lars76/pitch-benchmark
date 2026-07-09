@@ -1,30 +1,40 @@
+from .augment import (
+    CONDITION_FAMILIES,
+    REGISTRY,
+    Augment,
+    Truncate,
+    build_pipeline,
+    subset,
+)
 from .bach10synth import PitchDatasetBach10Synth
 from .base import PitchDataset
+from .laryngograph import PitchDatasetPTDB
 from .mdb import PitchDatasetMDBStemSynth
 from .mir1k import PitchDatasetMIR1K
-from .noise import CHiMeNoiseDataset
 from .nsynth import PitchDatasetNSynth
-from .ptdb import PitchDatasetPTDB, PitchDatasetPTDBNoisy
 from .speechsynth import PitchDatasetSpeechSynth
 from .vocadito import PitchDatasetVocadito
 
 __all__ = [
+    "CONDITION_FAMILIES",
+    "REGISTRY",
+    "Augment",
     "PitchDataset",
-    "PitchDatasetPTDB",
-    "PitchDatasetPTDBNoisy",
-    "PitchDatasetMDBStemSynth",
-    "PitchDatasetNSynth",
-    "PitchDatasetSpeechSynth",
-    "PitchDatasetMIR1K",
-    "PitchDatasetVocadito",
     "PitchDatasetBach10Synth",
-    "CHiMeNoiseDataset",
+    "PitchDatasetMDBStemSynth",
+    "PitchDatasetMIR1K",
+    "PitchDatasetNSynth",
+    "PitchDatasetPTDB",
+    "PitchDatasetSpeechSynth",
+    "PitchDatasetVocadito",
+    "Truncate",
+    "build_pipeline",
+    "subset",
 ]
 
 # Separate registries for different dataset types/capabilities
 _PITCH_REGISTRY = {
     "PTDB": PitchDatasetPTDB,
-    "PTDBNoisy": PitchDatasetPTDBNoisy,
     "NSynth": PitchDatasetNSynth,
     "MDBStemSynth": PitchDatasetMDBStemSynth,
     "SpeechSynth": PitchDatasetSpeechSynth,
@@ -87,8 +97,7 @@ def get_transcription_dataset(name: str):
         )
     dataset_class = _TRANSCRIPTION_REGISTRY[name]
     if not issubclass(dataset_class, PitchDataset):
-        # This check might be redundant if we strictly manage _TRANSCRIPTION_REGISTRY
-        # but good for safety.
+        # Defensive: the registry should already guarantee this.
         raise TypeError(
             f"Registered dataset '{name}' for transcription does not inherit from PitchDataset."
         )

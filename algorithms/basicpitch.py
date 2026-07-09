@@ -1,13 +1,18 @@
-from typing import Tuple
 
+import librosa
 import numpy as np
 from basic_pitch import FilenameSuffix, build_icassp_2022_model_path
 from basic_pitch.inference import Model, predict
+from basic_pitch.note_creation import model_frames_to_time
 
 from .base import ContinuousPitchAlgorithm
 
 
 class BasicPitchPitchAlgorithm(ContinuousPitchAlgorithm):
+    # Mean measured delay of the reported pitch content relative to the library's
+    # model_frames_to_time stamps; see the comment at the `times` computation below.
+    CONTENT_DELAY = 0.01075  # seconds
+
     def __init__(
         self,
         onset_threshold: float = 0.5,
@@ -41,7 +46,7 @@ class BasicPitchPitchAlgorithm(ContinuousPitchAlgorithm):
 
     def _extract_raw_pitch_and_periodicity(
         self, audio: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         import os
         import tempfile
         from contextlib import redirect_stdout
@@ -49,15 +54,14 @@ class BasicPitchPitchAlgorithm(ContinuousPitchAlgorithm):
 
         import soundfile as sf
 
-        # Basic Pitch expects a file path, so we need to save the audio temporarily
+        # Basic Pitch takes a file path, so write the audio to a temp file.
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             temp_path = temp_file.name
 
         try:
-            # Write audio array to temporary file
             sf.write(temp_path, audio, self.sample_rate)
 
-            # Run Basic Pitch prediction with file path (suppress print output)
+            # Suppress Basic Pitch's stdout chatter during predict.
             with redirect_stdout(StringIO()):
                 model_output, _, _ = predict(
                     temp_path,
@@ -70,11 +74,10 @@ class BasicPitchPitchAlgorithm(ContinuousPitchAlgorithm):
                     melodia_trick=self.melodia_trick,
                 )
         finally:
-            # Clean up temporary file
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
-        # Extract note activation matrix: shape (time, pitch)
+        # Note activation matrix: shape (time, pitch).
         note_activations = model_output["note"]
         n_frames = note_activations.shape[0]
 
@@ -82,24 +85,27 @@ class BasicPitchPitchAlgorithm(ContinuousPitchAlgorithm):
         num_pitches = note_activations.shape[1]
         midi_start = 21  # A0
         midi_numbers = np.arange(midi_start, midi_start + num_pitches)
-        frequencies = 440.0 * (2.0 ** ((midi_numbers - 69) / 12.0))
+        frequencies = librosa.midi_to_hz(midi_numbers)
 
-        # Create frequency mask for valid range (vectorized)
+        # Zero out pitches outside [fmin, fmax].
         valid_freq_mask = (frequencies >= self.fmin) & (frequencies <= self.fmax)
-
-        # Apply frequency constraints to all frames at once
         masked_activations = note_activations * valid_freq_mask[np.newaxis, :]
 
-        # Find most prominent pitch per frame (vectorized)
+        # Most prominent pitch per frame.
         max_indices = np.argmax(masked_activations, axis=1)
         max_confidences = masked_activations[np.arange(len(max_indices)), max_indices]
-
-        # Convert MIDI indices to frequencies
         pitch_estimates = frequencies[max_indices]
 
-        # Calculate timestamps (Basic Pitch outputs at 100Hz)
-        frame_rate = 100.0  # Fixed frame rate per Basic Pitch constants
-        times = np.arange(n_frames) / frame_rate
+        # Basic Pitch's posteriorgram runs at AUDIO_SAMPLE_RATE/FFT_HOP (~86 fps); the library's
+        # model_frames_to_time maps frame m to ~m*FFT_HOP/22050 with a per-inference-window seam
+        # correction. The timestamp calibration (tests/test_time_calibration.py) measures the
+        # reported content a further CONTENT_DELAY after those times: +10.8 ms at 16 kHz and
+        # +10.7 ms at 22.05 kHz (rate-invariant; step probe agrees in sign). The error is not a
+        # single geometric constant -- it ramps ~+5..+15 ms across each 142-frame inference window
+        # (basic_pitch windows clips internally at ~1.64 s), so this corrects the MEAN stamp error
+        # and the remaining within-window jitter stays part of BasicPitch's score. Applied per the
+        # calibration policy in TIMING.md.
+        times = model_frames_to_time(n_frames) + self.CONTENT_DELAY
 
         return times, pitch_estimates, max_confidences
 

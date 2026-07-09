@@ -1,5 +1,4 @@
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
 
 import librosa
 import numpy as np
@@ -16,8 +15,7 @@ class PitchDatasetMIR1K(PitchDataset):
     MIR-1K contains 1000 song clips where music accompaniment and singing voice
     are recorded at left and right channels respectively. The dataset includes
     manual pitch annotations in semitone.
-    The pitch labels have 40ms frame size and 20ms hop size, interpolated to 10ms
-    for finer temporal resolution.
+    The pitch labels have a 40 ms frame size and 20 ms hop.
 
     Note: Pitch annotations are only available for the singing voice channel.
     The accompaniment channel has no ground truth pitch labels.
@@ -30,23 +28,23 @@ class PitchDatasetMIR1K(PitchDataset):
 
     fmin = 65
     fmax = 2093
+    # MIR-1K manual pitch labels: 40 ms analysis window, 20 ms hop. Used to resample labels at their
+    # true times; see _load_sample for the frame-centring convention and its empirical verification.
+    PITCH_LABEL_HOP_SECONDS = 0.02
 
     def __init__(self, root_dir: str, use_cache: bool = True, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(use_cache=use_cache, **kwargs)
 
         self.root_dir = Path(root_dir)
         if not self.root_dir.exists():
             raise FileNotFoundError(f"Root directory '{root_dir}' does not exist")
-
-        self.use_cache = use_cache
-        self.data_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
         # Find all valid wav-pitch pairs
         self.wav_pitch_pairs = self._find_wav_pitch_pairs()
         if not self.wav_pitch_pairs:
             raise ValueError(f"No valid wav-pitch pairs found in '{root_dir}'")
 
-    def _find_wav_pitch_pairs(self) -> List[Tuple[Path, Path]]:
+    def _find_wav_pitch_pairs(self) -> list[tuple[Path, Path]]:
         """Finds matching WAV and pitch label file pairs in the dataset."""
         pairs = []
 
@@ -78,61 +76,53 @@ class PitchDatasetMIR1K(PitchDataset):
     def __len__(self) -> int:
         return len(self.wav_pitch_pairs)
 
-    def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, Path]]:
-        if not 0 <= idx < len(self):
-            raise IndexError(
-                f"Index {idx} out of range for dataset of size {len(self)}"
-            )
+    def _load_sample(self, idx: int) -> dict[str, torch.Tensor | Path]:
+        wav_path, pitch_path = self.wav_pitch_pairs[idx]
 
-        if idx not in self.data_cache or not self.use_cache:
-            wav_path, pitch_path = self.wav_pitch_pairs[idx]
+        try:
+            # Load stereo audio - pitch annotations are for singing voice (right channel) only
+            waveform, sr = torchaudio.load(wav_path)
 
-            try:
-                # Load stereo audio - pitch annotations are for singing voice (right channel) only
-                waveform, sr = torchaudio.load(wav_path)
+            # Always use singing voice channel (right channel, index 1) since that's what has pitch labels
+            if waveform.shape[0] == 2:  # Stereo
+                waveform = waveform[1]  # Right channel = singing voice
+            else:  # Mono - use as is (assume it's singing voice)
+                waveform = waveform.squeeze()
 
-                # Always use singing voice channel (right channel, index 1) since that's what has pitch labels
-                if waveform.shape[0] == 2:  # Stereo
-                    waveform = waveform[1]  # Right channel = singing voice
-                else:  # Mono - use as is (assume it's singing voice)
-                    waveform = waveform.squeeze()
+        except Exception as e:
+            raise OSError(f"Error loading audio file {wav_path}: {e!s}") from e
 
-            except Exception as e:
-                raise IOError(f"Error loading audio file {wav_path}: {str(e)}")
+        try:
+            # Load pitch labels
+            # MIR-1K pitch labels are in semitone format, space-separated
+            pitch_semitone = np.loadtxt(pitch_path)
 
-            try:
-                # Load pitch labels
-                # MIR-1K pitch labels are in semitone format, space-separated
-                pitch_semitone = np.loadtxt(pitch_path)
+            # Convert semitone (= MIDI note number) to Hz. In MIR-1K, 0 represents unvoiced frames.
+            pitch_hz = np.zeros_like(pitch_semitone)
+            voiced_mask = pitch_semitone > 0
+            if np.any(voiced_mask):
+                pitch_hz[voiced_mask] = librosa.midi_to_hz(pitch_semitone[voiced_mask])
 
-                # Convert semitone to Hz using librosa
-                # In MIR-1K, 0 represents unvoiced frames
-                pitch_hz = np.zeros_like(pitch_semitone)
-                voiced_mask = pitch_semitone > 0
-                if np.any(voiced_mask):
-                    pitch_hz[voiced_mask] = librosa.midi_to_hz(
-                        pitch_semitone[voiced_mask]
-                    )
+            pitch = torch.from_numpy(pitch_hz).float()
+            periodicity = torch.from_numpy(voiced_mask.astype(np.float32))
 
-                pitch = torch.from_numpy(pitch_hz).float()
-                periodicity = torch.from_numpy(voiced_mask.astype(np.float32))
+        except Exception as e:
+            raise OSError(f"Error loading pitch file {pitch_path}: {e!s}") from e
 
-            except Exception as e:
-                raise IOError(f"Error loading pitch file {pitch_path}: {str(e)}")
-
-            # Process the sample using parent class method
-            waveform, pitch, periodicity = self.process_sample(
-                waveform, pitch, periodicity, sr
-            )
-
-            if self.use_cache:
-                self.data_cache[idx] = (waveform, pitch, periodicity)
-        else:
-            waveform, pitch, periodicity = self.data_cache[idx]
+        # Resample labels at their true timestamps. MIR-1K labels come from 40 ms windows hopped by
+        # 20 ms from t=0, so frame i spans [i*20, i*20+40] ms and is centered at (i+1)*20 ms. This is
+        # confirmed by the label count: every file has n = floor(dur/20 ms) - 1 labels (last centre
+        # at n*20 ms <= dur-20 ms), the fingerprint of centres at 20, 40, ..., dur-20 ms; the (i+0.5)
+        # convention would instead predict n = floor(dur/20 ms). Using (i+0.5) put every label half a
+        # hop (~10 ms) early on the eval grid.
+        label_times = (np.arange(pitch.numel()) + 1.0) * self.PITCH_LABEL_HOP_SECONDS
+        waveform, pitch, periodicity = self.process_sample(
+            waveform, pitch, periodicity, sr, label_times=label_times
+        )
 
         return {
             "audio": waveform,
             "pitch": pitch,
             "periodicity": periodicity,
-            "wav_path": self.wav_pitch_pairs[idx][0],
+            "wav_path": wav_path,
         }

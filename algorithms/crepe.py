@@ -1,18 +1,17 @@
 import os
-from typing import Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
 from numpy.lib.stride_tricks import as_strided
 
-from .base import ContinuousPitchAlgorithm
+from resampling import frame_times, model_hop_length, resample_audio
 
-# This global flag ensures that the complex, one-time TensorFlow setup
-# is performed only once during the entire program's execution.
-TF_CONFIGURED = False
+from .base import ContinuousPitchAlgorithm, TensorFlowModelMixin
 
 
-class CREPEPitchAlgorithm(ContinuousPitchAlgorithm):
+class CREPEPitchAlgorithm(TensorFlowModelMixin, ContinuousPitchAlgorithm):
+    device_backend = "tf"
+
     def __init__(
         self,
         viterbi: bool = True,
@@ -21,39 +20,18 @@ class CREPEPitchAlgorithm(ContinuousPitchAlgorithm):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        global TF_CONFIGURED
-
-        # Configure TensorFlow once
-        if not TF_CONFIGURED:
-            os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-            os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-            tf.get_logger().setLevel("ERROR")
-            try:
-                gpus = tf.config.list_physical_devices("GPU")
-                if gpus:
-                    for gpu in gpus:
-                        tf.config.experimental.set_memory_growth(gpu, True)
-            except Exception:
-                pass
-            TF_CONFIGURED = True
 
         self.viterbi = viterbi
         self.model_capacity = model
         self.step_size = (self.hop_size / self.sample_rate) * 1000
         self.model_srate = 16000  # CREPE expects 16kHz
-
-        # Set device
-        gpus_available = len(tf.config.list_physical_devices("GPU")) > 0
-        if device == "cuda" and gpus_available:
-            self.tf_device = "/GPU:0"
-        else:
-            self.tf_device = "/CPU:0"
+        self.tf_device = self._init_tensorflow(device)
 
         # Load the model once during initialization
         with tf.device(self.tf_device):
             self.model = self._build_and_load_model()
 
-        # Precompute cents mapping for efficiency - EXACTLY like original
+        # Precomputed cents mapping (upstream CREPE constant).
         self.cents_mapping = np.linspace(0, 7180, 360) + 1997.3794084376191
 
     def _build_and_load_model(self):
@@ -89,23 +67,23 @@ class CREPEPitchAlgorithm(ContinuousPitchAlgorithm):
         x = Input(shape=(1024,), name="input", dtype="float32")
         y = Reshape(target_shape=(1024, 1, 1), name="input-reshape")(x)
 
-        for l, f, w, s in zip(layers, filters, widths, strides):
+        for li, f, w, s in zip(layers, filters, widths, strides):
             y = Conv2D(
                 f,
                 (w, 1),
                 strides=s,
                 padding="same",
                 activation="relu",
-                name="conv%d" % l,
+                name=f"conv{li}",
             )(y)
-            y = BatchNormalization(name="conv%d-BN" % l)(y)
+            y = BatchNormalization(name=f"conv{li}-BN")(y)
             y = MaxPool2D(
                 pool_size=(2, 1),
                 strides=None,
                 padding="valid",
-                name="conv%d-maxpool" % l,
+                name=f"conv{li}-maxpool",
             )(y)
-            y = Dropout(0.25, name="conv%d-dropout" % l)(y)
+            y = Dropout(0.25, name=f"conv{li}-dropout")(y)
 
         y = Permute((2, 1, 3), name="transpose")(y)
         y = Flatten(name="flatten")(y)
@@ -129,9 +107,8 @@ class CREPEPitchAlgorithm(ContinuousPitchAlgorithm):
                 compressed_path = weights_path + ".bz2"
                 if os.path.exists(compressed_path):
                     print(f"Decompressing {compressed_path}...")
-                    with bz2.BZ2File(compressed_path, "rb") as source:
-                        with open(weights_path, "wb") as target:
-                            target.write(source.read())
+                    with bz2.BZ2File(compressed_path, "rb") as source, open(weights_path, "wb") as target:
+                        target.write(source.read())
                     print("Decompression complete")
 
         except ImportError:
@@ -149,9 +126,9 @@ class CREPEPitchAlgorithm(ContinuousPitchAlgorithm):
         return model
 
     def _to_local_average_cents(
-        self, salience: np.ndarray, center: Optional[int] = None
+        self, salience: np.ndarray, center: int | None = None
     ) -> np.ndarray:
-        """Convert salience to cents using local weighted average - EXACT copy from original"""
+        """Local weighted-average cents around the salience argmax (upstream CREPE)."""
         if salience.ndim == 1:
             if center is None:
                 center = int(np.argmax(salience))
@@ -172,7 +149,7 @@ class CREPEPitchAlgorithm(ContinuousPitchAlgorithm):
         raise Exception("label should be either 1d or 2d ndarray")
 
     def _to_viterbi_cents(self, salience: np.ndarray) -> np.ndarray:
-        """Apply Viterbi smoothing to pitch estimates - EXACT copy from original"""
+        """Viterbi-smooth the salience into a cents path (upstream CREPE)."""
         from hmmlearn import hmm
 
         # uniform prior on the starting pitch
@@ -211,26 +188,20 @@ class CREPEPitchAlgorithm(ContinuousPitchAlgorithm):
 
     def _extract_raw_pitch_and_periodicity(
         self, audio: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Extract pitch and periodicity from audio using the loaded CREPE model"""
 
-        # Convert to mono if stereo
         if len(audio.shape) == 2:
             audio = audio.mean(1)  # make mono
         audio = audio.astype(np.float32)
 
-        # Resample if necessary
-        if self.sample_rate != self.model_srate:
-            from resampy import resample
+        audio = resample_audio(audio, self.sample_rate, self.model_srate)
 
-            audio = resample(audio, self.sample_rate, self.model_srate)
-
-        # pad so that frames are centered around their timestamps (i.e. first frame
-        # is zero centered). - EXACTLY like original with center=True
+        # Pad so frames are centered on their timestamps (first frame zero-centered, center=True).
         audio = np.pad(audio, 512, mode="constant", constant_values=0)
 
-        # make 1024-sample frames of the audio with hop length of 10 milliseconds
-        hop_length = int(self.model_srate * self.step_size / 1000)
+        # make 1024-sample frames of the audio, strided by the INTEGER hop on the 16 kHz timeline
+        hop_length = model_hop_length(self.hop_size, self.sample_rate, self.model_srate)
         n_frames = 1 + int((len(audio) - 1024) / hop_length)
         frames = as_strided(
             audio,
@@ -247,37 +218,19 @@ class CREPEPitchAlgorithm(ContinuousPitchAlgorithm):
         with tf.device(self.tf_device):
             activation = self.model.predict(frames, verbose=0)
 
-        # Extract confidence
         confidence = activation.max(axis=1)
 
-        # Convert to pitch
-        if self.viterbi:
-            cents = self._to_viterbi_cents(activation)
-        else:
-            cents = self._to_local_average_cents(activation)
+        cents = self._to_viterbi_cents(activation) if self.viterbi else self._to_local_average_cents(activation)
 
-        # Convert cents to frequency
         frequency = 10 * 2 ** (cents / 1200)
         frequency[np.isnan(frequency)] = 0
 
-        # Create time array EXACTLY like original
-        time = np.arange(confidence.shape[0]) * self.step_size / 1000.0
+        # Stamp from the ACTUAL stride, not the nominal step_size: when 16000*hop/sample_rate is
+        # non-integer (e.g. sr 22050) the truncated hop_length and the float step differ by ~0.4%
+        # per frame, which compounds to a -4 ms/s timestamp drift over the clip.
+        time = frame_times(confidence.shape[0], hop_length, self.model_srate)
 
         return time, frequency, confidence
-
-    def cleanup(self):
-        """Clean up the loaded model"""
-        if hasattr(self, "model") and self.model is not None:
-            del self.model
-            self.model = None
-            tf.keras.backend.clear_session()
-            import gc
-
-            gc.collect()
-
-    def __del__(self):
-        """Cleanup when object is destroyed"""
-        self.cleanup()
 
     def _get_default_threshold(self) -> float:
         return 0.775

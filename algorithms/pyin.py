@@ -1,4 +1,3 @@
-from typing import Tuple
 
 import librosa
 import numpy as np
@@ -9,7 +8,7 @@ from .base import ContinuousPitchAlgorithm
 class pYINPitchAlgorithm(ContinuousPitchAlgorithm):
     def _extract_raw_pitch_and_periodicity(
         self, audio
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         pitch, _, voiced_probs = librosa.pyin(
             audio,
             fmin=self.fmin,

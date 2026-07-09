@@ -1,16 +1,16 @@
 import argparse
-from typing import List, Optional
 
 import librosa
 import librosa.display
 import matplotlib.pyplot as plt
 import numpy as np
 
-from algorithms import get_algorithm, list_algorithms
+from algorithms import build_algorithm, get_algorithm, resolve_requested_algorithms
+from resampling import frame_times
 
 
 def assign_colors_and_styles(num_algorithms):
-    """Automatically assign colors and linestyles."""
+    """Assign colors and linestyles."""
     colors = plt.get_cmap("tab10", num_algorithms).colors
     linestyles = ["-", "--", "-.", ":"] * (num_algorithms // 4 + 1)
     return colors, linestyles
@@ -32,14 +32,12 @@ def calculate_spectrogram_params(fmin: float, fmax: float, sr: int) -> dict:
 
 def compare_pitch_algorithms(
     audio_file: str,
-    selected_algorithms: List[str],
+    selected_algorithms: list[str],
     sr: int = 22050,
     hop_size: int = 256,
     fmin: float = 65,
     fmax: float = 300,
-    pitch_threshold: Optional[
-        float
-    ] = None,  # Override threshold for all algorithms
+    pitch_threshold: float | None = None,  # Override threshold for all algorithms
     output_file: str = "output.jpg",
 ):
     """Compare different pitch detection algorithms.
@@ -61,14 +59,13 @@ def compare_pitch_algorithms(
             audio = audio / audio_max
         audio_duration = librosa.get_duration(y=audio, sr=sr)
     except Exception as e:
-        raise RuntimeError(f"Error loading audio file: {e}")
+        raise RuntimeError(f"Error loading audio file: {e}") from e
 
     # Filter algorithms based on selection
     filtered_algorithms = [get_algorithm(algo) for algo in selected_algorithms]
     if not filtered_algorithms:
         raise ValueError("No valid algorithms selected.")
 
-    # Assign colors and linestyles
     colors, linestyles = assign_colors_and_styles(len(filtered_algorithms))
 
     # Process audio with each algorithm
@@ -79,9 +76,7 @@ def compare_pitch_algorithms(
         algo_name = algo_class.get_name()
         print(f"Running: {algo_name}")
         try:
-            algo_instance = algo_class(
-                sample_rate=sr, hop_size=hop_size, fmin=fmin, fmax=fmax
-            )
+            algo_instance = build_algorithm(algo_class, sr, hop_size, fmin, fmax)
 
             # Get the threshold to use
             if pitch_threshold is not None:
@@ -98,7 +93,7 @@ def compare_pitch_algorithms(
             else:
                 pitch, periodicity, _ = algo_instance.extract_pitch(
                     audio, thresholds=threshold
-                )
+                )[0]
 
             results.append(
                 (algo_name, pitch, periodicity, threshold, color, linestyle)
@@ -111,7 +106,7 @@ def compare_pitch_algorithms(
         raise ValueError("No algorithms produced results.")
 
     ref_length = results[0][2].shape[-1]
-    times = np.linspace(0, audio_duration, ref_length)
+    times = frame_times(ref_length, hop_size, sr)   # grid contract: frame m is centered at m*hop/sr
 
     # Set up the plot
     fig = plt.figure(figsize=(15, 10))
@@ -184,7 +179,7 @@ def compare_pitch_algorithms(
         plt.savefig(output_file, dpi=300, bbox_inches="tight")
         print(f"Visualization saved to {output_file}")
     except Exception as e:
-        raise RuntimeError(f"Error saving visualization: {e}")
+        raise RuntimeError(f"Error saving visualization: {e}") from e
 
 
 def main():
@@ -198,7 +193,7 @@ def main():
         "--selected_algorithms",
         nargs="+",
         type=str,
-        default=list_algorithms(),
+        default=None,  # None => visualize every installed algorithm (resolved after parsing)
         help="List of algorithms to visualize. Separate names by spaces, e.g., 'Praat SWIPE'.",
     )
     parser.add_argument("--sr", type=int, default=22050, help="Sampling rate")
@@ -216,6 +211,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # default => visualize every installed algorithm
+    args.selected_algorithms = resolve_requested_algorithms(args.selected_algorithms)
 
     compare_pitch_algorithms(
         audio_file=args.audio_file,

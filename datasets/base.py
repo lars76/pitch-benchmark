@@ -1,11 +1,55 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 
+import librosa
 import numpy as np
+import pandas as pd
 import torch
-import torch.nn.functional as F
 import torchaudio
+
+from metrics import (
+    is_voiced,  # single definition of "voiced" (periodicity >= VOICED_THRESHOLD)
+)
+from resampling import (
+    resample_to_grid,  # one resampler shared with algorithms/ and scripts/
+)
+
+
+def frame_rms(
+    waveform: torch.Tensor,
+    hop_size: int,
+    n_frames: int,
+    frame_length: int | None = None,
+    *,
+    center: bool,
+) -> torch.Tensor:
+    """Per-frame RMS over `n_frames` hop-spaced windows of `frame_length` samples (default hop_size).
+
+    `center` is REQUIRED (no default) because it decides which samples frame i's energy describes,
+    and getting that silently wrong is exactly the half-hop timing-bug class the calibration work
+    eliminated (TIMING.md):
+      - center=True:  frame i spans [i*hop - L//2, i*hop + L - L//2) -- centered on sample i*hop,
+        matching the benchmark grid contract (frame i IS the audio centered at i*hop). Every
+        voicing/silence gate in the repo uses this.
+      - center=False: frame i spans [i*hop, i*hop + L) -- forward-looking, energy centered half a
+        window LATE relative to the grid. Only for callers that explicitly want trailing windows.
+
+    The signal is zero-padded (left for centring, right so the final window is complete); returns
+    shape (n_frames,). This is the one per-frame energy primitive behind every RMS-vs-peak
+    silence/voicing gate in the repo (NSynth's voicing detector, the laryngograph energy gate, and
+    the offline consensus silence gate). Each caller keeps its OWN normalization/threshold/policy
+    on top -- this returns only the raw per-frame RMS they share."""
+    if frame_length is None:
+        frame_length = hop_size
+    waveform = waveform.squeeze()
+    if center:
+        waveform = torch.nn.functional.pad(waveform, (frame_length // 2, 0))
+    total_samples_needed = (n_frames - 1) * hop_size + frame_length
+    padding_needed = max(0, total_samples_needed - waveform.size(-1))
+    if padding_needed > 0:
+        waveform = torch.nn.functional.pad(waveform, (0, padding_needed))
+    frames = waveform.unfold(0, frame_length, hop_size)[:n_frames]
+    return torch.sqrt(torch.mean(frames**2, dim=1))
 
 
 class PitchDataset(ABC, torch.utils.data.Dataset):
@@ -18,12 +62,34 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
     Args:
         sample_rate (int): Target sample rate in Hz
         hop_size (int): Number of audio samples between consecutive frames
-        clip_pitch (bool, optional): Whether to clip pitch values to [fmin, fmax] range.
-            If False (default), out-of-range pitch values are preserved but their
-            periodicity is set to zero, indicating unreliable pitch detection.
-            This prevents false pitch information while maintaining data integrity.
+        clip_pitch (bool, optional): How to handle ground-truth f0 outside [fmin, fmax].
+            If False (default), out-of-range frames are marked UNVOICED (periodicity 0, pitch 0),
+            since the label is unreliable there. If True, pitch is clamped into [fmin, fmax].
             Defaults to False
         normalize_audio (bool, optional): Whether to normalize audio to [-1, 1]. Defaults to True
+
+    Ground-truth contract (what __getitem__ must return):
+        Required keys, all 1-D and frame-aligned: length F = audio_samples // hop_size, where frame m
+        is the audio CENTERED at sample m*hop_size (time m*hop_size / sample_rate). This centre-aligned
+        grid is shared with the predictions: both ground truth and estimates are resampled onto it
+        (resampling.resample_to_grid), so they line up frame-for-frame.
+          - "audio":       float32 tensor, shape (T,), range [-1, 1] at `sample_rate`.
+          - "pitch":       float32 tensor (Hz). INVARIANT: pitch > 0 => voiced, i.e. pitch == 0 on
+                           every unvoiced frame. The converse need NOT hold: a voiced frame may have
+                           pitch == 0 (the "voiced, pitch uncertain" state below). NaN -> 0.
+          - "periodicity": float32 tensor, a voicing CONFIDENCE in [0, 1] (a binary {0, 1} label
+                           is the certain case). voiced <=> periodicity >= 0.5 (metrics.is_voiced),
+                           the single definition of "voiced" across the benchmark.
+        Optional keys: "pitch_conf" (float32 [0,1]; laryngograph consensus, gates RPA, not F1),
+          "notes" (List[{start, end, midi_pitch}]; transcription datasets), an identifier
+          ("wav_path" or dataset-specific).
+        The three frame states (see LaryngographSpeechDataset):
+          voiced, pitch known    -> pitch > 0, periodicity >= 0.5   (scored for F1 and RPA)
+          voiced, pitch uncertain-> pitch = 0, periodicity >= 0.5   (F1 only; finite-rule drops RPA)
+          unvoiced               -> pitch = 0, periodicity <  0.5   (F1 negative)
+        Out-of-range f0 policy: ground truth outside [fmin, fmax] is marked UNVOICED (not scored);
+        predictions are CLAMPED to [fmin, fmax]. (Asymmetric by design: don't penalize a tracker for
+        the label's range; constrain the tracker to its operating band.)
     """
 
     DEFAULT_FMIN = 46.875  # Default minimum frequency (G1)
@@ -35,20 +101,23 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
         hop_size: int,
         clip_pitch: bool = False,
         normalize_audio: bool = True,
+        use_cache: bool = True,
     ):
         super().__init__()
 
         self.sample_rate = sample_rate
         self.hop_size = hop_size
 
-        # Check if the subclass has defined its own fmin/fmax.
-        # If not, getattr falls back to the default values.
-        # self.__class__ refers to the specific subclass (e.g., PitchDatasetBach10Synth).
+        # Subclass fmin/fmax if the subclass defines them, else the class defaults.
         self.fmin = getattr(self.__class__, "fmin", self.DEFAULT_FMIN)
         self.fmax = getattr(self.__class__, "fmax", self.DEFAULT_FMAX)
 
         self.clip_pitch = clip_pitch
         self.normalize_audio = normalize_audio
+        # In-memory decode cache: __getitem__ stores each loaded sample dict so a second pass over the
+        # dataset (the next algorithm) reuses it instead of re-decoding. See __getitem__.
+        self.use_cache = use_cache
+        self.data_cache: dict[int, dict[str, torch.Tensor | Path]] = {}
         self._validate_init_params(sample_rate, hop_size, self.fmin, self.fmax)
 
     def _validate_init_params(
@@ -73,19 +142,10 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
         return str(idx)  # Default: each sample is its own group
 
     def _validate_audio(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Validates and normalizes audio data.
-
-        Args:
-            audio (torch.Tensor): Input audio tensor
-
-        Returns:
-            torch.Tensor: Validated and normalized audio
-        """
+        """Validate, NaN-clean, optionally peak-normalize, and clamp audio to [-1, 1]."""
         if audio.dim() not in {1, 2}:
             raise ValueError(f"Audio must be 1D or 2D, got {audio.dim()}D")
 
-        # Clean up audio values
         audio = torch.nan_to_num(audio, nan=0)
 
         if torch.all(audio == 0):
@@ -98,38 +158,34 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
 
         return audio.clamp(-1.0, 1.0)
 
+    def _apply_range_gate(
+        self, pitch: torch.Tensor, periodicity: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Enforce the shared label contract: a NONZERO f0 outside [fmin, fmax] marks the frame
+        unvoiced, then pitch is zeroed on every unvoiced frame (so pitch > 0 implies voiced). pitch==0
+        is the "voiced, pitch uncertain" marker (periodicity may stay >= 0.5) and is left voiced. Used
+        by both _validate_pitch (clip_pitch=False) and the laryngograph consensus path; with
+        clip_pitch=True pitch is already clamped in range, so the gate only enforces the invariant."""
+        # Only gate genuinely out-of-range (nonzero) pitch; keep the pitch==0 voiced-uncertain state.
+        in_range = (pitch == 0) | ((pitch >= self.fmin) & (pitch <= self.fmax))
+        periodicity = periodicity * in_range.to(periodicity.dtype)
+        pitch = pitch * is_voiced(periodicity).to(pitch.dtype)
+        return pitch, periodicity
+
     def _validate_pitch(
         self,
         pitch: torch.Tensor,
         periodicity: torch.Tensor,
-        notes: Optional[List[Dict]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List[Dict]]]:
-        """
-        Validates and processes pitch, periodicity values, and optionally notes.
+        notes: list[dict] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict] | None]:
+        """Enforce the label contract on pitch, periodicity, and optionally notes.
 
-        By default, pitch values outside the [fmin, fmax] range are preserved
-        but their corresponding periodicity is set to zero. This approach maintains
-        data integrity while indicating that pitch detection is unreliable outside
-        the specified frequency range, avoiding false pitch information.
+        NaN pitch -> 0; periodicity is clamped to a [0,1] confidence. By default (clip_pitch=False)
+        f0 outside [fmin, fmax] marks the frame UNVOICED and out-of-range notes are dropped; with
+        clip_pitch=True pitch and note frequencies are clamped into [fmin, fmax] instead. Finally
+        pitch is zeroed on every unvoiced frame so that pitch > 0 <=> voiced.
 
-        The same frequency constraints are applied to transcription notes to ensure
-        consistency with the pitch algorithm's operational range.
-
-        Args:
-            pitch (torch.Tensor): Pitch values
-            periodicity (torch.Tensor): Periodicity values
-            notes (Optional[List[Dict]]): Musical notes with 'start', 'end', 'midi_pitch'
-
-        Returns:
-            Tuple containing:
-            - pitch (torch.Tensor): Processed pitch values
-            - periodicity (torch.Tensor): Processed periodicity values
-            - notes (Optional[List[Dict]]): Processed notes (if provided)
-
-            If clip_pitch=True, pitch values are clipped to [fmin, fmax] range and
-            note frequencies are similarly clipped.
-            If clip_pitch=False, out-of-range pitch values have periodicity set to 0
-            and out-of-range notes are excluded.
+        Notes carry 'start', 'end', 'midi_pitch' and get the same frequency constraint as pitch.
         """
         # Validate pitch and periodicity shapes
         if pitch.shape != periodicity.shape:
@@ -137,50 +193,111 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
                 f"Pitch and periodicity shapes must match: {pitch.shape} vs {periodicity.shape}"
             )
 
-        # Clean up pitch values
-        pitch = torch.nan_to_num(pitch, nan=self.fmin)
+        # NaN pitch means "no pitch" -> 0 (the unvoiced sentinel), matching the prediction
+        # side and the global convention (NOT fmin, which would fake an in-range reading).
+        pitch = torch.nan_to_num(pitch, nan=0.0)
 
-        # Ensure periodicity is binary
-        periodicity = torch.round(periodicity).clamp(0, 1)
+        # periodicity is a voicing confidence in [0, 1] (a binary {0, 1} label is the certain case).
+        periodicity = torch.nan_to_num(periodicity, nan=0.0).clamp(0, 1)
 
         if self.clip_pitch:
-            # Clip pitch values to valid range
             pitch = torch.clamp(pitch, self.fmin, self.fmax)
 
-            # Apply same clipping logic to notes if provided
+            # Clamp note frequencies the same way.
             if notes is not None:
                 processed_notes = []
                 for note in notes:
                     midi_pitch = note["midi_pitch"]
-                    freq_hz = 440.0 * (2 ** ((midi_pitch - 69) / 12))
+                    freq_hz = librosa.midi_to_hz(midi_pitch)
 
-                    # Clip frequency to algorithm's operational range
                     freq_hz_clipped = max(self.fmin, min(freq_hz, self.fmax))
-                    midi_pitch_clipped = 69 + 12 * np.log2(freq_hz_clipped / 440.0)
+                    midi_pitch_clipped = librosa.hz_to_midi(freq_hz_clipped)
 
                     processed_note = note.copy()
                     processed_note["midi_pitch"] = float(midi_pitch_clipped)
                     processed_notes.append(processed_note)
                 notes = processed_notes
         else:
-            # Preserve pitch but zero periodicity for out-of-range values
-            out_of_range_mask = (pitch < self.fmin) | (pitch > self.fmax)
-            periodicity = periodicity * (~out_of_range_mask).float()
-
-            # Apply same filtering logic to notes if provided
+            # Drop notes outside [fmin, fmax] (the tracker can't detect them).
             if notes is not None:
                 processed_notes = []
                 for note in notes:
                     midi_pitch = note["midi_pitch"]
-                    freq_hz = 440.0 * (2 ** ((midi_pitch - 69) / 12))
+                    freq_hz = librosa.midi_to_hz(midi_pitch)
 
-                    # Only include notes within algorithm's operational range
                     if self.fmin <= freq_hz <= self.fmax:
                         processed_notes.append(note.copy())
-                    # Notes outside range are excluded (algorithm can't detect them)
                 notes = processed_notes
 
-        return pitch, periodicity.bool(), notes
+        # Out-of-range f0 -> unvoiced, then pitch = 0 on every unvoiced frame (pitch > 0 <=> voiced).
+        # With clip_pitch=True pitch is already clamped in range, so this only enforces the invariant.
+        # periodicity stays a float32 [0,1] confidence (NOT bool) so the type is uniform across all
+        # datasets; the metric thresholds it via metrics.is_voiced.
+        pitch, periodicity = self._apply_range_gate(pitch, periodicity)
+        return pitch, periodicity.float(), notes
+
+    @staticmethod
+    def _resample_labels_to_grid(
+        pitch: torch.Tensor,
+        periodicity: torch.Tensor,
+        native_times: np.ndarray,
+        target_times: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resample native (f0, voicing) labels sampled at ``native_times`` onto ``target_times``
+        by SAMPLING AT THE TRUE TIMES (``np.interp``, coordinate-based, so no index time-warp).
+
+        f0 follows the mir_eval melody convention so it never interpolates *through* an unvoiced
+        zero (which would fabricate boundary frequencies, e.g. 110 Hz at a voiced->unvoiced edge):
+          1. forward-fill the last voiced value across the unvoiced gaps,
+          2. interpolate in cents (log-Hz, perceptually uniform),
+          3. re-mask the frames that were unvoiced in the source back to 0.
+        Voicing is resampled nearest. Target times outside the annotation span are unvoiced.
+        Reproduces ``mir_eval.melody.resample_melody_series`` (asserted in tests).
+
+        Why not ``F.interpolate``: it is INDEX-based (it ignores ``native_times``) and stretches
+        the contour onto the output length, time-warping it (~half a frame mid-clip on a fine
+        annotation). ``np.interp`` samples at the actual timestamps, which is what we need.
+
+        Delegates to ``resampling.resample_to_grid`` (voicing nearest, the binary-label setting) so
+        the ground truth, the prediction wrappers and the consensus generator all align identically.
+        """
+        pitch_g, per_g = resample_to_grid(
+            pitch.detach().cpu().numpy(),
+            periodicity.detach().cpu().numpy(),
+            native_times,
+            target_times,
+            voicing_kind="nearest",
+        )
+        return torch.from_numpy(pitch_g).float(), torch.from_numpy(per_g).float()
+
+    def _prepare_audio(self, audio: torch.Tensor, orig_sr: int) -> torch.Tensor:
+        """Squeeze to mono, resample to self.sample_rate, and validate; returns (1, num_samples).
+        This is the audio half of process_sample, factored out so the laryngograph consensus path can reuse
+        it: that path ships precomputed grid-aligned labels and so skips label resampling, but still
+        needs identical audio handling."""
+        audio = audio.squeeze()
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        if orig_sr != self.sample_rate:
+            audio = torchaudio.functional.resample(
+                waveform=audio, orig_freq=orig_sr, new_freq=self.sample_rate
+            )
+        return self._validate_audio(audio)
+
+    def _load_csv_f0_annotation(
+        self, csv_path: Path
+    ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
+        """Load (times, pitch, periodicity) from a headerless 2-column F0 CSV: column 0 = annotation
+        timestamps (seconds), column 1 = F0 in Hz with 0 = unvoiced. Periodicity is binary (pitch >
+        0). Shared by the CSV-annotated loaders (MDB, Bach10Synth, Vocadito)."""
+        try:
+            data = pd.read_csv(csv_path, header=None).values
+            times = data[:, 0].astype(float)
+            pitch = torch.from_numpy(data[:, 1]).float()
+            periodicity = (pitch > 0).float()
+            return times, pitch, periodicity
+        except Exception as e:
+            raise OSError(f"Error loading annotation file {csv_path}: {e!s}") from e
 
     def process_sample(
         self,
@@ -188,55 +305,49 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
         pitch: torch.Tensor,
         periodicity: torch.Tensor,
         orig_sr: int,
-        notes: Optional[List[Dict]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[List[Dict]]]:
+        notes: list[dict] | None = None,
+        *,
+        label_times: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict] | None]:
+        """Resample audio and labels onto the eval grid, then enforce the label contract.
+
+        Audio is squeezed to mono, resampled to self.sample_rate and validated; pitch/periodicity
+        are resampled by true time onto the centre-aligned grid and range-gated, with the same
+        frequency constraint applied to any notes.
+
+        label_times (np.ndarray): true time (seconds) of each input pitch/periodicity frame;
+            required, so the labels resample by true time (no index warp).
+
+        Returns processed (audio, pitch, periodicity[, notes]).
         """
-        Processes a single audio sample with its corresponding pitch, periodicity, and (optionally) notes.
+        # Squeeze to mono, resample, and validate (shared with the laryngograph consensus path)
+        audio = self._prepare_audio(audio, orig_sr)
 
-        Applies consistent frequency constraints to both F0 estimates and transcription notes to ensure
-        they represent what the pitch algorithm can actually detect.
-
-        Args:
-            audio (torch.Tensor): Audio waveform
-            pitch (torch.Tensor): Pitch values
-            periodicity (torch.Tensor): Periodicity values
-            orig_sr (int): Original sample rate of the audio
-            notes (Optional[List[Dict]]): Musical notes with 'start', 'end', 'midi_pitch'
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[List[Dict]]]: Processed audio, pitch, periodicity and notes
-        """
-        # Ensure consistent dimensions
-        audio = audio.squeeze()
-        if audio.dim() == 1:
-            audio = audio.unsqueeze(0)
-
-        # Resample audio if needed
-        if orig_sr != self.sample_rate:
-            audio = torchaudio.functional.resample(
-                waveform=audio, orig_freq=orig_sr, new_freq=self.sample_rate
+        target_length = audio.size(-1) // self.hop_size
+        if target_length < 1:
+            # Labels could not be put on the eval grid at all; returning them at native length would
+            # silently break the frame-alignment contract downstream.
+            raise ValueError(
+                f"{type(self).__name__}: audio too short for one frame "
+                f"(samples={audio.size(-1)}, hop={self.hop_size})"
             )
 
-        # Basic validation
-        audio = self._validate_audio(audio)
+        # Contract: one true frame time per label frame (and pitch/periodicity stay frame-aligned).
+        label_times = np.asarray(label_times, dtype=np.float64).reshape(-1)
+        if not (label_times.shape[0] == pitch.reshape(-1).numel() == periodicity.reshape(-1).numel()):
+            raise ValueError(
+                f"{type(self).__name__}: label_times ({label_times.shape[0]}), pitch "
+                f"({pitch.reshape(-1).numel()}) and periodicity ({periodicity.reshape(-1).numel()}) "
+                f"must be frame-aligned (one true time per pitch/periodicity frame)."
+            )
 
-        # Calculate target length for pitch and periodicity
-        target_length = audio.size(-1) // self.hop_size
+        # Resample labels onto the eval grid at their TRUE frame times (label_times),
+        # mir_eval-faithful, no index warp. Every dataset supplies label_times.
+        target_times = np.arange(target_length) * (self.hop_size / self.sample_rate)
+        pitch, periodicity = self._resample_labels_to_grid(
+            pitch, periodicity, label_times, target_times
+        )
 
-        if target_length > 0:
-            # Interpolate pitch and periodicity to match target length
-            pitch = F.interpolate(
-                pitch.view(1, 1, -1),
-                size=target_length,
-                mode="linear",
-                align_corners=True,
-            ).squeeze()
-
-            periodicity = F.interpolate(
-                periodicity.view(1, 1, -1), size=target_length, mode="nearest"
-            ).squeeze()
-
-        # Validate pitch and periodicity
         pitch, periodicity, notes = self._validate_pitch(pitch, periodicity, notes)
 
         if notes is None:
@@ -247,9 +358,24 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
     @abstractmethod
     def __len__(self) -> int:
         """Returns the total number of samples in the dataset."""
-        pass
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor | Path]:
+        """Return sample `idx` as a dict, caching the decoded result (see `use_cache`).
+
+        The load itself lives in the subclass `_load_sample`; this wrapper owns the bounds check and
+        the one shared decode-cache. Callers always get a fresh shallow copy, so replacing keys on a
+        returned dict can never corrupt the cache (tensor values are still shared -- consumers must
+        replace, not mutate in place, which is what datasets.augment does)."""
+        if not 0 <= idx < len(self):
+            raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
+        if self.use_cache and idx in self.data_cache:
+            return dict(self.data_cache[idx])
+        sample = self._load_sample(idx)
+        if self.use_cache:
+            self.data_cache[idx] = sample
+            return dict(sample)
+        return sample
 
     @abstractmethod
-    def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, Path]]:
-        """Retrieves a single item from the dataset."""
-        pass
+    def _load_sample(self, idx: int) -> dict[str, torch.Tensor | Path]:
+        """Decode and process sample `idx` into its result dict (no caching; see __getitem__)."""

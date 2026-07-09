@@ -1,4 +1,3 @@
-from typing import Tuple
 
 import numpy as np
 import pyworld as pw
@@ -13,7 +12,7 @@ class HarvestPitchAlgorithm(ContinuousPitchAlgorithm):
     # and applies threshold comparisons cheaply in post-processing.
     def _extract_raw_pitch_and_periodicity(
         self, audio: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         audio64 = audio.astype(np.float64)
         frame_period = self.hop_size / self.sample_rate * 1000.0  # ms
         f0, t = pw.harvest(

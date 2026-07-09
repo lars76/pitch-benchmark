@@ -1,6 +1,5 @@
 import urllib.request
 from pathlib import Path
-from typing import Tuple
 
 import numpy as np
 import torch
@@ -8,7 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from librosa.filters import mel
 
-from .base import ContinuousPitchAlgorithm
+from resampling import frame_times, resample_audio
+
+from .base import ContinuousPitchAlgorithm, resolve_device
 
 # Constants
 SAMPLE_RATE = 16000
@@ -24,7 +25,7 @@ DEFAULT_MODEL_URL = (
 )
 
 
-def get_model_path(model_path: str = None) -> str:
+def get_model_path(model_path: str | None = None) -> str:
     """
     Get model path, downloading if necessary.
 
@@ -56,7 +57,7 @@ def get_model_path(model_path: str = None) -> str:
         except Exception as e:
             if model_path.exists():
                 model_path.unlink()  # Remove partial file
-            raise RuntimeError(f"Failed to download model: {e}")
+            raise RuntimeError(f"Failed to download model: {e}") from e
 
     return str(model_path)
 
@@ -132,7 +133,7 @@ class MelSpectrogram(torch.nn.Module):
 
 class ConvBlockRes(nn.Module):
     def __init__(self, in_channels, out_channels, momentum=0.01):
-        super(ConvBlockRes, self).__init__()
+        super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(
                 in_channels=in_channels,
@@ -172,11 +173,11 @@ class ResEncoderBlock(nn.Module):
     def __init__(
         self, in_channels, out_channels, kernel_size, n_blocks=1, momentum=0.01
     ):
-        super(ResEncoderBlock, self).__init__()
+        super().__init__()
         self.n_blocks = n_blocks
         self.conv = nn.ModuleList()
         self.conv.append(ConvBlockRes(in_channels, out_channels, momentum))
-        for i in range(n_blocks - 1):
+        for _ in range(n_blocks - 1):
             self.conv.append(ConvBlockRes(out_channels, out_channels, momentum))
         self.kernel_size = kernel_size
         if self.kernel_size is not None:
@@ -195,7 +196,7 @@ class ResDecoderBlock(nn.Module):
     def __init__(
         self, in_channels, out_channels, stride, n_blocks=1, momentum=0.01
     ):
-        super(ResDecoderBlock, self).__init__()
+        super().__init__()
         # Adjust output padding based on stride
         if stride == (1, 2):
             out_padding = (0, 1)
@@ -223,7 +224,7 @@ class ResDecoderBlock(nn.Module):
         self.conv2.append(
             ConvBlockRes(out_channels * 2, out_channels, momentum)
         )
-        for i in range(n_blocks - 1):
+        for _ in range(n_blocks - 1):
             self.conv2.append(
                 ConvBlockRes(out_channels, out_channels, momentum)
             )
@@ -247,12 +248,12 @@ class Encoder(nn.Module):
         out_channels=16,
         momentum=0.01,
     ):
-        super(Encoder, self).__init__()
+        super().__init__()
         self.n_encoders = n_encoders
         self.bn = nn.BatchNorm2d(in_channels, momentum=momentum)
         self.layers = nn.ModuleList()
         self.latent_channels = []
-        for i in range(self.n_encoders):
+        for _ in range(self.n_encoders):
             self.layers.append(
                 ResEncoderBlock(
                     in_channels,
@@ -282,13 +283,13 @@ class Intermediate(nn.Module):
     def __init__(
         self, in_channels, out_channels, n_inters, n_blocks, momentum=0.01
     ):
-        super(Intermediate, self).__init__()
+        super().__init__()
         self.n_inters = n_inters
         self.layers = nn.ModuleList()
         self.layers.append(
             ResEncoderBlock(in_channels, out_channels, None, n_blocks, momentum)
         )
-        for i in range(self.n_inters - 1):
+        for _ in range(self.n_inters - 1):
             self.layers.append(
                 ResEncoderBlock(
                     out_channels, out_channels, None, n_blocks, momentum
@@ -305,10 +306,10 @@ class Decoder(nn.Module):
     def __init__(
         self, in_channels, n_decoders, stride, n_blocks, momentum=0.01
     ):
-        super(Decoder, self).__init__()
+        super().__init__()
         self.layers = nn.ModuleList()
         self.n_decoders = n_decoders
-        for i in range(self.n_decoders):
+        for _ in range(self.n_decoders):
             out_channels = in_channels // 2
             self.layers.append(
                 ResDecoderBlock(
@@ -333,7 +334,7 @@ class DeepUnet0(nn.Module):
         in_channels=1,
         en_out_channels=16,
     ):
-        super(DeepUnet0, self).__init__()
+        super().__init__()
         self.encoder = Encoder(
             in_channels,
             N_MELS,
@@ -361,7 +362,7 @@ class DeepUnet0(nn.Module):
 
 class BiGRU(nn.Module):
     def __init__(self, input_features, hidden_features, num_layers):
-        super(BiGRU, self).__init__()
+        super().__init__()
         self.gru = nn.GRU(
             input_features,
             hidden_features,
@@ -386,7 +387,7 @@ class E2E0(nn.Module):
         in_channels=1,
         en_out_channels=16,
     ):
-        super(E2E0, self).__init__()
+        super().__init__()
         self.mel = MelSpectrogram(
             N_MELS,
             SAMPLE_RATE,
@@ -463,11 +464,12 @@ def to_local_average_cents(salience, center=None, thred=0.0):
 
 class RMVPEPitchAlgorithm(ContinuousPitchAlgorithm):
     _name = "RMVPE"
+    device_backend = "torch"
 
     def __init__(
         self,
-        model_path: str = None,
-        device: str = "cuda",
+        model_path: str | None = None,
+        device: str = "auto",
         **kwargs,
     ):
         """
@@ -482,15 +484,11 @@ class RMVPEPitchAlgorithm(ContinuousPitchAlgorithm):
 
         # RMVPE always works at 16kHz internally - base class handles alignment
 
-        # Set up device
-        if device == "cuda" and torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
+        # Set up device (cuda -> mps -> cpu for 'auto'; explicit requests fall back if unavailable)
+        self.device = resolve_device(device)
 
-        # RMVPE model requires fixed hop_length=320 samples (20ms at 16kHz)
-        # This is baked into the trained model architecture
-        self.model_hop_length = 160  # Fixed model hop length
+        # RMVPE's model hop is fixed at 160 samples (10ms at 16kHz), baked into the architecture.
+        self.model_hop_length = 160
 
         # Get model path (auto-download if needed)
         model_path = get_model_path(model_path)
@@ -544,16 +542,7 @@ class RMVPEPitchAlgorithm(ContinuousPitchAlgorithm):
         audio = audio.astype(np.float32)
 
         # Always resample to model's native 16kHz (base class handles user alignment)
-        if self.sample_rate != SAMPLE_RATE:
-            try:
-                from resampy import resample
-
-                audio = resample(audio, self.sample_rate, SAMPLE_RATE)
-            except ImportError:
-                from scipy.signal import resample
-
-                target_length = int(len(audio) * SAMPLE_RATE / self.sample_rate)
-                audio = resample(audio, target_length).astype(np.float32)
+        audio = resample_audio(audio, self.sample_rate, SAMPLE_RATE)
 
         # Normalize to [-1, 1]
         audio_max = np.max(np.abs(audio))
@@ -564,7 +553,7 @@ class RMVPEPitchAlgorithm(ContinuousPitchAlgorithm):
 
     def _extract_raw_pitch_and_periodicity(
         self, audio: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Extract raw pitch and periodicity from audio
 
@@ -592,12 +581,12 @@ class RMVPEPitchAlgorithm(ContinuousPitchAlgorithm):
             try:
                 pitch_pred = self.model(audio_tensor).squeeze(0)
             except RuntimeError as e:
-                if "out of memory" in str(e):
-                    # Move to CPU for this sample only
+                if "out of memory" in str(e) and self.device.type in ("cuda", "mps"):
+                    # Move to CPU for this sample only, then back to the original device
                     audio_tensor = audio_tensor.cpu()
                     self.model = self.model.cpu()
                     pitch_pred = self.model(audio_tensor).squeeze(0)
-                    self.model = self.model.cuda()  # Move back for next sample
+                    self.model = self.model.to(self.device)
                 else:
                     raise e
 
@@ -609,7 +598,10 @@ class RMVPEPitchAlgorithm(ContinuousPitchAlgorithm):
         import gc
 
         gc.collect()
-        torch.cuda.empty_cache()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif self.device.type == "mps":
+            torch.mps.empty_cache()
 
         # Convert pitch prediction to cents then to Hz
         cents = to_local_average_cents(
@@ -626,11 +618,9 @@ class RMVPEPitchAlgorithm(ContinuousPitchAlgorithm):
             else pitch_pred_np
         )
 
-        # Calculate time points based on model's internal hop length
-        # The model operates at 16kHz with 160-sample hops (10ms)
-        model_hopsize_seconds = self.model_hop_length / SAMPLE_RATE
-        n_frames = len(f0)
-        times = np.arange(n_frames) * model_hopsize_seconds
+        # Stamp from the model's internal stride (160 samples at 16 kHz, 10 ms); seconds survive
+        # the resample, so these times are valid on the original timeline.
+        times = frame_times(len(f0), self.model_hop_length, SAMPLE_RATE)
 
         return times, f0, periodicity
 
