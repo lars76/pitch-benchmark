@@ -25,12 +25,12 @@ _ALGORITHM_METADATA = {
     "Harvest": ("harvest", "HarvestPitchAlgorithm"),
 }
 
-# Trackers that need NO `uv sync --extra` -- their backend is already covered by the base install, so
-# there is no pip package to add. NOT a statement of importance: RMVPE's model is implemented in-repo
-# (algorithms/rmvpe.py, torch + librosa only, weights downloaded at runtime) and pYIN is just
-# librosa.pyin; both torch and librosa are core dependencies. Everything else ships an external backend
-# package and thus a pyproject extra. Single source of truth for the "has an extra vs not" split; used
-# by the install hint below and the conformance test (tests/test_algorithm_extras.py).
+# Trackers that need NO `uv sync --extra` -- there is no pip package to add. NOT a statement of
+# importance: RMVPE's model is implemented in-repo (algorithms/rmvpe.py, torch + librosa only,
+# weights downloaded at runtime) and pYIN is just librosa.pyin; both torch and librosa are core
+# dependencies. Everything else ships an external backend package and thus a pyproject extra.
+# Single source of truth for the "has an extra vs not" split; used by the install hint below and
+# the conformance test (tests/test_algorithm_extras.py).
 _NO_EXTRA_MODULES = frozenset({"pyin", "rmvpe"})
 
 # _REGISTRY caches lazily loaded algorithm classes.

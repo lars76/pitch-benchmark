@@ -13,7 +13,7 @@ class PENNPitchAlgorithm(ContinuousPitchAlgorithm):
     device_backend = "torch"
 
     # FCNF0++'s reported pitch corresponds to signal this many 8 kHz samples BEFORE the analysis
-    # window centre (~11 ms), constant across sample rates and sweep rates; see the timestamp
+    # window center (~11 ms), constant across sample rates and sweep rates; see the timestamp
     # comment in _extract_raw_pitch_and_periodicity and tests/test_time_calibration.py.
     MODEL_LAG_SAMPLES = 88
 
@@ -83,9 +83,9 @@ class PENNPitchAlgorithm(ContinuousPitchAlgorithm):
         #  1. Window-center geometry per `center` mode: penn.preprocess pads the 8 kHz audio with
         #     int((WINDOW_SIZE - hop8k)/2) ('half-hop'), WINDOW_SIZE//2 ('zero') or nothing
         #     ('half-window') and strides windows of WINDOW_SIZE from the padded start, so frame
-        #     m's window centre sits at m*hop + ((WINDOW_SIZE-1)/2 - padding)/penn.SAMPLE_RATE.
+        #     m's window center sits at m*hop + ((WINDOW_SIZE-1)/2 - padding)/penn.SAMPLE_RATE.
         #  2. A constant FCNF0++ content lag: the reported pitch corresponds to signal
-        #     MODEL_LAG_SAMPLES before the window centre -- measured -10.99 ms at 16 kHz and
+        #     MODEL_LAG_SAMPLES before the window center -- measured -10.99 ms at 16 kHz and
         #     -11.05 ms at 22.05 kHz (rate-invariant across sweep rates, same sign on the step
         #     probe, so it is corrected per the calibration policy in TIMING.md).
         hop8k = self.hopsize_seconds * penn.SAMPLE_RATE

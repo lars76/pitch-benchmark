@@ -82,6 +82,46 @@ only; pass `--devices cpu mps` (or `cuda`) to also time the GPU-capable trackers
 
 (SpeechSynth needs no download; it is rendered at runtime from a LightSpeech TTS checkpoint.)
 
+**EGG (laryngograph) speech corpora.** These are recorded with an electroglottograph, so the f0 is
+derived from the glottal (laryngograph) channel rather than annotated by ear. **To use them you only
+(1) download + extract the original dataset and (2) run the benchmark**. The loader decodes audio
+straight from the raw extracted download (each parses that corpus's native format), and the ground
+truth ships in the repo. There is no preprocessing step to run.
+
+Ground truth comes from one of two sources:
+- `consensus` (default): cross-family EGG labels (Praat / differentiated-EGG / Harvest), **committed
+  in the repo** as `datasets/laryngograph/<NAME>.npz`.
+- `reference`: the dataset authors' own shipped f0, read from the archive, available only where the
+  download ships one: PTDB (`REF/.f0`), KEELE (its reference track), FDA (`.fx`). The other corpora
+  ship audio + EGG but no f0, so they are consensus-only.
+
+(SVD: extract `healthy.zip` only, the healthy-control subset; SVD is otherwise a voice-disorder
+database whose pathological voices make unreliable f0 ground truth. MOCHA's CSTR download is raw
+`.wav` + `.lar`; KEELE is distributed pre-packaged as `signal.wav` + `laryngograph.wav`; the loader
+reads whichever form is present for each.)
+
+> **Maintainers only** (regenerating the committed labels; end users never run this): `uv sync
+> --extra praat --extra harvest` then `scripts/build_consensus_labels.py --dataset <NAME> --data-dir
+> <extracted-root>` for every EGG corpus, and commit the resulting npz.
+
+- [MOCHA-TIMIT](https://www.cstr.ed.ac.uk/research/projects/artic/mocha.html) - 9 speakers x 460 TIMIT sentences, speech + laryngograph (`.wav` + `.lar`, 16 kHz, 1024-byte NIST/SPHERE headers). CSTR, free non-commercial; download per-speaker from [data.cstr.ed.ac.uk/mocha](http://data.cstr.ed.ac.uk/mocha/)
+- [CMU Arctic](http://www.festvox.org/cmu_arctic/) - phonetically balanced English, EGG-recorded (festvox; free). Download the `-WAVEGG` stereo distribution (speech + EGG channel); the plain mono package has no EGG and cannot be used (there is no shipped f0 to fall back on)
+- [KEELE](https://zenodo.org/records/3921794) - 10 speakers reading the North Wind passage, speech + laryngograph reference ([Plante et al., 1995](https://www.isca-archive.org/eurospeech_1995/plante95_eurospeech.html)). NOTE: the first-party Keele/SAM distribution is defunct (the KTH/MIT `lost-contact` mirror is offline and not archived in the Wayback Machine), so KEELE is the one EGG corpus obtained from a curated redistribution rather than a first-party raw download: Bechtold's Zenodo compilation "[Speech and Noise Corpora for Pitch Estimation of Human Speech](https://zenodo.org/records/3921794)" ([Bechtold, 2020, dissertation replication set](https://github.com/bastibe/Replication-Dataset-Scripts)). It repackages the corpus as a [jbof](https://github.com/bastibe/jbof) dataframe (per item `signal.wav` + `laryngograph.wav` + `pitch.npy`) while preserving the original 20 kHz / 16-bit audio unchanged, so the loader reads that faithful packaging directly.
+- [FDA](https://www.cstr.ed.ac.uk/research/projects/fda/) - Bagshaw 50-sentence x 2-speaker f0 evaluation set with `.lar` laryngograph ([`fda_eval.tar.gz`](https://www.cstr.ed.ac.uk/pcb/fda_eval.tar.gz))
+- [SVD](http://stimmdb.coli.uni-saarland.de/) - Saarbruecken Voice Database, speech + separate EGG (web export; helper: [svd-downloader](https://github.com/rijulg/svd-downloader))
+- [AVID](https://zenodo.org/records/10524873) - Aalto Vocal Intensity Database: 50 speakers, calibrated speech + EGG at four intensity levels (open, Zenodo; [Alku et al., Speech Communication 2024](https://www.sciencedirect.com/science/article/pii/S0167639324000116))
+- OSFGlottis - Alku "Speech and EGG Simultaneous Recordings" ([Kielipankki](https://research.aalto.fi/en/datasets/speech-and-egg-electroglottography-simultaneous-recordings/); CLARIN academic/non-commercial)
+- APLAWD - 151 short-utterance types x 10 repetitions x 10 British-RP speakers, speech + laryngograph (EGG) at 20 kHz (recorded at UCL 1987-88 for the SPAR project; Lindsey, Breen & Nevard). We use the **APLAWDW** repackaging by M. Brookes, Imperial College London (2015): [`aplawdw.zip`](https://www.commsp.ee.ic.ac.uk/~sap/uploads/data/aplawdw.zip) from [Imperial SAP](https://www.commsp.ee.ic.ac.uk/~sap/resources/aplawdw/) (server occasionally 500s; the download URL and GCI reference markings are also documented at [serwy/aplawdw](https://github.com/serwy/aplawdw))
+
+**Multi-instrument music.**
+
+- [URMP](https://labsites.rochester.edu/air/projects/URMP.html) - 44 classical chamber pieces with manually corrected per-track f0 and note transcriptions ([Li et al., IEEE TMM 2019](https://ieeexplore.ieee.org/document/8411155); access via the linked form)
+
+> **Disclosure.** Several EGG-speech corpora (PTDB, MOCHA, CMU Arctic, and the wider EGG pool) plus
+> MDB-stem-synth are commonly used as *training* data for the small in-house tracker (BPO48). Their
+> leaderboard cells are therefore home data for that model and should be read as such; the
+> resynthesized-music and held-out speech corpora (KEELE, FDA, ...) are the fair comparison points.
+
 **Noise sources** (only for the real-noise robustness conditions `--degradation chime|demand`):
 
 - [CHiME-Home](https://archive.org/details/chime-home) - Domestic background noise ([Foster et al., WASPAA 2015](https://ieeexplore.ieee.org/document/7314880)); pass with `--chime-dir`
@@ -96,6 +136,15 @@ datasets/
 ├── MIR1K/
 ├── Vocadito/
 ├── Bach10Synth/
+├── MOCHA/              # raw CSTR per-speaker: <spk>_<num>.wav + .lar (--dataset MOCHA)
+├── cmu_arctic_egg/            # extracted -WAVEGG: cmu_us_<spk>_arctic/orig/*.wav (--dataset CMUArctic)
+├── avid/extracted/           # AVID/Repository 1/Spk*_*.wav stereo (--dataset AVID)
+├── osf_glottis/bids_dataset/ # BIDS sub-XX/beh/*_physio.tsv.gz (--dataset OSFGlottis)
+├── svd/healthy/              # extracted healthy.zip: <rec>/sentences/*.nsp + overview.csv (--dataset SVD)
+├── aplawd/APLAWDW/           # extracted aplawdw.zip: <...>/*.wav + *.egg (--dataset APLAWD)
+├── KEELE/KEELE/        # Bechtold jbof redistribution: <stem>/signal.wav + laryngograph.wav + pitch.npy (--dataset KEELE)
+├── FDA/                      # raw .sig/.fx/.lar (--dataset FDA)
+├── URMP/Dataset/    # multi-instrument music (--dataset URMP)
 ├── chime_home/      # noise source for --degradation chime
 └── DEMAND/          # noise source for --degradation demand
 ```

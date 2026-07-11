@@ -193,6 +193,12 @@ class MetricAccumulator:
         self._sm_cnt = {"relative_smoothness": 0, "continuity_breaks": 0}
 
     def update(self, pred_pitch, pred_voicing, true_pitch, true_voicing, pitch_conf=None) -> None:
+        # A frame the tracker calls voiced but assigns no pitch (pred_pitch <= 0) is a VOICING miss,
+        # not a pitch error: fold the pitch-present test into the voicing decision so the frame is
+        # charged exactly once (as a recall miss) and excluded from RPA -- instead of escaping BOTH
+        # axes at low voicing thresholds, where pred_voicing is forced True yet the cents are
+        # non-finite and _PitchBin.add drops the frame silently.
+        pred_voicing = np.asarray(pred_voicing).astype(bool) & (np.asarray(pred_pitch) > 0)
         # `true_voicing` is a [0,1] confidence; threshold to voiced GT (single def: is_voiced).
         tv = is_voiced(np.asarray(true_voicing))
         self.tp += int(np.sum(pred_voicing & tv))

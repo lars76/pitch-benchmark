@@ -14,7 +14,7 @@ class YAAPTPitchAlgorithm(ThresholdPitchAlgorithm):
     at a fixed delay after the frame START, independent of frame_length (sweeping frame_length
     35 -> 45 ms moves the apparent offset by exactly -frame_length/2: -8.65 -> -13.48 ms), i.e.
     YAAPT's NCCF/spectral evidence is anchored to the front of the analysis window, not its
-    centre. We therefore stamp frame_start + NCCF_CONTENT_DELAY (measured 8.9 ms at 16 kHz and
+    center. We therefore stamp frame_start + NCCF_CONTENT_DELAY (measured 8.9 ms at 16 kHz and
     10.3 ms at 22.05 kHz; the 9.6 ms mean leaves <=0.8 ms residual at both rates). Applied per
     the calibration policy in TIMING.md (chirp -8.65 / step -10.0 agree in sign and magnitude)."""
 
@@ -71,7 +71,7 @@ class YAAPTPitchAlgorithm(ThresholdPitchAlgorithm):
         # Get pitch values and voicing decisions
         pitch_values = pitch.samp_values
 
-        # frames_pos marks window centres; stamp start + measured content delay (class docstring).
+        # frames_pos marks window centers; stamp start + measured content delay (class docstring).
         starts = np.asarray(pitch.frames_pos, dtype=float) - self.frame_length_samples // 2
         times = starts / self.sample_rate + self.NCCF_CONTENT_DELAY
 

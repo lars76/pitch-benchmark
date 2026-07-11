@@ -48,10 +48,10 @@ class REAPERPitchAlgorithm(ThresholdPitchAlgorithm):
     (unlike thresholding the correlation, which can only make voicing more conservative because
     REAPER reports no f0 on frames it calls unvoiced).
 
-    REAPER reports per-frame `f0_times`, but those mark frame STARTS, not the analysis centre:
+    REAPER reports per-frame `f0_times`, but those mark frame STARTS, not the analysis center:
     the timestamp calibration (tests/test_time_calibration.py) measures the content of frame m
     exactly frame_period/2 after its stamp at both 16 kHz and 22.05 kHz, with the chirp and step
-    probes agreeing to 0.1 ms. We therefore shift the stamps by +frame_period/2 to the centres and
+    probes agreeing to 0.1 ms. We therefore shift the stamps by +frame_period/2 to the centers and
     let the base class resample to the eval grid.
 
     Note (transparency): REAPER is also one of the four EGG estimators behind the PTDB consensus
@@ -81,7 +81,7 @@ class REAPERPitchAlgorithm(ThresholdPitchAlgorithm):
             )
         f0 = np.asarray(f0, dtype=float)
         pitch = np.where(f0 > 0, f0, 0.0)  # REAPER uses -1 on unvoiced frames
-        # f0_times are frame starts; stamp the frame centres (see class docstring).
+        # f0_times are frame starts; stamp the frame centers (see class docstring).
         times = np.asarray(f0_times, dtype=float) + 0.5 * self.hop_size / self.sample_rate
         return times, pitch, (pitch > 0).astype(np.float32)
 

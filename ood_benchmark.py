@@ -65,6 +65,7 @@ FAMILIES = {
     "unresolved":   ("unresolved", MECH_F0),
     "irn":          ("irn", MECH_F0),
     "vibrato_fast": ("vibrato", None),
+    "glide":        ("glide", None),
     "sine_bass":    ("sine", BANDS_F0["bass"]),
     "sine_low":     ("sine", BANDS_F0["low"]),
     "sine_mid":     ("sine", BANDS_F0["mid"]),
@@ -177,10 +178,24 @@ def _control_signal(family, rng):
     return _finalize(x)
 
 
+# FROZEN per-family ids for stochastic-clip seeding (noise/whisper/irn). These are the
+# alphabetical ranks at the time the first results were generated. Frozen because a sorted-rank
+# lookup silently RENUMBERS later families whenever a new one is added (e.g. adding "glide"
+# would shift harm_* .. whisper by one and re-roll every stochastic clip, invalidating all
+# existing results_ood_* comparisons). Add new families at the END with the next unused id;
+# never renumber. test_ood.py locks the table against FAMILIES drift.
+_FAMILY_IDS = {
+    "harm_high": 0, "harm_low": 1, "harm_mid": 2, "harm_vhigh": 3, "irn": 4, "missing_f0": 5,
+    "noise": 6, "sine_bass": 7, "sine_high": 8, "sine_low": 9, "sine_mid": 10, "sine_vhigh": 11,
+    "tilt_high": 12, "tilt_low": 13, "tilt_mid": 14, "tilt_vhigh": 15, "unresolved": 16,
+    "vibrato_fast": 17, "whisper": 18,
+    "glide": 19,                       # added 2026-07-10 (deterministic kind; id reserved anyway)
+}
+
+
 def _family_id(family):
-    """Stable integer id for a family (alphabetical rank), for per-clip seeding. Sorting decouples
-    the id from FAMILIES' insertion order, so reordering the table cannot re-roll the clips."""
-    return sorted(FAMILIES).index(family)
+    """Stable integer id for a family, for per-clip seeding (see _FAMILY_IDS)."""
+    return _FAMILY_IDS[family]
 
 
 def make_clips(family):
@@ -202,6 +217,16 @@ def make_clips(family):
         t = np.arange(N) / SR
         ft = 220.0 * 2 ** (1.0 / 12 * np.sin(2 * np.pi * 6 * t))     # +-1 semitone at 6 Hz
         return [_voiced_clip(ft, _harm_parts(ft, lambda k: 1.0 / k))]
+
+    if kind == "glide":
+        # Monotonic one-octave glides (600 cents/s -- the calibration-probe slope, but scored as
+        # RPA against exact per-frame labels): up + down, low + mid register. Deterministic.
+        t = np.arange(N) / SR
+        clips = []
+        for f_start, octaves in ((110.0, +1.0), (220.0, -1.0), (330.0, +1.0), (660.0, -1.0)):
+            ft = f_start * 2.0 ** (octaves * t * SR / N)
+            clips.append(_voiced_clip(ft, _harm_parts(ft, lambda k: 1.0 / k)))
+        return clips
 
     clips = []
     for i, f0 in enumerate(f0_list):

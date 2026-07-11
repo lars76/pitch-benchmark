@@ -1,3 +1,4 @@
+import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -34,7 +35,7 @@ def frame_rms(
       - center=False: frame i spans [i*hop, i*hop + L) -- forward-looking, energy centered half a
         window LATE relative to the grid. Only for callers that explicitly want trailing windows.
 
-    The signal is zero-padded (left for centring, right so the final window is complete); returns
+    The signal is zero-padded (left for centering, right so the final window is complete); returns
     shape (n_frames,). This is the one per-frame energy primitive behind every RMS-vs-peak
     silence/voicing gate in the repo (NSynth's voicing detector, the laryngograph energy gate, and
     the offline consensus silence gate). Each caller keeps its OWN normalization/threshold/policy
@@ -70,7 +71,7 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
 
     Ground-truth contract (what __getitem__ must return):
         Required keys, all 1-D and frame-aligned: length F = audio_samples // hop_size, where frame m
-        is the audio CENTERED at sample m*hop_size (time m*hop_size / sample_rate). This centre-aligned
+        is the audio CENTERED at sample m*hop_size (time m*hop_size / sample_rate). This center-aligned
         grid is shared with the predictions: both ground truth and estimates are resampled onto it
         (resampling.resample_to_grid), so they line up frame-for-frame.
           - "audio":       float32 tensor, shape (T,), range [-1, 1] at `sample_rate`.
@@ -276,6 +277,8 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
         it: that path ships precomputed grid-aligned labels and so skips label resampling, but still
         needs identical audio handling."""
         audio = audio.squeeze()
+        if audio.dim() == 2:            # genuine multi-channel -> average to mono (squeeze only drops
+            audio = audio.mean(0)       # size-1 dims, so a real stereo signal would slip through as 2ch)
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
         if orig_sr != self.sample_rate:
@@ -285,19 +288,40 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
         return self._validate_audio(audio)
 
     def _load_csv_f0_annotation(
-        self, csv_path: Path
+        self, csv_path: Path, sep: str = ","
     ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor]:
-        """Load (times, pitch, periodicity) from a headerless 2-column F0 CSV: column 0 = annotation
+        """Load (times, pitch, periodicity) from a headerless 2-column F0 file: column 0 = annotation
         timestamps (seconds), column 1 = F0 in Hz with 0 = unvoiced. Periodicity is binary (pitch >
-        0). Shared by the CSV-annotated loaders (MDB, Bach10Synth, Vocadito)."""
+        0). Shared by the comma-CSV loaders (MDB, Bach10Synth, Vocadito) and URMP's whitespace-
+        separated F0s files (sep=r"\\s+")."""
         try:
-            data = pd.read_csv(csv_path, header=None).values
+            data = pd.read_csv(csv_path, header=None, sep=sep).values
             times = data[:, 0].astype(float)
             pitch = torch.from_numpy(data[:, 1]).float()
             periodicity = (pitch > 0).float()
             return times, pitch, periodicity
         except Exception as e:
             raise OSError(f"Error loading annotation file {csv_path}: {e!s}") from e
+
+    def _load_notes_annotation(self, csv_path: Path, sep: str = ",") -> list[dict]:
+        """Load note events from a headerless 3-column file: ``(onset_s, f0_hz, duration_s)`` -> a list
+        of ``{start, end, midi_pitch}``, midi via ``librosa.hz_to_midi`` (the single hz->midi
+        definition). Non-positive f0 rows are skipped (no MIDI pitch). Shared by Vocadito (comma) and
+        URMP (whitespace, sep=r"\\s+"). Returns ``[]`` and warns if the file cannot be read."""
+        try:
+            data = pd.read_csv(csv_path, header=None, sep=sep).values
+        except Exception as e:
+            warnings.warn(f"Error loading notes file {csv_path}: {e!s}", stacklevel=2)
+            return []
+        notes = []
+        for row in data:
+            start, pitch_hz, duration = float(row[0]), float(row[1]), float(row[2])
+            if pitch_hz <= 0:                       # a note with no positive f0 has no MIDI pitch
+                continue
+            notes.append(
+                {"start": start, "end": start + duration, "midi_pitch": float(librosa.hz_to_midi(pitch_hz))}
+            )
+        return notes
 
     def process_sample(
         self,
@@ -312,7 +336,7 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
         """Resample audio and labels onto the eval grid, then enforce the label contract.
 
         Audio is squeezed to mono, resampled to self.sample_rate and validated; pitch/periodicity
-        are resampled by true time onto the centre-aligned grid and range-gated, with the same
+        are resampled by true time onto the center-aligned grid and range-gated, with the same
         frequency constraint applied to any notes.
 
         label_times (np.ndarray): true time (seconds) of each input pitch/periodicity frame;

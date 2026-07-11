@@ -298,14 +298,35 @@ def _copy_eval_attrs(dst, src):
 
 
 class Augment(Dataset):
-    """Apply a pipeline (list of transforms) to a base dataset's audio, deterministically
-    per (seed, idx). An empty pipeline is a pass-through (the 'clean' condition)."""
+    """Apply a pipeline (list of transforms) to a base dataset's audio, deterministically.
 
-    def __init__(self, base_dataset, pipeline, seed: int = 0):
+    Two seeding modes, selected by `epoch`:
+      - epoch is None (default, EVAL): the per-item stream is item_rng(seed, idx) -- FROZEN across
+        accesses, so two benchmark runs at the same seed produce bit-identical degraded audio. This
+        is the reproducibility contract the benchmark depends on; leave epoch=None for eval.
+      - epoch is an int (TRAINING): the stream is item_rng(seed, epoch, idx), so every epoch re-rolls
+        every transform's randomness (fresh noise / SNR / condition choice each pass) while staying a
+        PURE function of (seed, epoch, idx) -- reproducible and resumable (set_epoch(N) after a
+        checkpoint continues the identical stream), independent of shuffle order, worker count and
+        cache state. Call set_epoch(e) once per epoch before iterating.
+
+    Adding the epoch key changes the derived seed, so the two modes are intentionally distinct
+    streams; the None path is kept byte-identical to the original two-key derivation so eval numbers
+    do not move. An empty pipeline is a pass-through (the 'clean' condition)."""
+
+    def __init__(self, base_dataset, pipeline, seed: int = 0, epoch: int | None = None):
         self.base_dataset = base_dataset
         self.pipeline = list(pipeline)
         self.seed = int(seed)
+        self.epoch = None if epoch is None else int(epoch)
         _copy_eval_attrs(self, base_dataset)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Switch to training seeding for `epoch` (see class docstring). Call once per epoch, before
+        the DataLoader iterator is created, so re-forked workers pick up the new epoch. With
+        persistent_workers=True a worker holds a stale copy and never sees this -- use
+        persistent_workers=False for training (the decode cache is off there anyway)."""
+        self.epoch = int(epoch)
 
     def __len__(self):
         return len(self.base_dataset)
@@ -320,7 +341,13 @@ class Augment(Dataset):
             audio = audio.squeeze(0)
         x = audio.detach().cpu().numpy().astype(np.float32).reshape(-1)
 
-        rng = item_rng(self.seed, idx)  # bit-identical to the original inline derivation
+        # None -> eval: item_rng(seed, idx), bit-identical to the original derivation (frozen stream).
+        # int  -> training: fold the epoch in so each epoch re-rolls, still pure(seed, epoch, idx).
+        rng = (
+            item_rng(self.seed, idx)
+            if self.epoch is None
+            else item_rng(self.seed, self.epoch, idx)
+        )
 
         per = sample.get("periodicity")
         per_np = per.detach().cpu().numpy() if per is not None else None
@@ -482,6 +509,31 @@ def _real_noise(scan, directory, name, sample_rate):
     return [AddNoise(SampleBank(scan(directory, sample_rate)))]
 
 
+class Codec:
+    """G.711-style telephone codec, label-preserving: narrowband 8 kHz round-trip (linear-phase
+    resample_poly -- no group delay, honoring the same zero-phase contract as BandLimit) plus an
+    8-bit mu-law companding round-trip (quantization distortion). Deterministic (rng unused).
+    Complements 'telephone' (pure band-limit): codec adds the NONLINEAR quantization artifacts of
+    real phone/VoIP chains while keeping f0 (<4 kHz) intact."""
+
+    def __init__(self, mu: float = 255.0):
+        self.mu = mu
+
+    def __call__(self, audio, sr, periodicity, hop, rng):
+        from scipy.signal import resample_poly
+
+        x = np.asarray(audio, dtype=np.float64)
+        n = len(x)
+        if sr > 8000:
+            x = resample_poly(resample_poly(x, 8000, sr), sr, 8000)
+            x = x[:n] if len(x) >= n else np.pad(x, (0, n - len(x)))
+        x = np.clip(x, -1.0, 1.0)
+        comp = np.sign(x) * np.log1p(self.mu * np.abs(x)) / np.log1p(self.mu)
+        q = np.round((comp + 1.0) * 127.5) / 127.5 - 1.0        # 256 levels
+        x = np.sign(q) * ((1.0 + self.mu) ** np.abs(q) - 1.0) / self.mu
+        return x.astype(np.float32)
+
+
 REGISTRY = {
     "clean": lambda **k: [],
     # additive-noise family at a common 0 dB voiced-aware SNR (AddNoise defaults to 0 dB;
@@ -494,6 +546,7 @@ REGISTRY = {
         _nonpitched_demand_segments, demand_dir, "demand", sample_rate),
     # low-cut and convolutional axes
     "telephone": lambda **k: [BandLimit(300.0, 3400.0)],
+    "codec": lambda **k: [Codec()],
     "reverb": lambda **k: [Reverb(0.4)],
     "room": lambda **k: [RoomReverb()],
 }
@@ -505,7 +558,7 @@ REGISTRY = {
 CONDITION_FAMILIES = {
     "additive": ("white", "pink", "chime", "demand"),   # per-source + mean + worst-provenance
     "convolutional": ("reverb", "room"),
-    "filtering": ("telephone",),
+    "filtering": ("telephone", "codec"),
 }
 
 

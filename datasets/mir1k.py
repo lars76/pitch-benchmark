@@ -29,7 +29,7 @@ class PitchDatasetMIR1K(PitchDataset):
     fmin = 65
     fmax = 2093
     # MIR-1K manual pitch labels: 40 ms analysis window, 20 ms hop. Used to resample labels at their
-    # true times; see _load_sample for the frame-centring convention and its empirical verification.
+    # true times; see _load_sample for the frame-centering convention and its empirical verification.
     PITCH_LABEL_HOP_SECONDS = 0.02
 
     def __init__(self, root_dir: str, use_cache: bool = True, **kwargs):
@@ -111,8 +111,8 @@ class PitchDatasetMIR1K(PitchDataset):
 
         # Resample labels at their true timestamps. MIR-1K labels come from 40 ms windows hopped by
         # 20 ms from t=0, so frame i spans [i*20, i*20+40] ms and is centered at (i+1)*20 ms. This is
-        # confirmed by the label count: every file has n = floor(dur/20 ms) - 1 labels (last centre
-        # at n*20 ms <= dur-20 ms), the fingerprint of centres at 20, 40, ..., dur-20 ms; the (i+0.5)
+        # confirmed by the label count: every file has n = floor(dur/20 ms) - 1 labels (last center
+        # at n*20 ms <= dur-20 ms), the fingerprint of centers at 20, 40, ..., dur-20 ms; the (i+0.5)
         # convention would instead predict n = floor(dur/20 ms). Using (i+0.5) put every label half a
         # hop (~10 ms) early on the eval grid.
         label_times = (np.arange(pitch.numel()) + 1.0) * self.PITCH_LABEL_HOP_SECONDS

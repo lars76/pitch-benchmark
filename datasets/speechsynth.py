@@ -315,11 +315,23 @@ class PitchDatasetSpeechSynth(PitchDataset):
         self.vocoder_name = vocoder_name
         self.exact_f0 = exact_f0
         self.seed = seed
+        # None -> eval: the corpus is FROZEN, sample idx = pure(checkpoint, seed, idx) so it is
+        # identical across runs (like every file-backed dataset). An int (set via set_epoch) folds
+        # the epoch into the per-sample RNG so training regenerates fresh utterances each epoch while
+        # staying pure(checkpoint, seed, epoch, idx). See _generate_word_sequence.
+        self.epoch = None
 
         self._initialize_models()
 
         # Calculate total dataset size
         self.total_samples = self.num_speakers * self.samples_per_speaker
+
+    def set_epoch(self, epoch: int) -> None:
+        """Switch to training seeding for `epoch`: the generated corpus re-rolls each epoch (fresh
+        word sequences and therefore fresh waveforms) instead of the frozen eval corpus. Call once
+        per epoch before iterating; with the decode cache on, regeneration only takes effect for
+        samples not already cached, so run training with use_cache=False."""
+        self.epoch = int(epoch)
 
     def _initialize_models(self):
         """Initialize the TTS model and vocoder."""
@@ -444,8 +456,13 @@ class PitchDatasetSpeechSynth(PitchDataset):
         order, cache state), silently changing the corpus between otherwise-identical runs. The
         default seed is a constant, deliberately DECOUPLED from the benchmark run seed: the corpus
         stays fixed across runs (like every file-backed dataset) and the run seed varies only the
-        augmentation noise."""
-        rng = random.Random(item_seed(self.seed, idx))
+        augmentation noise. In training mode (self.epoch is an int, via set_epoch) the epoch joins
+        the key so the corpus re-rolls each epoch, still a pure function of (seed[, epoch], idx)."""
+        rng = random.Random(
+            item_seed(self.seed, idx)
+            if self.epoch is None
+            else item_seed(self.seed, self.epoch, idx)
+        )
         num_words = rng.randint(*self.word_range)
         selected_words = rng.sample(
             self.available_words, min(num_words, len(self.available_words))
@@ -503,7 +520,7 @@ class PitchDatasetSpeechSynth(PitchDataset):
             # (len(wav)/len(pitch)) samples, so the native hop in seconds is that ratio over the
             # vocoder sample rate. Mel frame i is NOT centered at i*hop: the upstream preprocessing
             # (lars76/fastspeech2-clean, compute_mel) pads (n_fft - hop)/2 with center=False, so
-            # the analysis window centre sits at i*hop + (hop-1)/2 samples (+5.8 ms at 22.05 kHz).
+            # the analysis window center sits at i*hop + (hop-1)/2 samples (+5.8 ms at 22.05 kHz).
             # Anchoring the contour there keeps the imposed f0 in sync with the donor envelope's
             # phonetic content (and is the honest stamp for the exact_f0=False debug path).
             native_hop = (wav.numel() / pitch.numel()) / self.vocoder.sampling_rate

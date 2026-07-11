@@ -8,11 +8,22 @@ from .augment import (
 )
 from .bach10synth import PitchDatasetBach10Synth
 from .base import PitchDataset
-from .laryngograph import PitchDatasetPTDB
+from .laryngograph import (
+    PitchDatasetAPLAWD,
+    PitchDatasetAVID,
+    PitchDatasetCMUArctic,
+    PitchDatasetFDA,
+    PitchDatasetKEELE,
+    PitchDatasetMOCHA,
+    PitchDatasetOSFGlottis,
+    PitchDatasetPTDB,
+    PitchDatasetSVD,
+)
 from .mdb import PitchDatasetMDBStemSynth
 from .mir1k import PitchDatasetMIR1K
 from .nsynth import PitchDatasetNSynth
 from .speechsynth import PitchDatasetSpeechSynth
+from .urmp import PitchDatasetURMP
 from .vocadito import PitchDatasetVocadito
 
 __all__ = [
@@ -20,12 +31,21 @@ __all__ = [
     "REGISTRY",
     "Augment",
     "PitchDataset",
+    "PitchDatasetAPLAWD",
+    "PitchDatasetAVID",
     "PitchDatasetBach10Synth",
+    "PitchDatasetCMUArctic",
+    "PitchDatasetFDA",
+    "PitchDatasetKEELE",
     "PitchDatasetMDBStemSynth",
     "PitchDatasetMIR1K",
+    "PitchDatasetMOCHA",
     "PitchDatasetNSynth",
+    "PitchDatasetOSFGlottis",
     "PitchDatasetPTDB",
+    "PitchDatasetSVD",
     "PitchDatasetSpeechSynth",
+    "PitchDatasetURMP",
     "PitchDatasetVocadito",
     "Truncate",
     "build_pipeline",
@@ -41,10 +61,23 @@ _PITCH_REGISTRY = {
     "MIR1K": PitchDatasetMIR1K,
     "Vocadito": PitchDatasetVocadito,
     "Bach10Synth": PitchDatasetBach10Synth,
+    # EGG (laryngograph) speech corpora -- consensus f0 (committed npz) by default; PTDB/KEELE/FDA
+    # additionally offer the dataset authors' shipped reference (label_source="reference").
+    "MOCHA": PitchDatasetMOCHA,
+    "CMUArctic": PitchDatasetCMUArctic,
+    "AVID": PitchDatasetAVID,
+    "OSFGlottis": PitchDatasetOSFGlottis,
+    "SVD": PitchDatasetSVD,
+    "APLAWD": PitchDatasetAPLAWD,
+    "KEELE": PitchDatasetKEELE,
+    "FDA": PitchDatasetFDA,
+    # multi-instrument music with gold frame-level f0
+    "URMP": PitchDatasetURMP,
 }
 
 _TRANSCRIPTION_REGISTRY = {
     "Vocadito": PitchDatasetVocadito,
+    "URMP": PitchDatasetURMP,  # gold Notes_*.txt per stem, via the shared _load_notes_annotation
 }
 
 

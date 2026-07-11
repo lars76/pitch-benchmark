@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import librosa
 import pandas as pd
 import torch
 import torchaudio
@@ -101,31 +100,7 @@ class PitchDatasetVocadito(PitchDataset):
                     )
         return pairs
 
-    def _load_notes_annotation(self, csv_path: Path) -> list[dict]:
-        """Load and convert annotations to standardized format."""
-        notes = []
-        try:
-            data = pd.read_csv(csv_path, header=None).values
-            for row in data:
-                start = float(row[0])
-                pitch_hz = float(row[1])
-                duration = float(row[2])
-                end = start + duration
-
-                # Convert Hz to MIDI
-                midi_pitch = librosa.hz_to_midi(pitch_hz)
-
-                notes.append(
-                    {
-                        "start": start,
-                        "end": end,
-                        "midi_pitch": float(midi_pitch),
-                    }
-                )
-        except Exception as e:
-            print(f"Warning: Error loading {csv_path}: {e!s}")
-            return []
-        return notes
+    # note loading is inherited from PitchDataset._load_notes_annotation (shared with URMP)
 
     def __len__(self) -> int:
         """Return the total number of samples in the dataset."""

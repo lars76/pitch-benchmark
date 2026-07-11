@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -102,12 +103,13 @@ def _ood_key(m, _p):
 
 
 # Synthetic OOD families (kept in sync with ood_benchmark.py FAMILIES): two axes.
-OOD_MECHANISMS = ["missing_f0", "unresolved", "irn", "vibrato_fast"]
+OOD_MECHANISMS = ["missing_f0", "unresolved", "irn", "vibrato_fast", "glide"]
 OOD_MECH_AXIS = {
     "missing_f0": "fundamental presence (no energy at f0)",
     "unresolved": "harmonic resolvability (high harmonics only)",
     "irn": "noise-based periodicity (rippled noise)",
     "vibrato_fast": "temporal dynamics (fast FM)",
+    "glide": "temporal dynamics (monotonic octave sweep)",
 }
 OOD_RANGE_SIGNALS = ["sine", "harm", "tilt"]          # family-name prefixes of the pitch-range axis
 OOD_SIGNAL_LABEL = {
@@ -416,7 +418,7 @@ def generate_dataset_descriptions() -> str:
             "PTDB",
             "Speech",
             "Real",
-            "Speech recordings with simultaneous laryngograph (EGG). Ground truth is a cross-family consensus over the EGG signal (correlation: Praat + REAPER; period-marking: dEGG; instantaneous-frequency: Harvest), keeping frames where at least two of the three families agree within 50 cents and gating silence by mic energy. Frames where families voice but disagree on the f0 value are kept voiced (counted in F1) but excluded from pitch accuracy.",
+            "Speech recordings with simultaneous laryngograph (EGG). Ground truth is a consensus over three independent EGG estimators (Praat, dEGG, Harvest), keeping frames where at least two agree within 50 cents and gating silence by mic energy. Frames where estimators voice but disagree on the f0 value are kept voiced (counted in F1) but excluded from pitch accuracy.",
         ),
         (
             "MIR1K",
@@ -447,6 +449,60 @@ def generate_dataset_descriptions() -> str:
             "Speech",
             "Synthetic",
             "Synthetic Mandarin speech generated using LightSpeech TTS. The conditioned f0 is rendered by a neural vocoder and is faithful for smooth contours, so labels are accurate to within a few tens of cents (near-exact, not exact to the cent).",
+        ),
+        (
+            "MOCHA",
+            "Speech",
+            "Real",
+            "MOCHA-TIMIT speech with a simultaneous laryngograph (.lar) channel. Consensus f0 on the EGG (same three-estimator scheme as PTDB); no shipped author f0.",
+        ),
+        (
+            "CMUArctic",
+            "Speech",
+            "Real",
+            "CMU ARCTIC prompts recorded with simultaneous EGG (stereo speech+EGG). Consensus f0 on the EGG; no shipped author f0.",
+        ),
+        (
+            "AVID",
+            "Speech",
+            "Real",
+            "Aalto Vocal Intensity Database: calibrated stereo speech+EGG recordings at graded vocal intensities. Consensus f0 on the EGG; no shipped author f0.",
+        ),
+        (
+            "OSFGlottis",
+            "Speech",
+            "Real",
+            "OSF 'Physical Models of the Glottis' subjects reading Harvard sentences with simultaneous EGG (10 kHz). Consensus f0 on the EGG; no shipped author f0.",
+        ),
+        (
+            "SVD",
+            "Speech",
+            "Real",
+            "Saarbruecken Voice Database (healthy subset): German connected-speech phrases with simultaneous EGG. Consensus f0 on the EGG; no shipped author f0.",
+        ),
+        (
+            "APLAWD",
+            "Speech",
+            "Real",
+            "APLAWD speech with a simultaneous laryngograph (.egg) channel. Consensus f0 on the EGG; no shipped author f0.",
+        ),
+        (
+            "KEELE",
+            "Speech",
+            "Real",
+            "KEELE pitch database: speech with simultaneous EGG. Consensus f0 on the EGG by default; also ships an author reference (label_source=\"reference\").",
+        ),
+        (
+            "FDA",
+            "Speech",
+            "Real",
+            "FDA (Edinburgh) speech with simultaneous EGG. Consensus f0 on the EGG by default; also ships an author reference (label_source=\"reference\").",
+        ),
+        (
+            "URMP",
+            "Music",
+            "Real",
+            "URMP multi-instrument recordings with gold frame-level f0 and note (Notes_*.txt) annotations per stem. Music reference, no EGG.",
         ),
     ]
 
@@ -732,22 +788,40 @@ def generate_detailed_analysis(
 
 
 # Dataset groupings for the subset analysis (single source; descriptions derived from this).
+# The EGG (laryngograph) speech corpora are all Real + Speech; URMP is Real + Music. Keep these in
+# sync with datasets/__init__._PITCH_REGISTRY -- _check_group_coverage() below warns on any registered
+# dataset that appears in the results but is missing from every group here (a silent-omission guard).
+_EGG_SPEECH = ["PTDB", "MOCHA", "CMUArctic", "AVID", "OSFGlottis", "SVD", "APLAWD", "KEELE", "FDA"]
 DATASET_GROUPS = {
     "By Origin": {
         "Synthetic": ["Bach10Synth", "MDBStemSynth", "SpeechSynth", "NSynth"],
-        "Real": ["MIR1K", "PTDB", "Vocadito"],
+        "Real": ["MIR1K", "Vocadito", "URMP", *_EGG_SPEECH],
     },
     "By Domain": {
-        "Speech": ["PTDB", "SpeechSynth"],
-        "Music": ["Bach10Synth", "MDBStemSynth", "NSynth", "Vocadito", "MIR1K"],
+        "Speech": ["SpeechSynth", *_EGG_SPEECH],
+        "Music": ["Bach10Synth", "MDBStemSynth", "NSynth", "Vocadito", "MIR1K", "URMP"],
     },
     "By Cross-Dimension": {
         "Synthetic + Speech": ["SpeechSynth"],
         "Synthetic + Music": ["Bach10Synth", "MDBStemSynth", "NSynth"],
-        "Real + Speech": ["PTDB"],
-        "Real + Music": ["Vocadito", "MIR1K"],
+        "Real + Speech": _EGG_SPEECH,
+        "Real + Music": ["Vocadito", "MIR1K", "URMP"],
     },
 }
+
+
+def _check_group_coverage(aggregated_results: dict) -> None:
+    """Warn if any dataset present in the results is not covered by DATASET_GROUPS, so a newly added
+    corpus can never be silently dropped from the subset analysis (the bug this guards against)."""
+    grouped = {d for title in DATASET_GROUPS.values() for names in title.values() for d in names}
+    present = {d for algo in aggregated_results.values() for d in algo}
+    missing = sorted(present - grouped)
+    if missing:
+        print(
+            f"WARNING: datasets in results but absent from DATASET_GROUPS (omitted from subset "
+            f"analysis): {', '.join(missing)}",
+            file=sys.stderr,
+        )
 
 
 def _subcat_score(algo_results, datasets):
@@ -766,6 +840,7 @@ def generate_subset_analysis(
     if not aggregated_results:
         return ""
 
+    _check_group_coverage(aggregated_results)
     analysis = "## Performance by Dataset Subsets\n\n"
     for title, subcats in DATASET_GROUPS.items():
         analysis += f"### {title}\n"
@@ -943,6 +1018,10 @@ def generate_robustness_analysis(probe_results: list[dict]) -> tuple[str, dict[s
         "Δ-from-clean in combined-score percentage points (**lower = more robust**), measured "
         "on the robustness probe. All conditions are label-preserving (ground-truth f0 stays "
         "valid).\n\n"
+        "⚠ Δ-from-clean is **floor-effect-prone**: a tracker that already scores poorly on "
+        "clean audio has little room to drop, so a small mean Δ is only meaningful next to a "
+        "high clean score (leaderboard). Compare absolute per-condition scores before ranking "
+        "trackers by Δ.\n\n"
     )
     order = sorted(table, key=lambda a: (mean_delta[a] is None, mean_delta[a] or 0.0))
     col_vals = {c: [table[a][c] for a in order] for c in conditions}

@@ -289,9 +289,9 @@ class PitchAlgorithm(ABC):
                 pitch_contour[valid_indices] / 440.0
             )
 
-        for i, is_voiced in enumerate(valid_voiced_frames):
+        for i, voiced in enumerate(valid_voiced_frames):
             t = i * frame_period
-            if is_voiced:
+            if voiced:
                 unvoiced_frames_count = 0
                 midi_pitch = midi_contour[i]
                 if current_note_segment is None:
