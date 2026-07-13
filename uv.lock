@@ -1031,6 +1031,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "librosa", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "matplotlib", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "mir-eval", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "numpy", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "pandas", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "pyroomacoustics", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -1129,6 +1130,7 @@ requires-dist = [
     { name = "hmmlearn", marker = "extra == 'crepe'" },
     { name = "librosa" },
     { name = "matplotlib" },
+    { name = "mir-eval" },
     { name = "numpy" },
     { name = "onnxruntime", marker = "extra == 'all'" },
     { name = "onnxruntime", marker = "extra == 'basicpitch'" },

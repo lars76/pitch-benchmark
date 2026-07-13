@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import torch
@@ -56,10 +57,16 @@ class PitchDatasetMDBStemSynth(PitchDataset):
         return len(self.wav_f0_pairs)
 
     def get_group(self, idx: int) -> str:
-        """Return group identifier for sample (artist name)"""
-        file_path = self.wav_f0_pairs[idx][0]
-        # Extract artist from filename (first part before underscore)
-        return file_path.stem.split("_")[0]
+        """Return group identifier for sample = the source TRACK (Artist_Title).
+
+        Filenames are `Artist_Title_STEM_NN.RESYN.wav`, so the previous `stem.split("_")[0]` returned
+        only the first token -- collapsing every distinct `MusicDelta_*` track (Beethoven, Rock, ...)
+        into one 100-clip 'MusicDelta' group, which fabricates within-group correlation for the cluster
+        bootstrap. The leakage-safe unit is the full track: drop `.RESYN.wav` then strip the trailing
+        `_STEM_NN` stem index."""
+        name = self.wav_f0_pairs[idx][0].name
+        name = re.sub(r"\.RESYN\.wav$", "", name)
+        return re.sub(r"_STEM_\d+$", "", name)
 
     def _load_sample(self, idx: int) -> dict[str, torch.Tensor | Path]:
         """Load and process one sample from the dataset."""

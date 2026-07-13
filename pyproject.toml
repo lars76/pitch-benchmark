@@ -19,6 +19,7 @@ dependencies = [
     "matplotlib",
     "tqdm",
     "tabulate",
+    "mir_eval",   # note-track transcription scoring (COnP/COnPOff), community-standard matching
     # audio I/O + DSP (datasets, plus the pYIN and RMVPE trackers)
     "librosa",
     "soundfile",

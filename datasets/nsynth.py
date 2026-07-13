@@ -167,7 +167,10 @@ class PitchDatasetNSynth(PitchDataset):
 
     def get_group(self, idx: int) -> str:
         _, info = self.examples[idx]
-        return info["instrument_family_str"]  # Unique instrument family ID
+        # Leakage-safe unit = the individual INSTRUMENT (e.g. "keyboard_acoustic_010"), 193 of them,
+        # not the coarse family (6). Same instrument across pitches/velocities = one source; family
+        # over-groups and throws away ~97% of the clusters (needless CI inflation).
+        return info["instrument_str"]
 
     def __len__(self) -> int:
         """Returns the number of examples in the filtered dataset."""

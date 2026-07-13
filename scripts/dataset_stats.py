@@ -50,6 +50,7 @@ def measure(name, data_dir):
         return None
 
     n = len(ds)
+    n_ok = 0
     total_samples = 0
     voiced_frames = total_frames = 0
     f0_chunks = []
@@ -62,6 +63,7 @@ def measure(name, data_dir):
         except Exception as e:
             bar.write(f"  {name}[{i}]: item error ({str(e)[:50]}) -- skipping clip")
             continue
+        n_ok += 1
         audio = np.asarray(it["audio"]).reshape(-1)
         pitch = np.asarray(it["pitch"]).reshape(-1)
         voiced = is_voiced(np.asarray(it["periodicity"]).reshape(-1))
@@ -80,8 +82,10 @@ def measure(name, data_dir):
     p5, p50, p95 = np.percentile(f0, [5, 50, 95])
     nv = max(voiced_frames, 1)
     bands = {b: 100.0 * band_counts[b] / nv for b in band_counts}
+    if n_ok < n:
+        print(f"  {name}: {n - n_ok}/{n} clips failed to load; stats cover the {n_ok} loadable clips")
     return {
-        "n": n, "hours": hours, "avg_len": total_samples / SR / max(n, 1),
+        "n": n, "hours": hours, "avg_len": total_samples / SR / max(n_ok, 1),
         "voiced_pct": 100.0 * voiced_frames / max(total_frames, 1),
         "p5": p5, "p50": p50, "p95": p95, "fmin_obs": np.nanmin(f0), "fmax_obs": np.nanmax(f0),
         "window": (ds.fmin, ds.fmax), "bands": bands,

@@ -4,9 +4,26 @@ Torch-free so it imports (and tests) without torch/torchaudio. Used by the runne
 (pitch_benchmark.py) and the report (generate_report.py).
 """
 import math
+import os
 
 import numpy as np
 from scipy.ndimage import find_objects, label
+
+
+def clip_and_group(dataset, wav_path, idx):
+    """(clip_id, group) for a per-clip row -- the ONE place both runners (pitch_benchmark.py,
+    note_benchmark.py) derive them, so their cluster-bootstrap CIs share the same grouping.
+
+    group = the dataset's leakage-safe get_group (speaker / singer / piece), forwarded through the
+    Augment/Truncate/Subset wrappers; NOT basename(dirname(wav)) (a logging path that collapses many
+    speakers into one bogus cluster). Falls back to dirname/idx only if the dataset has no get_group.
+    """
+    clip_id = os.path.basename(str(wav_path)) if wav_path is not None else str(idx)
+    try:
+        group = str(dataset.get_group(idx))
+    except (AttributeError, IndexError, KeyError):
+        group = os.path.basename(os.path.dirname(str(wav_path))) if wav_path is not None else str(idx)
+    return clip_id, group
 
 # --------------------------------------------------------------------------- #
 # Voicing contract (single source of truth)
@@ -229,6 +246,24 @@ class MetricAccumulator:
     def pitch_metrics(self) -> dict:
         return self._overall.result()
 
+    def pitch_coverage(self) -> float:
+        """Fraction of ground-truth-voiced frames that entered pitch scoring (valid_frames /
+        (TP+FN)). Pitch metrics are computed only where BOTH sides are voiced, so a
+        conservative tracker scores RPA on an easier, self-selected subset; coverage is the
+        column that makes RPA comparable across algorithms (low coverage = survivor-biased RPA)."""
+        gt_voiced = self.tp + self.fn
+        return self._overall.result()["valid_frames"] / gt_voiced if gt_voiced > 0 else 0.0
+
+    def suff_stats(self) -> dict:
+        """The additive sufficient statistics behind every scalar metric (overall pitch bin + voicing
+        counts). Summing these across clips reproduces the full-dataset accumulator EXACTLY, so a
+        cluster bootstrap can resample clips, sum, and RECOMPUTE any aggregate (RPA/coverage/F1/cents/
+        combined) frame-weighted -- the honest way to CI a nonlinear aggregate like combined_score."""
+        o = self._overall
+        return {"valid": int(o.valid), "n_rpa": int(o.n_rpa), "sum_cents": float(o.sum_cents),
+                "n_octave": int(o.n_octave), "n_gross": int(o.n_gross),
+                "tp": int(self.tp), "fp": int(self.fp), "fn": int(self.fn)}
+
     def per_band(self) -> dict:
         out = {}
         for name, _, _ in self.bands:
@@ -276,6 +311,38 @@ def to_json_safe(obj):
     return str(obj)  # last-resort for exotic types (set, Path, datetime, ...) -> string
 
 
+def voicing_boundary_latency(pred_voiced, true_voiced, frame_period, min_frames=8):
+    """Onset/offset truncation of ground-truth voiced regions, in ms.
+
+    For each GT voiced region of >= min_frames, onset latency = time from the region's first
+    frame to the tracker's first voiced frame inside it (region length if never voiced);
+    offset latency symmetric. Aggregate voicing F1 is position-blind -- a tracker that
+    systematically eats the first 30 ms of every region (e.g. the low start of a rising tone)
+    can share an F1 with one that scatters its misses; this is the metric that separates them.
+    Returns (onset_ms_list, offset_ms_list), one entry per qualifying region."""
+    pred_voiced = np.asarray(pred_voiced).astype(bool)
+    true_voiced = np.asarray(true_voiced).astype(bool)
+    on, off = [], []
+    i, n = 0, min(len(pred_voiced), len(true_voiced))
+    while i < n:
+        if true_voiced[i]:
+            j = i
+            while j < n and true_voiced[j]:
+                j += 1
+            if j - i >= min_frames:
+                hit = np.where(pred_voiced[i:j])[0]
+                if len(hit) == 0:
+                    on.append((j - i) * frame_period * 1000.0)
+                    off.append((j - i) * frame_period * 1000.0)
+                else:
+                    on.append(hit[0] * frame_period * 1000.0)
+                    off.append((j - i - 1 - hit[-1]) * frame_period * 1000.0)
+            i = j
+        else:
+            i += 1
+    return on, off
+
+
 def summarize_threshold_sweep(accumulators, thresholds):
     """Pick the best-combined-score threshold and assemble the shared metrics dict.
 
@@ -300,7 +367,7 @@ def summarize_threshold_sweep(accumulators, thresholds):
     best = accumulators[best_idx]
     best_metrics = {
         "voicing_detection": best.voicing_metrics(),
-        "pitch_accuracy": best.pitch_metrics(),
+        "pitch_accuracy": {**best.pitch_metrics(), "coverage": best.pitch_coverage()},
         "per_band": best.per_band(),
         "smoothness_metrics": best.smoothness_metrics(),
         "combined_score": best_score,

@@ -19,6 +19,7 @@ from .laryngograph import (
     PitchDatasetPTDB,
     PitchDatasetSVD,
 )
+from .m4singer import PitchDatasetM4Singer
 from .mdb import PitchDatasetMDBStemSynth
 from .mir1k import PitchDatasetMIR1K
 from .nsynth import PitchDatasetNSynth
@@ -37,6 +38,7 @@ __all__ = [
     "PitchDatasetCMUArctic",
     "PitchDatasetFDA",
     "PitchDatasetKEELE",
+    "PitchDatasetM4Singer",
     "PitchDatasetMDBStemSynth",
     "PitchDatasetMIR1K",
     "PitchDatasetMOCHA",
@@ -59,6 +61,8 @@ _PITCH_REGISTRY = {
     "MDBStemSynth": PitchDatasetMDBStemSynth,
     "SpeechSynth": PitchDatasetSpeechSynth,
     "MIR1K": PitchDatasetMIR1K,
+    # M4Singer -- score-grade GT (voicing-reliable, pitch is intended-score); selection/voicing use.
+    "M4Singer": PitchDatasetM4Singer,
     "Vocadito": PitchDatasetVocadito,
     "Bach10Synth": PitchDatasetBach10Synth,
     # EGG (laryngograph) speech corpora -- consensus f0 (committed npz) by default; PTDB/KEELE/FDA

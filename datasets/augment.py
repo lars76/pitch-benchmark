@@ -331,6 +331,10 @@ class Augment(Dataset):
     def __len__(self):
         return len(self.base_dataset)
 
+    def get_group(self, idx):
+        """Delegate the leakage-safe cluster id to the wrapped dataset (1:1 index)."""
+        return self.base_dataset.get_group(idx)
+
     def __getitem__(self, idx):
         if not self.pipeline:
             return self.base_dataset[idx]
@@ -363,9 +367,17 @@ class Augment(Dataset):
         return sample
 
 
+class _Subset(Subset):
+    """torch.utils.data.Subset that also forwards get_group, REMAPPING the subset-local index back to
+    the base index (subset does not preserve indices, unlike the 1:1 Augment/Truncate wrappers)."""
+
+    def get_group(self, idx):
+        return self.dataset.get_group(self.indices[idx])
+
+
 def subset(base_dataset, indices):
-    """torch.utils.data.Subset (the cap) but forwarding the attrs the eval loop needs."""
-    sub = Subset(base_dataset, list(indices))
+    """torch.utils.data.Subset (the cap) but forwarding the attrs + get_group the eval loop needs."""
+    sub = _Subset(base_dataset, list(indices))
     _copy_eval_attrs(sub, base_dataset)
     return sub
 
@@ -382,6 +394,10 @@ class Truncate(Dataset):
 
     def __len__(self):
         return len(self.base_dataset)
+
+    def get_group(self, idx):
+        """Delegate the leakage-safe cluster id to the wrapped dataset (1:1 index)."""
+        return self.base_dataset.get_group(idx)
 
     def __getitem__(self, idx):
         sample = dict(self.base_dataset[idx])  # shallow copy: don't mutate a cached base dict

@@ -267,96 +267,96 @@ class PitchAlgorithm(ABC):
         self,
         pitch_contour: np.ndarray,
         voicing_contour: np.ndarray,
-        split_semitone_threshold: float = 0.8,
+        audio: np.ndarray | None = None,
+        lam_per_s: float = 500.0,
         min_note_duration: float = 0.05,
-        unvoiced_grace_period: float = 0.02,
+        onset_gate: float = 2.5,
+        rise_gate: float = 0.6,
     ) -> list[dict[str, float]]:
-        frame_period = self.hop_size / self.sample_rate
-        notes = []
-        current_note_segment = None
-        unvoiced_frames_count = 0
+        """Contour -> notes via an exact penalised piecewise-constant fit (L2 changepoint DP)
+        plus, when `audio` is given, two mandatory-boundary gates for same-pitch re-articulations
+        the pitch contour cannot see: spectral-flux peaks above mean + onset_gate*std, and frame-RMS
+        rises >= 1/rise_gate within two frames (legato re-bows / re-tongues / glottal resets).
 
-        valid_voiced_frames = (
-            (voicing_contour > 0)
+        Replaces the previous greedy running-median segmenter: the DP is globally optimal for its
+        objective and keeps CONTINUOUS pitch per note (midi_pitch = median of the segment, not
+        rounded), so downstream scoring against continuous-Hz references is not quantised.
+        lam_per_s is the split penalty per second of frames (scales with frame rate);
+        min_note_duration drops shorter notes. Boundary evidence is derived from `audio` on the
+        tracker's own (sample_rate, hop_size) grid; with audio=None only the DP runs.
+        """
+        frame_period = self.hop_size / self.sample_rate
+        lam = lam_per_s * frame_period
+        n = len(pitch_contour)
+        voiced = (
+            (np.asarray(voicing_contour) > 0)
+            & (pitch_contour > 0)
             & (pitch_contour >= self.fmin)
             & (pitch_contour <= self.fmax)
         )
+        midi = np.where(voiced, 69 + 12 * np.log2(np.clip(pitch_contour, 1e-6, None) / 440.0), np.nan)
 
-        midi_contour = np.full_like(pitch_contour, np.nan)
-        valid_indices = np.where(valid_voiced_frames)[0]
-        if len(valid_indices) > 0:
-            midi_contour[valid_indices] = 69 + 12 * np.log2(
-                pitch_contour[valid_indices] / 440.0
-            )
+        onsets = np.zeros(n, dtype=bool)
+        if audio is not None:
+            w = 1024
+            xp = np.pad(np.asarray(audio, dtype=np.float64).reshape(-1), (w // 2, w // 2))
+            frames = np.lib.stride_tricks.sliding_window_view(xp, w)[:: self.hop_size][:n]
+            if onset_gate is not None and len(frames) > 2:
+                lm = np.log(np.abs(np.fft.rfft(frames * np.hanning(w)[None, :], axis=1)) + 1e-8)
+                fl = np.concatenate([[0.0], np.maximum(0.0, np.diff(lm, axis=0)).sum(axis=1)])
+                loc = np.r_[False, (fl[1:-1] > fl[:-2]) & (fl[1:-1] >= fl[2:]), False]
+                onsets[: len(fl)] |= loc & (fl > fl.mean() + onset_gate * fl.std())
+            if rise_gate is not None and len(frames) > 2:
+                rms = np.sqrt((frames**2).mean(axis=1))
+                rise = np.zeros(len(rms), dtype=bool)
+                rise[2:] = rms[:-2] <= rise_gate * rms[2:]
+                rise[1:] &= ~rise[:-1]
+                onsets[: len(rms)] |= rise
 
-        for i, voiced in enumerate(valid_voiced_frames):
-            t = i * frame_period
-            if voiced:
-                unvoiced_frames_count = 0
-                midi_pitch = midi_contour[i]
-                if current_note_segment is None:
-                    current_note_segment = {
-                        "start": t,
-                        "end": t + frame_period,
-                        "samples": [midi_pitch],
-                    }
-                else:
-                    current_median = np.median(current_note_segment["samples"])
-                    pitch_deviation = abs(midi_pitch - current_median)
-                    if pitch_deviation >= split_semitone_threshold:
-                        notes.append(current_note_segment)
-                        current_note_segment = {
-                            "start": t,
-                            "end": t + frame_period,
-                            "samples": [midi_pitch],
-                        }
-                    else:
-                        current_note_segment["samples"].append(midi_pitch)
-                        current_note_segment["end"] = t + frame_period
+        def _pwc_change_points(x: np.ndarray) -> list[tuple[int, int]]:
+            m = len(x)
+            s1 = np.concatenate([[0.0], np.cumsum(x)])
+            s2 = np.concatenate([[0.0], np.cumsum(x * x)])
+            best = np.full(m + 1, np.inf)
+            best[0] = 0.0
+            back = np.zeros(m + 1, dtype=int)
+            for j in range(1, m + 1):
+                i = np.arange(0, j)
+                sse = (s2[j] - s2[i]) - (s1[j] - s1[i]) ** 2 / (j - i)
+                cand = best[i] + sse + lam
+                k = int(np.argmin(cand))
+                best[j], back[j] = cand[k], k
+            segs, j = [], m
+            while j > 0:
+                segs.append((back[j], j))
+                j = back[j]
+            return segs[::-1]
+
+        notes = []
+        i = 0
+        while i < n:
+            if voiced[i]:
+                j = i
+                while j < n and voiced[j]:
+                    j += 1
+                bounds = [i] + [t for t in range(i + 2, j - 1) if onsets[t]] + [j]
+                for a0, b0 in zip(bounds[:-1], bounds[1:]):
+                    x = midi[a0:b0]
+                    if len(x) == 0:
+                        continue
+                    for a, b in _pwc_change_points(x):
+                        if (b - a) * frame_period >= min_note_duration:
+                            notes.append(
+                                {
+                                    "start": (a0 + a) * frame_period,
+                                    "end": (a0 + b - 1) * frame_period + frame_period,
+                                    "midi_pitch": float(np.median(x[a:b])),
+                                }
+                            )
+                i = j
             else:
-                if current_note_segment is not None:
-                    unvoiced_frames_count += 1
-                    unvoiced_duration = unvoiced_frames_count * frame_period
-                    if unvoiced_duration >= unvoiced_grace_period:
-                        notes.append(current_note_segment)
-                        current_note_segment = None
-                    else:
-                        current_note_segment["end"] = t + frame_period
-
-        if current_note_segment is not None:
-            notes.append(current_note_segment)
-        if not notes:
-            return []
-
-        processed_notes = []
-        for segment in notes:
-            duration = segment["end"] - segment["start"]
-            if duration >= min_note_duration and segment["samples"]:
-                median_pitch = np.median(segment["samples"])
-                processed_notes.append(
-                    {
-                        "start": segment["start"],
-                        "end": segment["end"],
-                        "midi_pitch": round(median_pitch),
-                    }
-                )
-        if not processed_notes:
-            return []
-
-        final_notes = [processed_notes[0]]
-        epsilon = 1e-9
-        for current_note in processed_notes[1:]:
-            previous_note = final_notes[-1]
-            gap = current_note["start"] - previous_note["end"]
-            if (
-                gap <= frame_period + epsilon
-                and previous_note["midi_pitch"] == current_note["midi_pitch"]
-            ):
-                previous_note["end"] = current_note["end"]
-            else:
-                final_notes.append(current_note)
-
-        return final_notes
+                i += 1
+        return notes
 
     def extract_pitch(
         self,
@@ -429,7 +429,7 @@ class ContinuousPitchAlgorithm(PitchAlgorithm):
         for threshold in thresholds:
             voicing = (confidence >= threshold).astype(bool)
             pitch_t = np.where(voicing, pitch, 0.0)   # pred contract: pitch == 0 on unvoiced frames
-            notes = self.notes_from_pitch_contour(pitch_t, voicing) if compute_notes else None
+            notes = self.notes_from_pitch_contour(pitch_t, voicing, audio=audio) if compute_notes else None
             results.append((pitch_t, voicing, notes))
         return results
 
@@ -464,6 +464,6 @@ class ThresholdPitchAlgorithm(PitchAlgorithm):
             )
             voicing = is_voiced(aligned_periodicity)
             aligned_pitch = np.where(voicing, aligned_pitch, 0.0)   # pred contract: pitch == 0 on unvoiced
-            notes = self.notes_from_pitch_contour(aligned_pitch, voicing) if compute_notes else None
+            notes = self.notes_from_pitch_contour(aligned_pitch, voicing, audio=audio) if compute_notes else None
             results.append((aligned_pitch, voicing, notes))
         return results

@@ -13,7 +13,13 @@ import numpy as np
 from datasets.augment import (
     CONDITION_FAMILIES,  # single source of truth for condition families
 )
-from metrics import PITCH_BANDS, band_label
+from metrics import PITCH_BANDS, band_label, calculate_combined_score
+
+# Datasets whose pitch/note ground truth is SCORE-GRADE (the notated note, not the performed f0):
+# reliable for VOICING, but their RPA/cents/note scores are a GT artifact and must not enter the
+# accuracy or note-transcription leaderboards. Registered + loadable (voicing / selection), excluded
+# from the accuracy comparison in main(). See the exclusion note there for the measured M4Singer gap.
+VOICING_ONLY = frozenset({"M4Singer"})
 
 
 def _is_bad(v):
@@ -351,6 +357,7 @@ def collect_detailed_metrics(
             for metric in [
                 "rpa",
                 "rca",
+                "coverage",
                 "cents_error",
                 "rmse",
                 "octave_error_rate",
@@ -358,6 +365,13 @@ def collect_detailed_metrics(
             ]:
                 if metric in pitch and pitch[metric] is not None:
                     metrics[algo_name][f"pitch_{metric}"].append(pitch[metric])
+
+            # Voicing boundary latency (linguistics-relevant: onset truncation eats
+            # e.g. the low start of a rising tone; F1 alone is position-blind)
+            lat = results_data.get("voicing_latency", {})
+            for metric in ["onset_median_ms", "offset_median_ms", "onset_p90_ms"]:
+                if lat.get(metric) is not None:
+                    metrics[algo_name][f"latency_{metric}"].append(lat[metric])
 
             # Smoothness metrics
             smoothness = results_data.get("smoothness_metrics", {})
@@ -587,6 +601,31 @@ def generate_methodology_section() -> str:
         "every frame. Voicing quality is captured separately by P/R/F1.\n\n"
     )
 
+    methodology += "### Detailed-Table Metric Definitions\n"
+    methodology += (
+        "Beyond the HM components above, the detailed tables report:\n\n"
+        "- **Coverage**: fraction of ground-truth-voiced frames that entered pitch scoring "
+        "(pitch is scored only where both sides are voiced). RPA at low coverage is computed "
+        "on an easier, self-selected subset of frames -- always read RPA together with Coverage.\n"
+        "- **Onset / Offset latency (ms)**: for each ground-truth voiced region (>= 8 frames "
+        "= 128 ms), the time from the region's true start until the tracker's first voiced frame "
+        "inside it (offset: symmetric, from the tracker's last voiced frame to the true end); a "
+        "region the tracker never voices counts at its full length. Median and p90 are pooled over "
+        "all regions of a run. Voicing F1 is position-blind; this metric catches trackers that "
+        "systematically truncate region starts (e.g. the low onset of a pitch rise, which carries "
+        "tone identity in tonal languages).\n"
+        "- **Cents Error**: mean absolute deviation in cents on scored frames; **RMSE (Hz)**: "
+        "root-mean-square error in Hz on the same frames.\n"
+        "- **Octave / Gross Error rate**: fraction of scored frames off by ~an octave "
+        "(chroma-preserving) / by more than 200 cents.\n"
+        "- **Relative Smoothness**: coefficient of variation (std/mean) of relative pitch changes "
+        "between consecutive predicted-voiced frames -- jitter of the contour, lower is smoother.\n"
+        "- **Continuity Breaks**: fraction of ground-truth voiced segments (> 1 frame) in which the "
+        "tracker's voicing drops out at least once mid-segment -- spurious contour splits.\n"
+        "- **Pitch bands** (per-band tables): bass < 80 Hz, low 80-260, mid 260-650, "
+        "high 650-1050, vhigh > 1050 Hz, by ground-truth f0.\n\n"
+    )
+
     methodology += "### Speed Benchmark Details\n"
     methodology += "CPU timing measurements are performed on 1-second audio signals at 22.05 kHz sample rate with 256-sample hop length. "
     methodology += "The reported **CPU Time (ms)** represents the average processing time per 1-second audio segment across multiple runs. "
@@ -718,19 +757,29 @@ def generate_detailed_analysis(
     out += _metric_table(
         detailed_metrics,
         "Voicing Detection Performance",
-        "How well algorithms distinguish voiced (pitched) from unvoiced frames.",
+        "How well algorithms distinguish voiced (pitched) from unvoiced frames. Onset/Offset "
+        "latency = median ms of each ground-truth voiced region missed before the first / "
+        "after the last frame the tracker captures (position-aware: F1 alone cannot see a "
+        "tracker that systematically truncates region onsets, e.g. the low start of a rise).",
         [
             ("Precision ↑", lambda d: _avg(d, "voicing_precision"), "{:.3f}", False),
             ("Recall ↑", lambda d: _avg(d, "voicing_recall"), "{:.3f}", False),
             ("F1 ↑", lambda d: _avg(d, "voicing_f1"), "{:.3f}", False),
+            ("Onset Lat (ms) ↓", lambda d: _avg(d, "latency_onset_median_ms"), "{:.0f}", True),
+            ("Onset Lat p90 ↓", lambda d: _avg(d, "latency_onset_p90_ms"), "{:.0f}", True),
+            ("Offset Lat (ms) ↓", lambda d: _avg(d, "latency_offset_median_ms"), "{:.0f}", True),
         ],
     )
     out += _metric_table(
         detailed_metrics,
         "Pitch Accuracy Metrics",
-        "Pitch-estimation accuracy across error types.",
+        "Pitch-estimation accuracy across error types. **Coverage** = fraction of "
+        "ground-truth-voiced frames that entered pitch scoring (pitch is scored only where "
+        "both sides are voiced): RPA at low coverage is computed on an easier, self-selected "
+        "subset and is NOT directly comparable to RPA at high coverage.",
         [
             ("RPA ↑", lambda d: _avg(d, "pitch_rpa"), "{:.3f}", False),
+            ("Coverage ↑", lambda d: _avg(d, "pitch_coverage"), "{:.3f}", False),
             ("RCA ↑", lambda d: _avg(d, "pitch_rca"), "{:.3f}", False),
             ("Cents Error ↓", lambda d: _avg(d, "pitch_cents_error"), "{:.1f}", True),
             ("RMSE (Hz) ↓", lambda d: _avg(d, "pitch_rmse"), "{:.1f}", True),
@@ -1047,6 +1096,218 @@ def generate_robustness_analysis(probe_results: list[dict]) -> tuple[str, dict[s
     return analysis + md_table(headers, rows) + "\n" + family_sections, mean_delta
 
 
+
+
+def load_note_results(notes_dir: str) -> list[dict]:
+    """Load note-track result files (note_benchmark.py output; metadata.track == 'notes')."""
+    out = []
+    if not os.path.isdir(notes_dir):
+        return out
+    for fn in sorted(os.listdir(notes_dir)):
+        if fn.endswith(".json"):
+            try:
+                with open(os.path.join(notes_dir, fn)) as f:
+                    r = json.load(f)
+                if r.get("metadata", {}).get("track") == "notes":
+                    out.append(r)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"Warning: skipping {fn}: {e}")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Cluster-bootstrap CIs (the ONE bootstrap, shared by the frame + note tracks)
+# --------------------------------------------------------------------------- #
+# Always cluster by the per-clip `group` (speaker/singer/piece via get_group), never by clip --
+# correlated clips would give false precision. We pre-SUM each cluster's columns once (metrics are
+# additive), so the inner loop is O(n_boot * n_clusters), and a reducer turns the summed clusters into
+# the frame-weighted aggregate (RPA/coverage/F1/cents/combined) or a clip-mean (note COnP).
+def _group_sums(rows, cols, group_col=1):
+    """Per cluster, {name: Σcolumn, ..., '_n': #clips}. `cols` = [(name, col_index)]. A degenerate
+    single-group key falls back to per-clip clusters (matches the old _cluster_ci behaviour)."""
+    groups = {}
+    for r in rows:
+        groups.setdefault(r[group_col], []).append(r)
+    if len(groups) == 1:
+        groups = {i: [r] for i, r in enumerate(rows)}
+    out = []
+    for rs in groups.values():
+        d = {"_n": len(rs)}
+        for name, idx in cols:
+            d[name] = float(sum(float(r[idx]) for r in rs))
+        out.append(d)
+    return out
+
+
+def _cluster_bootstrap(per_group, reduce_fn, n_boot=2000, seed=0):
+    """95% CI of reduce_fn over the CLUSTERS. `per_group` = list of per-cluster summed dicts; each
+    bootstrap resamples clusters with replacement and `reduce_fn(picked_dicts) -> scalar`."""
+    n = len(per_group)
+    if n == 0:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    vals = np.empty(n_boot)
+    for b in range(n_boot):
+        pick = rng.integers(0, n, n)
+        vals[b] = reduce_fn([per_group[i] for i in pick])
+    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
+
+
+def _s(dicts, k):
+    return sum(d[k] for d in dicts)
+
+
+# Frame reducers: recompute the FRAME-weighted aggregate from summed sufficient stats (so CIs match the
+# reported pitch_accuracy.* / combined_score exactly).
+def _agg_from_sums(dicts):
+    v = _s(dicts, "valid"); tp, fp, fn = _s(dicts, "tp"), _s(dicts, "fp"), _s(dicts, "fn")
+    pm = {"rpa": _s(dicts, "n_rpa") / v if v else 0.0,
+          "cents_error": _s(dicts, "sum_cents") / v if v else 0.0,
+          "octave_error_rate": _s(dicts, "n_octave") / v if v else 0.0,
+          "gross_error_rate": _s(dicts, "n_gross") / v if v else 0.0}
+    vm = {"precision": tp / (tp + fp) if (tp + fp) else 0.0,
+          "recall": tp / (tp + fn) if (tp + fn) else 0.0}
+    vm["f1"] = 0.0 if (vm["precision"] + vm["recall"]) == 0 else \
+        2 * vm["precision"] * vm["recall"] / (vm["precision"] + vm["recall"])
+    coverage = v / (tp + fn) if (tp + fn) else 0.0
+    return pm, vm, coverage
+
+def _reduce_combined(ds):
+    pm, vm, _ = _agg_from_sums(ds)
+    return calculate_combined_score(vm, pm)
+
+FRAME_STAT_COLS = ("valid", "n_rpa", "sum_cents", "n_octave", "n_gross", "tp", "fp", "fn")
+_FRAME_REDUCERS = {
+    "combined": _reduce_combined,
+    "rpa": lambda ds: _agg_from_sums(ds)[0]["rpa"],
+    "voicing_f1": lambda ds: _agg_from_sums(ds)[1]["f1"],
+    "coverage": lambda ds: _agg_from_sums(ds)[2],
+    "cents_mae": lambda ds: _agg_from_sums(ds)[0]["cents_error"],
+}
+
+
+def _frame_ci(rows, schema, metric, n_boot=2000, seed=0):
+    """95% cluster-CI of a frame-weighted aggregate `metric`, recomputed from per-clip sufficient
+    stats. Returns (value, lo, hi): `value` is the point estimate over ALL clusters (one draw)."""
+    idx = [(c, schema.index(c)) for c in FRAME_STAT_COLS]
+    pg = _group_sums(rows, idx)
+    reduce_fn = _FRAME_REDUCERS[metric]
+    value = reduce_fn(pg)                       # over all clusters = the reported aggregate
+    lo, hi = _cluster_bootstrap(pg, reduce_fn, n_boot, seed)
+    return value, lo, hi
+
+
+def _cluster_ci(rows, col, n_boot=2000, seed=0):
+    """95% CI of the clip-weighted MEAN of per-clip column `col` (note track). Thin wrapper."""
+    pg = _group_sums(rows, [("v", col)])
+    return _cluster_bootstrap(pg, lambda ds: _s(ds, "v") / _s(ds, "_n") if _s(ds, "_n") else float("nan"),
+                              n_boot, seed)
+
+
+def _ci_cell(value, lo, hi, fmt="{:.3f}"):
+    """A 'value [lo, hi]' markdown cell (shared by the frame + note CI tables)."""
+    return f"{fmt.format(value)} [{fmt.format(lo)}, {fmt.format(hi)}]"
+
+
+_FRAME_CI_METRICS = [("Combined", "combined"), ("RPA", "rpa"), ("Voicing-F1", "voicing_f1"),
+                     ("Coverage", "coverage"), ("Cents-MAE", "cents_mae")]
+
+
+def generate_frame_accuracy_section(clean_results):
+    """Per clean dataset: each algorithm's Combined / RPA / F1 / Coverage / Cents with a 95% cluster
+    bootstrap CI (frame-weighted, recomputed from per-clip sufficient stats), clustered by speaker/
+    singer/piece. Ranked by Combined; rows whose Combined upper-CI reaches the best are bolded (tied
+    for best). Only runs on results that carry the sufficient-stat columns (fresh runs)."""
+    cells = {}   # (algo, dataset) -> per_clip block
+    for r in clean_results:
+        m, res = r.get("metadata", {}), r.get("results", {})
+        if m.get("dataset_name") in VOICING_ONLY:
+            continue
+        pc = res.get("per_clip")
+        if pc and pc.get("rows") and all(c in pc.get("schema", []) for c in FRAME_STAT_COLS):
+            cells[(m.get("algorithm_name"), m.get("dataset_name"))] = pc
+    if not cells:
+        return ""
+    out = ["## Frame Accuracy (per dataset, 95% CI)\n",
+           "95% cluster bootstrap over per-clip **sufficient statistics**, clustered by "
+           "speaker/singer/piece (`get_group`) -- frame-weighted, so the point estimates match the "
+           "leaderboard. Read **RPA with Coverage** (low coverage = RPA on an easier self-selected "
+           "subset). Rows whose **Combined** upper-CI reaches the best are **bold** (statistically "
+           "tied for best on this dataset).\n"]
+    for ds in sorted({d for _a, d in cells}):
+        algs = sorted({a for (a, d) in cells if d == ds})
+        ci = {a: {mk: _frame_ci(cells[(a, ds)]["rows"], cells[(a, ds)]["schema"], mkey)
+                  for mk, mkey in _FRAME_CI_METRICS} for a in algs}
+        ranked = sorted(algs, key=lambda a: -ci[a]["Combined"][0])
+        best = ci[ranked[0]]["Combined"][0]
+        rows_md = []
+        for a in ranked:
+            name = f"**{a}**" if ci[a]["Combined"][2] >= best else a   # upper-CI reaches best
+            cells_md = [name]
+            for mk, _mkey in _FRAME_CI_METRICS:
+                v, lo, hi = ci[a][mk]
+                cells_md.append(_ci_cell(v, lo, hi, "{:.1f}" if mk == "Cents-MAE" else "{:.3f}"))
+            rows_md.append(cells_md)
+        out.append(f"### {ds}\n")
+        out.append(md_table(["**Algorithm**"] + [f"**{mk} [95% CI]**" for mk, _ in _FRAME_CI_METRICS],
+                            rows_md) + "\n")
+    return "\n".join(out)
+
+
+def generate_note_track_section(note_results: list[dict]) -> str:
+    """Note-transcription leaderboard: per (algorithm, dataset, condition), COnP/COnPOff with
+    cluster-bootstrap CIs from per_clip rows; crashed cells shown as 0. Each contour tracker is
+    ranked at its own best (voicing threshold, split penalty) -- see note_benchmark.py."""
+    # Voicing-only corpora (score-grade note onsets/pitch) would score a spurious ~0.26 COnP here.
+    note_results = [r for r in note_results
+                    if r.get("metadata", {}).get("dataset_name") not in VOICING_ONLY]
+    if not note_results:
+        return ""
+    cells = {}
+    for r in note_results:
+        m, res = r["metadata"], r["results"]
+        key = (m["algorithm_name"], m["dataset_name"], m.get("condition", "clean"))
+        cells[key] = (0.0, 0.0, None, None) if m.get("crashed") else (
+            res.get("conp"), res.get("conpoff"), res.get("per_clip"), res)
+    datasets = sorted({k[1] for k in cells}); conds = sorted({k[2] for k in cells})
+    out = ["## Note Transcription Track\n",
+           "Contour trackers are segmented by the benchmark's own note layer (exact changepoint "
+           "DP + audio-derived boundary gates; `algorithms.base.notes_from_pitch_contour`), with "
+           "the voicing threshold and split penalty swept per algorithm. Scoring: mir_eval "
+           "COnP (onset 50 ms, pitch 50 cents) / COnPOff (+offset 20%), continuous-Hz pitch on "
+           "both sides. CIs are 95% cluster bootstrap over per-clip scores.\n"]
+    for ds in datasets:
+        for cond in conds:
+            rows_md = []
+            algs = sorted({k[0] for k in cells if k[1] == ds and k[2] == cond})
+            if not algs:
+                continue
+            ranked = sorted(algs, key=lambda a: -(cells[(a, ds, cond)][0] or 0))
+            best = cells[(ranked[0], ds, cond)][0] or 0
+            for a in ranked:
+                conp, conpoff, pc, res = cells[(a, ds, cond)]
+                if pc and pc.get("rows"):
+                    lo, hi = _cluster_ci(pc["rows"], 3)
+                    lo2, hi2 = _cluster_ci(pc["rows"], 4)
+                    tie = hi >= best
+                    name = f"**{a}**" if tie else a
+                    c1 = _ci_cell(conp, lo, hi)
+                    c2 = _ci_cell(conpoff, lo2, hi2)
+                    extra = (f"{res.get('optimal_threshold')} / {res.get('optimal_lam_per_s')}"
+                             if res else "-")
+                    oct_ = str(res.get("octave_errors_total", "-")) if res else "-"
+                    n = str(res.get("clips_evaluated", "-")) if res else "-"
+                else:
+                    name, c1 = a, (f"{conp:.3f}" if conp is not None else "CRASHED")
+                    c2, extra, oct_, n = (f"{conpoff:.3f}" if conpoff is not None else "-"), "-", "-", "-"
+                rows_md.append([name, c1, c2, oct_, n, extra])
+            out.append(f"### {ds} ({cond})\n")
+            out.append(md_table(
+                ["**Algorithm**", "**COnP [95% CI]**", "**COnPOff [95% CI]**",
+                 "**Octave errs**", "**n clips**", "**thr / lam**"], rows_md) + "\n")
+    return "\n".join(out)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate comprehensive analysis report from benchmark results",
@@ -1065,6 +1326,13 @@ def main():
         help="Output markdown file path",
     )
 
+    parser.add_argument(
+        "--notes-dir",
+        type=str,
+        default="results_notes",
+        help="Directory containing note-track JSON results (note_benchmark.py output)",
+    )
+
     args = parser.parse_args()
 
     if not os.path.exists(args.results_dir):
@@ -1075,6 +1343,19 @@ def main():
     pitch_results, speed_results, ood_results = load_all_results(args.results_dir)
     pitch_results = _dedupe_prefer_cpu(pitch_results, _pitch_key)   # one row per cell, prefer cpu
     ood_results = _dedupe_prefer_cpu(ood_results, _ood_key)         # same for OOD (no device mixing)
+    # Voicing-only corpora carry SCORE-GRADE pitch GT (the notated note, not the performed f0), so
+    # their RPA / cents / note metrics are a ground-truth artifact, not tracker skill: e.g. on M4Singer
+    # a correct tracker scores RPA ~0.59 (median err ~39c from vibrato/portamento) vs ~0.95 on real-f0
+    # MIR1K -- it would make every good tracker look broken on the accuracy + note leaderboards. They
+    # are registered (usable as loadable datasets, e.g. for voicing/selection) but EXCLUDED from the
+    # accuracy comparison here. Their voicing labels are reliable; the pitch VALUES are not.
+    dropped = sorted({r.get("metadata", {}).get("dataset_name") for r in pitch_results
+                      if r.get("metadata", {}).get("dataset_name") in VOICING_ONLY})
+    if dropped:
+        print(f"Excluding voicing-only (score-grade GT) datasets from the accuracy leaderboard: "
+              f"{', '.join(dropped)}", file=sys.stderr)
+    pitch_results = [r for r in pitch_results
+                     if r.get("metadata", {}).get("dataset_name") not in VOICING_ONLY]
 
     print(
         f"Found {len(pitch_results)} pitch benchmark results and {len(speed_results)} speed benchmark results."
@@ -1138,9 +1419,11 @@ def main():
     report += generate_dataset_descriptions()
     # main performance table carries the robustness mean-Δ column
     report += generate_combined_score_table(aggregated_pitch, robustness=robustness_score)
+    report += generate_frame_accuracy_section(clean_results)   # per-dataset CIs for the above
     report += generate_band_analysis(clean_results)
     report += robustness_section
     report += generate_ood_analysis(ood_results)
+    report += generate_note_track_section(load_note_results(args.notes_dir))
     report += generate_speed_table(aggregated_speed)
     report += generate_detailed_analysis(detailed_metrics)
     report += generate_subset_analysis(aggregated_pitch)
