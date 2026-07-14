@@ -127,27 +127,31 @@ reads whichever form is present for each.)
 - [CHiME-Home](https://archive.org/details/chime-home) - Domestic background noise ([Foster et al., WASPAA 2015](https://ieeexplore.ieee.org/document/7314880)); pass with `--chime-dir`
 - [DEMAND](https://zenodo.org/records/1227121) - Multi-environment acoustic noise ([Thiemann, Ito & Vincent, Proc. Mtgs. Acoust. 2013](https://hal.science/hal-00796707)); pass with `--demand-dir`
 
-Organize datasets in a directory structure like:
+The datasets live in a `datasets/` directory **beside** the repo — `run.sh` points at `../datasets`
+(override per dataset with `--data-dir`). Each `--dataset NAME` is fixed; the folder name is whatever
+you pass. These are the exact paths `run.sh` uses by default (edit the block at the top of `run.sh` if
+your layout differs):
 ```
-datasets/
-├── PTDB/
-├── NSynth/
-├── MDBStemSynth/
-├── MIR1K/
-├── Vocadito/
-├── Bach10Synth/
-├── MOCHA/              # raw CSTR per-speaker: <spk>_<num>.wav + .lar (--dataset MOCHA)
-├── cmu_arctic_egg/            # extracted -WAVEGG: cmu_us_<spk>_arctic/orig/*.wav (--dataset CMUArctic)
-├── avid/extracted/           # AVID/Repository 1/Spk*_*.wav stereo (--dataset AVID)
-├── osf_glottis/bids_dataset/ # BIDS sub-XX/beh/*_physio.tsv.gz (--dataset OSFGlottis)
-├── svd/healthy/              # extracted healthy.zip: <rec>/sentences/*.nsp + overview.csv (--dataset SVD)
-├── aplawd/APLAWDW/           # extracted aplawdw.zip: <...>/*.wav + *.egg (--dataset APLAWD)
-├── KEELE/KEELE/        # Bechtold jbof redistribution: <stem>/signal.wav + laryngograph.wav + pitch.npy (--dataset KEELE)
-├── FDA/                      # raw .sig/.fx/.lar (--dataset FDA)
-├── URMP/Dataset/    # multi-instrument music (--dataset URMP)
-├── chime_home/      # noise source for --degradation chime
-└── DEMAND/          # noise source for --degradation demand
+datasets/                            # a sibling of the repo (run.sh: ../datasets)
+├── KEELE/KEELE/                     # Bechtold jbof: <stem>/signal.wav + laryngograph.wav + pitch.npy (--dataset KEELE)
+├── FDA/                             # raw .sig/.fx/.lar (--dataset FDA)
+├── vocadito/                        # (--dataset Vocadito)
+├── Bach10Synth/Bach10-mf0-synth/    # (--dataset Bach10Synth)
+├── osf_glottis/                     # BIDS bids_dataset/sub-XX/... inside (--dataset OSFGlottis)
+├── avid/                            # extracted/AVID/Repository 1/Spk*_*.wav inside (--dataset AVID)
+├── MIR-1K/                          # (--dataset MIR1K)
+├── URMP/                            # multi-instrument music, Dataset/ inside (--dataset URMP)
+├── MDB-stem-synth/                  # (--dataset MDBStemSynth)
+├── "SPEECH DATA"/                   # PTDB raw; note the space (--dataset PTDB --data-dir "../datasets/SPEECH DATA")
+├── svd_zenodo/healthy/              # extracted healthy.zip: <rec>/sentences/*.nsp + overview.csv (--dataset SVD)
+├── nsynth-test/                     # NSynth held-out test split (--dataset NSynth)
+├── aplawd/APLAWDW/                  # extracted aplawdw.zip: <...>/*.wav + *.egg (--dataset APLAWD)
+├── chime_home/                      # real-noise source for --degradation chime (--chime-dir)
+├── DEMAND/                          # real-noise source for --degradation demand (--demand-dir)
+├── MOCHA/                           # optional (not in run.sh): raw CSTR <spk>_<num>.wav + .lar (--dataset MOCHA)
+└── cmu_arctic_egg/                  # optional (not in run.sh): -WAVEGG cmu_us_<spk>_arctic/orig/*.wav (--dataset CMUArctic)
 ```
+SpeechSynth needs no download — it renders at runtime from `datasets/speechsynth.pt` inside the repo.
 
 ### Usage
 
