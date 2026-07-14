@@ -52,6 +52,19 @@ def fmt_best(value, column_values, fmt="{:.3f}", lower=False, na="N/A") -> str:
     return s
 
 
+def _quarantine_corrupt(file_path) -> None:
+    """Rename a corrupt result to <name>.corrupt and warn loudly. Treating it as missing (rather than
+    crashing the whole report) keeps one truncated file from taking down an overnight run's report, and
+    the rename lets the runner regenerate the cell on its next pass."""
+    q = str(file_path) + ".corrupt"
+    try:
+        os.replace(file_path, q)
+    except OSError:
+        q = file_path
+    print(f"Warning: corrupt result JSON quarantined -> {q} (cell treated as missing; "
+          f"delete the .corrupt file and re-run to regenerate)")
+
+
 def load_all_results(results_dir: str) -> tuple[list[dict], list[dict], list[dict]]:
     """Load all JSON result files, split into (pitch, speed, ood) by benchmark_type."""
     pitch_results = []
@@ -62,7 +75,17 @@ def load_all_results(results_dir: str) -> tuple[list[dict], list[dict], list[dic
         try:
             with open(file_path) as f:
                 data = json.load(f)
-
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # A truncated result (killed mid-write before the atomic rename landed) is quarantined so
+            # the runner's exists()-based skip regenerates it, instead of skipping a broken cell forever.
+            _quarantine_corrupt(file_path)
+            continue
+        except OSError as e:
+            # A transient read failure (permission, concurrent removal, NFS) must not take down the
+            # whole report -- skip this file and keep going, as the pre-refactor except Exception did.
+            print(f"Warning: skipping {file_path}: {e}")
+            continue
+        try:
             # Route by benchmark_type FIRST: OOD cells also carry combined_score, so they must be
             # split off here or they would pollute the accuracy leaderboard.
             bt = data.get("metadata", {}).get("benchmark_type")
@@ -347,6 +370,7 @@ def collect_detailed_metrics(
     for result in pitch_results:
         try:
             algo_name = result["metadata"]["algorithm_name"]
+            dataset_name = result["metadata"].get("dataset_name")
             results_data = result["results"]
 
             # Voicing detection metrics
@@ -393,10 +417,14 @@ def collect_detailed_metrics(
                     results_data["optimal_threshold"]
                 )
 
-            # Combined score for consistency analysis
+            # Combined score for consistency analysis (Performance CV). Exclude the sparse-voiced
+            # sets: their combined score is false-positive-dominated, so folding them into a
+            # cross-dataset consistency stat would be inconsistent with the leaderboard Average,
+            # which drops them for the same reason.
             if (
                 "combined_score" in results_data
                 and results_data["combined_score"] is not None
+                and dataset_name not in SPARSE_VOICED
             ):
                 metrics[algo_name]["combined_score"].append(
                     results_data["combined_score"]
@@ -630,10 +658,12 @@ def generate_methodology_section() -> str:
         "- **Coverage**: fraction of ground-truth-voiced frames that entered pitch scoring "
         "(pitch is scored only where both sides are voiced). RPA at low coverage is computed "
         "on an easier, self-selected subset of frames -- always read RPA together with Coverage. "
-        "Coverage is numerically equal to voicing **recall** except on datasets with a per-frame "
-        "GT-pitch-confidence label (the EGG-consensus corpora), where it is recall times the "
-        "trustworthy-GT fraction; it is reported alongside RPA (not in the voicing table) because "
-        "its role here is the denominator context for RPA.\n"
+        "Coverage counts a mutually-voiced frame only where both sides also carry positive finite "
+        "pitch, so it equals voicing **recall** whenever every mutually-voiced frame does -- true for "
+        "all corpora here except the EGG-consensus sets (SVD/APLAWD/OSFGlottis/AVID), where a per-frame "
+        "GT-confidence mask drops untrustworthy-label frames and coverage = recall x (trustworthy-GT "
+        "fraction). It is reported alongside RPA (not in the voicing table) because its role here is "
+        "the denominator context for RPA.\n"
         "- **Onset / Offset latency (ms)**: for each ground-truth voiced region (>= 8 frames "
         "= 128 ms), the time from the region's true start until the tracker's first voiced frame "
         "inside it (offset: symmetric, from the tracker's last voiced frame to the true end); a "
@@ -710,7 +740,10 @@ def generate_combined_score_table(
                 if aggregated_results[algo].get(d) else None)
             for d in all_datasets
         }
-        present = [v for v in scores.values() if v is not None]
+        # The Average EXCLUDES the sparse-voiced sets: their combined score is false-positive-dominated
+        # (see note below), so folding them into the column that ranks algorithms would be inconsistent
+        # with the per-cell caveat that says not to judge them on it. They keep their own dataset columns.
+        present = [v for d, v in scores.items() if v is not None and d not in SPARSE_VOICED]
         avg = round(float(np.mean(present)), 1) if present else None
         table_data.append({"algo": algo, "scores": scores, "avg": avg})
 
@@ -739,7 +772,9 @@ def generate_combined_score_table(
 
     rows = []
     for i, r in enumerate(table_data):
-        name = f"**{r['algo']}**" if i == 0 else r["algo"]  # best overall (sorted first)
+        # Bold the top row as best overall only when the Average actually ranks it -- if every set
+        # is sparse-voiced (excluded from the Average), avg is None and there is no ranking to claim.
+        name = f"**{r['algo']}**" if i == 0 and r["avg"] is not None else r["algo"]
         cells = [name] + [_score_cell(r["algo"], d, r["scores"][d]) for d in all_datasets]
         cells.append(fmt_best(r["avg"], avgs, "{:.1f}%"))
         if robustness:
@@ -753,8 +788,9 @@ def generate_combined_score_table(
     sparse_here = [d for d in all_datasets if d in SPARSE_VOICED]
     if sparse_here:
         note += (f" ⚠ {', '.join(sparse_here)} are **sparse-voiced** (~13-21% voiced): their "
-                 f"combined score is false-positive-dominated -- judge them by RPA + voicing "
-                 f"precision (Frame Accuracy / Detailed Analysis), not this column.")
+                 f"combined score is false-positive-dominated, so they are **excluded from the "
+                 f"Average** -- judge them by RPA + voicing precision (Frame Accuracy / Detailed "
+                 f"Analysis), not this column.")
     return "## Overall Performance Rankings\n\n" + md_table(headers, rows) + note + "\n"
 
 
@@ -1217,13 +1253,18 @@ def load_note_results(notes_dir: str) -> list[dict]:
         return out
     for fn in sorted(os.listdir(notes_dir)):
         if fn.endswith(".json"):
+            path = os.path.join(notes_dir, fn)
             try:
-                with open(os.path.join(notes_dir, fn)) as f:
+                with open(path) as f:
                     r = json.load(f)
-                if r.get("metadata", {}).get("track") == "notes":
-                    out.append(r)
-            except (json.JSONDecodeError, OSError) as e:
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                _quarantine_corrupt(path)
+                continue
+            except OSError as e:
                 print(f"Warning: skipping {fn}: {e}")
+                continue
+            if r.get("metadata", {}).get("track") == "notes":
+                out.append(r)
     return out
 
 
@@ -1254,11 +1295,6 @@ def _keyed_group_sums(rows, cols, group_col=1):
             d[name] = float(sum(float(r[idx]) for r in rs))
         out[g] = d
     return out
-
-
-def _group_sums(rows, cols, group_col=1):
-    """Unkeyed view of _keyed_group_sums (order-only callers)."""
-    return list(_keyed_group_sums(rows, cols, group_col).values())
 
 
 def _boot_vals(per_group, reduce_fn, n_boot=2000, seed=0, per_group_b=None):
@@ -1339,24 +1375,6 @@ _FRAME_REDUCERS = {
 }
 
 
-def _frame_ci(rows, schema, metric, n_boot=2000, seed=0):
-    """95% cluster-CI of a frame-weighted aggregate `metric`, recomputed from per-clip sufficient
-    stats. Returns (value, lo, hi): `value` is the point estimate over ALL clusters (one draw)."""
-    idx = [(c, schema.index(c)) for c in FRAME_STAT_COLS]
-    pg = _group_sums(rows, idx)
-    reduce_fn = _FRAME_REDUCERS[metric]
-    value = reduce_fn(pg)                       # over all clusters = the reported aggregate
-    lo, hi = _cluster_bootstrap(pg, reduce_fn, n_boot, seed)
-    return value, lo, hi
-
-
-def _cluster_ci(rows, col, n_boot=2000, seed=0):
-    """95% CI of the clip-weighted MEAN of per-clip column `col` (note track). Thin wrapper."""
-    pg = _group_sums(rows, [("v", col)])
-    return _cluster_bootstrap(pg, lambda ds: _s(ds, "v") / _s(ds, "_n") if _s(ds, "_n") else float("nan"),
-                              n_boot, seed)
-
-
 def _ci_cell(value, lo, hi, fmt="{:.3f}"):
     """A 'value [lo, hi]' markdown cell (shared by the frame + note CI tables). No interval
     (single cluster, see _cluster_bootstrap) renders as '[n/a]'."""
@@ -1397,9 +1415,10 @@ def generate_frame_accuracy_section(clean_results):
            "speaker/singer/piece (`get_group`) -- frame-weighted, so the point estimates match the "
            "leaderboard. Read **RPA with Coverage** = the fraction of GT-voiced frames RPA was "
            "actually scored on (low coverage = RPA on an easier self-selected subset). Coverage "
-           "equals voicing **recall** except on the EGG-consensus corpora (SVD/APLAWD/OSFGlottis/"
-           "AVID), where a per-frame GT-confidence mask additionally drops untrustworthy-label "
-           "frames -- there coverage = recall x (trustworthy-GT fraction). **Bold** = "
+           "counts only mutually-voiced frames with positive finite pitch on both sides, so it "
+           "equals voicing **recall** for every corpus here except the EGG-consensus sets (SVD/APLAWD/"
+           "OSFGlottis/AVID), where a per-frame GT-confidence mask additionally drops untrustworthy-"
+           "label frames -- there coverage = recall x (trustworthy-GT fraction). **Bold** = "
            "statistically tied for the best **Combined**: every algorithm scores "
            "the same clips, so ties use a **paired** cluster bootstrap of the difference vs the "
            "leader (shared clip difficulty cancels; the 95% CI of the difference includes 0). "

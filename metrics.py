@@ -50,9 +50,9 @@ def cents(a, b):
 # --------------------------------------------------------------------------- #
 # Pitch bands (single source of truth)
 # --------------------------------------------------------------------------- #
-# (name, lo_hz, hi_hz): half-open [lo, hi). Boundaries match the research eval (INVESTIGATION
-# §3/§4): the high register splits at 650/1050 so the >1 kHz octave cliff is visible (hidden if
-# everything >520 Hz is one band); <80 Hz is the intrinsic STFT-resolution floor.
+# (name, lo_hz, hi_hz): half-open [lo, hi). The high register splits at 650/1050 so the >1 kHz octave
+# cliff is visible (it is hidden if everything >520 Hz is one band); <80 Hz is the intrinsic
+# STFT-resolution floor.
 PITCH_BANDS = [
     ("bass", 0.0, 80.0),
     ("low", 80.0, 260.0),

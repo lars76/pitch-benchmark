@@ -12,8 +12,8 @@ per-cell isolation keeps one abort from killing the whole run (it is recorded as
 
 Voiced families are scored by RPA (reusing the 11-threshold sweep + metrics.MetricAccumulator from the
 main runner); unvoiced controls, where the correct answer is "no pitch", are scored by false-positive
-rate. Ground truth is exact by construction, which is why the first cut is synthetic-only (see the
-plan/investigation: OOD is exactly where detector-derived labels are least trustworthy).
+rate. Ground truth is exact by construction, which is why the first cut is synthetic-only: OOD is
+exactly where detector-derived labels are least trustworthy.
 """
 import argparse
 import json

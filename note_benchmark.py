@@ -197,12 +197,15 @@ def main():
             except subprocess.TimeoutExpired:
                 kind = f"timeout (> {args.cell_timeout}s)"
             if not os.path.exists(result_path):
-                with open(result_path, "w") as f:
+                # Temp file + atomic rename, same constraint as the main result write below.
+                tmp_path = result_path + ".tmp"
+                with open(tmp_path, "w") as f:
                     json.dump({"metadata": {"track": "notes", "algorithm_name": algo_name,
                         "dataset_name": args.dataset, "condition": cond, "seed": args.seed,
                         "crashed": True, "crash_kind": kind or "no output",
                         "timestamp_utc": datetime.now(timezone.utc).isoformat()},
                         "parameters": {}, "results": {"conp": None, "conpoff": None}}, f, indent=4)
+                os.replace(tmp_path, result_path)
                 print(f"CRASHED cell written for {algo_name} ({kind or 'no output'})")
             elif kind:
                 print(f"note: {algo_name} exited abnormally ({kind}) but wrote its result")
@@ -264,8 +267,12 @@ def main():
             },
             "results": metrics,
         }
-        with open(result_path, "w") as f:
+        # Temp file + atomic rename: a kill mid-write must not leave a truncated JSON that the
+        # skip-if-done resume above then treats as finished.
+        tmp_path = result_path + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(to_json_safe(full), f, indent=4)
+        os.replace(tmp_path, result_path)
         print(f"saved {fname}: COnP={metrics.get('conp')} COnPOff={metrics.get('conpoff')}")
 
 

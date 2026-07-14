@@ -371,8 +371,12 @@ if __name__ == "__main__":
             "results": metrics,
         }
 
-        with open(result_path, "w") as f:
+        # Temp file + atomic rename: a kill mid-write must not leave a truncated JSON that the
+        # skip-if-done resume above then treats as finished.
+        tmp_path = result_path + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(to_json_safe(full_result), f, indent=4)
+        os.replace(tmp_path, result_path)
         print(f"Success: Saved result to {os.path.basename(result_path)}")
 
     print(f"\n--- Benchmark run for seed {args.seed} finished. ---")
