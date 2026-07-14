@@ -32,6 +32,10 @@ class PitchDatasetM4Singer(PitchDataset):
         use_cache (bool): cache decoded samples. Defaults to True.
     """
 
+    # Has note intervals (score MIDI), so the CAPABILITY is present -- but the note leaderboard
+    # EXCLUDES M4Singer by runner/report policy (score-grade GT, not 50ms/50c reference). Capability
+    # lives on the dataset; leaderboard inclusion is a separate policy decision (see note_benchmark).
+    provides_notes = True
     fmin = 65
     fmax = 2093
     # Native label grid for the piecewise-constant score labels; fine enough that resampling onto the

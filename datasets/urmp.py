@@ -15,6 +15,7 @@ from .base import PitchDataset
 
 
 class PitchDatasetURMP(PitchDataset):
+    provides_notes = True   # gold Notes_*.txt per stem
     fmin = 32.70    # C1: chamber ensembles include cello/bass register
     fmax = 2093.75  # C7, the benchmark's shared ceiling
 

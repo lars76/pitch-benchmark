@@ -79,12 +79,6 @@ _PITCH_REGISTRY = {
     "URMP": PitchDatasetURMP,
 }
 
-_TRANSCRIPTION_REGISTRY = {
-    "Vocadito": PitchDatasetVocadito,
-    "URMP": PitchDatasetURMP,  # gold Notes_*.txt per stem, via the shared _load_notes_annotation
-}
-
-
 def get_pitch_dataset(name: str):
     """
     Get a pitch dataset class by name from the pitch registry.
@@ -109,79 +103,27 @@ def get_pitch_dataset(name: str):
     return _PITCH_REGISTRY[name]
 
 
-def get_transcription_dataset(name: str):
+def register_dataset(name: str, dataset_class):
     """
-    Get a transcription dataset class by name from the transcription registry.
-
-    Args:
-        name (str): Dataset name (case-sensitive)
-
-    Returns:
-        Type[PitchDataset]: PitchDataset class from the registry
-
-    Raises:
-        ValueError: If dataset name is not found in the transcription registry,
-                    or if the dataset does not inherit from PitchDataset.
-
-    Example:
-        >>> dataset_cls = get_transcription_dataset("Bach10Synth")
-        >>> dataset = dataset_cls(root_dir="./data/Bach10Synth", sample_rate=22050, hop_size=256)
-        >>> midi_data = dataset.get_midi_transcription(0)
-    """
-    if name not in _TRANSCRIPTION_REGISTRY:
-        raise ValueError(
-            f"Unknown transcription dataset: {name}. Available: {list(_TRANSCRIPTION_REGISTRY.keys())}"
-        )
-    dataset_class = _TRANSCRIPTION_REGISTRY[name]
-    if not issubclass(dataset_class, PitchDataset):
-        # Defensive: the registry should already guarantee this.
-        raise TypeError(
-            f"Registered dataset '{name}' for transcription does not inherit from PitchDataset."
-        )
-    return dataset_class
-
-
-def register_dataset(name: str, dataset_class, dataset_type: str = "pitch"):
-    """
-    Register a new dataset class in the appropriate registry based on its type.
+    Register a new dataset class in the pitch registry.
 
     Args:
         name (str): Name to register the dataset under.
-        dataset_class: Dataset class to register.
-        dataset_type (str): The type of dataset to register ("pitch" or "transcription").
-                            Defaults to "pitch".
+        dataset_class: Dataset class to register (must inherit from PitchDataset).
 
     Raises:
-        TypeError: If the dataset_class does not inherit from the correct base class
-                   (PitchDataset) for the specified type.
-        ValueError: If an invalid dataset_type is provided.
+        TypeError: If dataset_class does not inherit from PitchDataset.
 
     Example:
         >>> class MyCustomPitchDataset(PitchDataset):
         ...     pass
-        >>> register_dataset("CustomPitch", MyCustomPitchDataset, "pitch")
-
-        >>> class MyCustomTranscriptionDataset(PitchDataset):
-        ...     def get_midi_transcription(self, index): return []
-        >>> register_dataset("CustomTranscription", MyCustomTranscriptionDataset, "transcription")
+        >>> register_dataset("CustomPitch", MyCustomPitchDataset)
     """
-    if dataset_type == "pitch":
-        if not issubclass(dataset_class, PitchDataset):
-            raise TypeError(
-                f"Dataset class for 'pitch' type must inherit from PitchDataset, got {dataset_class}"
-            )
-        _PITCH_REGISTRY[name] = dataset_class
-    elif dataset_type == "transcription":
-        if not issubclass(dataset_class, PitchDataset):
-            raise TypeError(
-                f"Dataset class for 'transcription' type must inherit from PitchDataset, got {dataset_class}"
-            )
-        _TRANSCRIPTION_REGISTRY[name] = dataset_class
-    else:
-        raise ValueError(
-            f"Invalid dataset_type for registration: '{dataset_type}'. "
-            "Must be 'pitch' or 'transcription'."
+    if not issubclass(dataset_class, PitchDataset):
+        raise TypeError(
+            f"Dataset class must inherit from PitchDataset, got {dataset_class}"
         )
+    _PITCH_REGISTRY[name] = dataset_class
 
 
 def list_pitch_datasets() -> list[str]:
@@ -198,15 +140,18 @@ def list_pitch_datasets() -> list[str]:
     return list(_PITCH_REGISTRY.keys())
 
 
-def list_transcription_datasets() -> list[str]:
+def list_note_datasets() -> list[str]:
     """
-    List all available transcription dataset names in the transcription registry.
+    List the pitch datasets that also carry ground-truth notes (PitchDataset.provides_notes).
+
+    Notes are a CAPABILITY of a pitch dataset, not a separate type -- so this is the one pitch
+    registry filtered by the capability flag, never a second registry to keep in sync. Whether a
+    note-capable dataset belongs on the note LEADERBOARD is a separate policy (e.g. M4Singer has
+    notes but is excluded for score-grade GT); that decision lives in the runner, not here.
 
     Returns:
-        List[str]: List of registered transcription dataset names.
-
-    Example:
-        >>> print(list_transcription_datasets())
-        ['Bach10Synth']
+        List[str]: Registered dataset names whose samples include a "notes" key.
     """
-    return list(_TRANSCRIPTION_REGISTRY.keys())
+    return [name for name, cls in _PITCH_REGISTRY.items() if getattr(cls, "provides_notes", False)]
+
+

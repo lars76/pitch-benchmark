@@ -1,6 +1,6 @@
 # Pitch Detection Benchmark
 
-A comprehensive benchmark suite evaluating pitch detection algorithms across 8 datasets covering speech, music, synthetic, and real-world audio conditions.
+A comprehensive benchmark suite evaluating pitch detection algorithms across datasets covering speech, music, synthetic, and real-world audio conditions.
 
 ## Which Algorithm Should I Use?
 
@@ -118,8 +118,8 @@ reads whichever form is present for each.)
 - [URMP](https://labsites.rochester.edu/air/projects/URMP.html) - 44 classical chamber pieces with manually corrected per-track f0 and note transcriptions ([Li et al., IEEE TMM 2019](https://ieeexplore.ieee.org/document/8411155); access via the linked form)
 
 > **Disclosure.** Several EGG-speech corpora (PTDB, MOCHA, CMU Arctic, and the wider EGG pool) plus
-> MDB-stem-synth are commonly used as *training* data for the small in-house tracker (BPO48). Their
-> leaderboard cells are therefore home data for that model and should be read as such; the
+> MDB-stem-synth are commonly used as *training* data for pitch trackers. Their leaderboard cells can
+> therefore be home data for any model trained on them and should be read with that caveat; the
 > resynthesized-music and held-out speech corpora (KEELE, FDA, ...) are the fair comparison points.
 
 **Noise sources** (only for the real-noise robustness conditions `--degradation chime|demand`):

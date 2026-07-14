@@ -20,6 +20,7 @@ class PitchDatasetVocadito(PitchDataset):
         **kwargs: Additional arguments passed to the base PitchDataset.
     """
 
+    provides_notes = True   # per-clip *_notesA1.csv (annotator 1)
     fmin = 80
     fmax = 1000
     # Constant timing correction (seconds) added to the F0 annotation timestamps: the label-offset

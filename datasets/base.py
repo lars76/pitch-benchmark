@@ -82,7 +82,7 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
                            is the certain case). voiced <=> periodicity >= 0.5 (metrics.is_voiced),
                            the single definition of "voiced" across the benchmark.
         Optional keys: "pitch_conf" (float32 [0,1]; laryngograph consensus, gates RPA, not F1),
-          "notes" (List[{start, end, midi_pitch}]; transcription datasets), an identifier
+          "notes" (List[{start, end, midi_pitch}]; datasets with provides_notes=True), an identifier
           ("wav_path" or dataset-specific).
         The three frame states (see LaryngographSpeechDataset):
           voiced, pitch known    -> pitch > 0, periodicity >= 0.5   (scored for F1 and RPA)
@@ -95,6 +95,13 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
 
     DEFAULT_FMIN = 46.875  # Default minimum frequency (G1)
     DEFAULT_FMAX = 2093.75  # Default maximum frequency (C7)
+
+    # Capability flag: True on datasets whose __getitem__ also yields a "notes" key (ground-truth
+    # note intervals). Notes are an OPTIONAL capability of a pitch dataset, not a separate dataset
+    # type -- the note track selects note datasets by this flag (via datasets.list_note_datasets) and
+    # validates it up front, so a note run against a non-notes dataset errors instead of silently
+    # scoring nothing.
+    provides_notes = False
 
     def __init__(
         self,

@@ -34,10 +34,9 @@ import numpy as np
 from tqdm import tqdm
 
 from algorithms import build_algorithm, get_algorithm
-from datasets import get_pitch_dataset
+from datasets import get_pitch_dataset, list_note_datasets
 from datasets.augment import Augment, Truncate, build_pipeline
-from metrics import clip_and_group
-from pitch_benchmark import to_json_safe
+from metrics import clip_and_group, to_json_safe
 
 LAM_GRID = [250.0, 375.0, 500.0, 750.0]
 
@@ -217,6 +216,12 @@ def main():
     base = get_pitch_dataset(args.dataset)(
         root_dir=args.data_dir, sample_rate=args.sample_rate, hop_size=args.hop_size
     )
+    if not getattr(base, "provides_notes", False):
+        # Fail loudly up front instead of silently skipping every clip (no "notes" key -> empty run).
+        raise SystemExit(
+            f"'{args.dataset}' does not provide ground-truth notes (provides_notes=False); the note "
+            f"track requires a note dataset. Note datasets: {list_note_datasets()}"
+        )
     if args.max_seconds:
         base = Truncate(base, args.max_seconds)
     indices = None
