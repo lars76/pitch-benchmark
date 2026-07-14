@@ -20,6 +20,11 @@ from metrics import PITCH_BANDS, band_label, calculate_combined_score
 # accuracy or note-transcription leaderboards. Registered + loadable (voicing / selection), excluded
 # from the accuracy comparison in main(). See the exclusion note there for the measured M4Singer gap.
 VOICING_ONLY = frozenset({"M4Singer"})
+# Sparse-voiced corpora: long clinical/lab sessions that are mostly UNVOICED (~13-21% voiced), so
+# voicing F1 / precision / the combined score are dominated by false positives over the silence and
+# are NOT comparable to the dense datasets. Their RPA (pitch accuracy on the voiced frames) + voicing
+# PRECISION are the informative axes. Flagged in-place (kept on the leaderboard, with a caveat).
+SPARSE_VOICED = frozenset({"OSFGlottis", "AVID"})
 
 
 def _is_bad(v):
@@ -480,13 +485,13 @@ def generate_dataset_descriptions() -> str:
             "AVID",
             "Speech",
             "Real",
-            "Aalto Vocal Intensity Database: calibrated stereo speech+EGG recordings at graded vocal intensities. Consensus f0 on the EGG; no shipped author f0.",
+            "Aalto Vocal Intensity Database: calibrated stereo speech+EGG recordings at graded vocal intensities. Consensus f0 on the EGG; no shipped author f0. **Sparse-voiced** (~21% voiced: long graded-intensity sessions, mostly silence) -- read RPA + voicing precision; F1/combined are false-positive-dominated and not comparable to dense sets.",
         ),
         (
             "OSFGlottis",
             "Speech",
             "Real",
-            "OSF 'Physical Models of the Glottis' subjects reading Harvard sentences with simultaneous EGG (10 kHz). Consensus f0 on the EGG; no shipped author f0.",
+            "OSF 'Physical Models of the Glottis' subjects reading Harvard sentences with simultaneous EGG (10 kHz). Consensus f0 on the EGG; no shipped author f0. **Sparse-voiced** (~19% voiced: ~28-min lab sessions, mostly silence) -- read RPA + voicing precision; F1/combined are false-positive-dominated and not comparable to dense sets.",
         ),
         (
             "SVD",
@@ -518,6 +523,12 @@ def generate_dataset_descriptions() -> str:
             "Real",
             "URMP multi-instrument recordings with gold frame-level f0 and note (Notes_*.txt) annotations per stem. Music reference, no EGG.",
         ),
+        (
+            "M4Singer",
+            "Music",
+            "Real",
+            "Mandarin solo-singing corpus (20 singers). Labels are derived from the score MIDI crossed with a phoneme forced-alignment (a frame is voiced iff its phoneme carries a score note). This makes BOTH axes weak references: (1) **pitch is score-grade** (intended notated pitch, not performed f0), so every tracker scores RPA ~0.72 / ~50-cent error regardless of quality; (2) **voicing is only half-reliable** -- the syllable's note is assigned to its onset consonant too, so ~12-20% of 'voiced' time lands on voiceless obstruents (sh, x, s, p, t, k, ...) that a correct tracker unvoices, capping achievable recall/F1 near ~85% (voicing PRECISION is meaningful -- the unvoiced rests are real silence -- but recall/F1 are biased low, and alignment jitter blurs every boundary). M4Singer is therefore **excluded from every leaderboard here** (accuracy, note, and voicing); it is retained only as a loadable corpus for upstream use.",
+        ),
     ]
 
     for dataset, domain, type_str, desc in dataset_info:
@@ -539,20 +550,32 @@ def generate_dataset_descriptions() -> str:
     descriptions += "|---|--:|--:|--:|--:|---|---|\n"
     corpus_stats = [
         ("NSynth", 3319, 3.7, 4.0, 53, "73-277-1480", "bass 8, low 39, mid 29, high 12, vhigh 12"),
-        ("PTDB", 4718, 9.6, 7.3, 25, "84-155-234", "bass 3, low 96, mid 1"),
+        ("PTDB", 4718, 9.6, 7.3, 26, "84-156-236", "bass 3, low 95, mid 2"),
         ("MIR1K", 1000, 2.2, 8.0, 70, "121-231-390", "low 63, mid 37"),
         ("MDBStemSynth", 230, 15.6, 243.6, 40, "73-209-704", "bass 11, low 50, mid 32, high 6"),
         ("Vocadito", 40, 0.2, 20.4, 66, "113-219-364", "low 69, mid 31"),
         ("Bach10Synth", 40, 0.4, 33.4, 92, "111-296-579", "low 38, mid 59, high 2"),
-        ("SpeechSynth", 219, 0.1, 1.9, 48, "125-211-272", "low 91, mid 9"),
+        ("SpeechSynth", 219, 0.1, 2.0, 47, "126-213-273", "low 90, mid 10"),
+        ("KEELE", 10, 0.1, 33.7, 54, "81-173-295", "bass 5, low 85, mid 10"),
+        ("FDA", 100, 0.1, 3.3, 42, "91-205-296", "low 80, mid 20"),
+        ("MOCHA", 3690, 4.3, 4.2, 46, "98-188-355", "low 82, mid 17"),
+        ("CMUArctic", 3377, 2.8, 3.0, 60, "93-130-195", "bass 1, low 99"),
+        ("SVD", 634, 0.3, 1.9, 73, "87-181-287", "bass 3, low 86, mid 12"),
+        ("APLAWD", 10979, 2.7, 0.9, 58, "81-134-251", "bass 4, low 91, mid 4"),
+        ("OSFGlottis", 14, 6.9, 1764.6, 20, "113-188-257", "low 96, mid 4"),
+        ("AVID", 51, 18.3, 1290.7, 21, "114-208-346", "low 76, mid 24"),
+        ("M4Singer", 20896, 29.7, 5.1, 86, "92-233-523", "bass 1, low 55, mid 43"),
+        ("URMP", 149, 4.6, 111.0, 76, "109-348-856", "bass 1, low 31, mid 54, high 12, vhigh 2"),
     ]
     for name, clips, hours, avglen, voiced, f0r, bands in corpus_stats:
         descriptions += (
             f"| **{name}** | {clips} | {hours} | {avglen} | {voiced} | {f0r} | {bands} |\n"
         )
     descriptions += (
-        "\nThe high/vhigh bands are populated almost entirely by NSynth; the speech sets "
-        "(PTDB, SpeechSynth) sit almost entirely in the low band.\n"
+        "\nThe high/vhigh bands are populated almost entirely by NSynth (and a little URMP); every "
+        "speech set sits almost entirely in the low band (80-260 Hz). Voiced fraction ranges widely "
+        "-- from ~20% on the sparse-voiced clinical EGG sessions (OSFGlottis, AVID) to ~86-92% on "
+        "sustained singing/instrument sets (M4Singer, Bach10Synth).\n"
     )
 
     descriptions += "\n**Key Characteristics:**\n"
@@ -606,7 +629,11 @@ def generate_methodology_section() -> str:
         "Beyond the HM components above, the detailed tables report:\n\n"
         "- **Coverage**: fraction of ground-truth-voiced frames that entered pitch scoring "
         "(pitch is scored only where both sides are voiced). RPA at low coverage is computed "
-        "on an easier, self-selected subset of frames -- always read RPA together with Coverage.\n"
+        "on an easier, self-selected subset of frames -- always read RPA together with Coverage. "
+        "Coverage is numerically equal to voicing **recall** except on datasets with a per-frame "
+        "GT-pitch-confidence label (the EGG-consensus corpora), where it is recall times the "
+        "trustworthy-GT fraction; it is reported alongside RPA (not in the voicing table) because "
+        "its role here is the denominator context for RPA.\n"
         "- **Onset / Offset latency (ms)**: for each ground-truth voiced region (>= 8 frames "
         "= 128 ms), the time from the region's true start until the tracker's first voiced frame "
         "inside it (offset: symmetric, from the tracker's last voiced frame to the true end); a "
@@ -626,6 +653,27 @@ def generate_methodology_section() -> str:
         "high 650-1050, vhigh > 1050 Hz, by ground-truth f0.\n\n"
     )
 
+    methodology += "### Statistical Reporting\n"
+    methodology += (
+        "This report is **descriptive**, not confirmatory. Uncertainty is quantified with 95% "
+        "**cluster bootstrap** intervals: clips are resampled by their source cluster "
+        "(speaker / singer / piece), never individually, because clips from one source are "
+        "correlated and clip-level resampling would overstate precision. Nonlinear aggregates "
+        "(F1, the harmonic-mean combined score) are **recomputed from summed per-clip sufficient "
+        "statistics inside every resample** rather than averaged, so intervals match the reported "
+        "frame-weighted values exactly. \"Tied for best\" claims (**bold**) use a **paired** "
+        "bootstrap: all algorithms score the same clips, so the resampled clusters are shared and "
+        "the CI is taken on the *difference* vs the leader -- two overlapping unpaired CIs on "
+        "shared data would say nothing. Intervals are per cell with **no multiplicity "
+        "correction** across the many cells of this report; for a confirmatory A-vs-B decision, "
+        "run a paired test on the exported per-clip sufficient statistics (`per_clip` in each "
+        "result JSON) rather than reading intervals off the tables. Cluster counts are shown "
+        "next to every CI -- an interval over very few clusters (e.g. a 2-speaker corpus) is "
+        "close to decorative. A result whose clips all come from a single cluster gets **no "
+        "interval and no tie claim** (`[n/a]`) rather than a clip-level one: clips of one source "
+        "are correlated, so resampling them would understate the real uncertainty.\n\n"
+    )
+
     methodology += "### Speed Benchmark Details\n"
     methodology += "CPU timing measurements are performed on 1-second audio signals at 22.05 kHz sample rate with 256-sample hop length. "
     methodology += "The reported **CPU Time (ms)** represents the average processing time per 1-second audio segment across multiple runs. "
@@ -642,8 +690,13 @@ def generate_methodology_section() -> str:
 def generate_combined_score_table(
     aggregated_results: dict[str, dict[str, list[float]]],
     robustness: dict[str, float] | None = None,
+    tie_sets: dict[str, set] | None = None,
 ) -> str:
-    """Generate the main performance table showing combined scores as percentages."""
+    """Generate the main performance table showing combined scores as percentages. Per-dataset
+    bolding is STATISTICAL only: bold = tied for best under the paired cluster bootstrap, the same
+    tie definition as the Frame Accuracy section (`tie_sets` comes from there). A dataset absent
+    from tie_sets cannot support the claim, so nothing is bolded for it -- there is no
+    display-best fallback."""
     if not aggregated_results:
         return "No pitch benchmark results found.\n"
 
@@ -663,7 +716,6 @@ def generate_combined_score_table(
 
     table_data.sort(key=lambda r: (r["avg"] is None, -(r["avg"] or 0)))
 
-    col_vals = {d: [r["scores"][d] for r in table_data] for d in all_datasets}
     avgs = [r["avg"] for r in table_data]
     robust_vals = (
         [round(robustness.get(r["algo"]), 1) if robustness.get(r["algo"]) is not None else None
@@ -677,10 +729,18 @@ def generate_combined_score_table(
         + ["**Average**"]
         + (["**Robust Δ ↓**"] if robustness else [])
     )
+    tie_sets = tie_sets or {}
+
+    def _score_cell(algo, d, v):
+        if v is None:
+            return "N/A"
+        s = f"{v:.1f}%"
+        return f"**{s}**" if algo in tie_sets.get(d, ()) else s
+
     rows = []
     for i, r in enumerate(table_data):
         name = f"**{r['algo']}**" if i == 0 else r["algo"]  # best overall (sorted first)
-        cells = [name] + [fmt_best(r["scores"][d], col_vals[d], "{:.1f}%") for d in all_datasets]
+        cells = [name] + [_score_cell(r["algo"], d, r["scores"][d]) for d in all_datasets]
         cells.append(fmt_best(r["avg"], avgs, "{:.1f}%"))
         if robustness:
             rv = robustness.get(r["algo"])
@@ -688,7 +748,14 @@ def generate_combined_score_table(
             cells.append(fmt_best(rv, robust_vals, "{:.1f}", lower=True))
         rows.append(cells)
 
-    return "## Overall Performance Rankings\n\n" + md_table(headers, rows) + "\n"
+    note = ("\n**Bold** per dataset = statistically tied for best (paired cluster bootstrap on "
+            "shared clips -- see Frame Accuracy).")
+    sparse_here = [d for d in all_datasets if d in SPARSE_VOICED]
+    if sparse_here:
+        note += (f" ⚠ {', '.join(sparse_here)} are **sparse-voiced** (~13-21% voiced): their "
+                 f"combined score is false-positive-dominated -- judge them by RPA + voicing "
+                 f"precision (Frame Accuracy / Detailed Analysis), not this column.")
+    return "## Overall Performance Rankings\n\n" + md_table(headers, rows) + note + "\n"
 
 
 def generate_speed_table(speed_results: dict[str, dict[str, float]]) -> str:
@@ -754,17 +821,21 @@ def generate_detailed_analysis(
         return "No detailed metrics available.\n"
 
     out = "## Detailed Performance Analysis\n\n"
+    out += (
+        "Cross-dataset averages for the metrics **not** already reported per dataset with CIs in "
+        "the Frame Accuracy section (RPA / Voicing-F1 / Coverage / Cents live there).\n\n"
+    )
     out += _metric_table(
         detailed_metrics,
         "Voicing Detection Performance",
-        "How well algorithms distinguish voiced (pitched) from unvoiced frames. Onset/Offset "
-        "latency = median ms of each ground-truth voiced region missed before the first / "
-        "after the last frame the tracker captures (position-aware: F1 alone cannot see a "
-        "tracker that systematically truncates region onsets, e.g. the low start of a rise).",
+        "How well algorithms distinguish voiced (pitched) from unvoiced frames (per-dataset F1 "
+        "with CIs: see Frame Accuracy). Onset/Offset latency = median ms of each ground-truth "
+        "voiced region missed before the first / after the last frame the tracker captures "
+        "(position-aware: F1 alone cannot see a tracker that systematically truncates region "
+        "onsets, e.g. the low start of a rise).",
         [
             ("Precision ↑", lambda d: _avg(d, "voicing_precision"), "{:.3f}", False),
             ("Recall ↑", lambda d: _avg(d, "voicing_recall"), "{:.3f}", False),
-            ("F1 ↑", lambda d: _avg(d, "voicing_f1"), "{:.3f}", False),
             ("Onset Lat (ms) ↓", lambda d: _avg(d, "latency_onset_median_ms"), "{:.0f}", True),
             ("Onset Lat p90 ↓", lambda d: _avg(d, "latency_onset_p90_ms"), "{:.0f}", True),
             ("Offset Lat (ms) ↓", lambda d: _avg(d, "latency_offset_median_ms"), "{:.0f}", True),
@@ -773,15 +844,10 @@ def generate_detailed_analysis(
     out += _metric_table(
         detailed_metrics,
         "Pitch Accuracy Metrics",
-        "Pitch-estimation accuracy across error types. **Coverage** = fraction of "
-        "ground-truth-voiced frames that entered pitch scoring (pitch is scored only where "
-        "both sides are voiced): RPA at low coverage is computed on an easier, self-selected "
-        "subset and is NOT directly comparable to RPA at high coverage.",
+        "Pitch-error types beyond the Frame Accuracy section's RPA/Cents (which are per dataset, "
+        "with CIs and Coverage alongside).",
         [
-            ("RPA ↑", lambda d: _avg(d, "pitch_rpa"), "{:.3f}", False),
-            ("Coverage ↑", lambda d: _avg(d, "pitch_coverage"), "{:.3f}", False),
             ("RCA ↑", lambda d: _avg(d, "pitch_rca"), "{:.3f}", False),
-            ("Cents Error ↓", lambda d: _avg(d, "pitch_cents_error"), "{:.1f}", True),
             ("RMSE (Hz) ↓", lambda d: _avg(d, "pitch_rmse"), "{:.1f}", True),
             ("Octave Error ↓", lambda d: _avg(d, "pitch_octave_error_rate"), "{:.3f}", True),
             ("Gross Error ↓", lambda d: _avg(d, "pitch_gross_error_rate"), "{:.3f}", True),
@@ -1024,13 +1090,34 @@ def _family_aggregate_section(member_conds, present_conds, table, heading, blurb
     return f"\n### {heading}\n\n{blurb}\n\n" + md_table(headers, rows) + "\n"
 
 
+def _paired_delta_ci(pairs, n_boot=2000):
+    """95% CI of the mean-over-datasets PAIRED combined-score delta (clean - degraded), in
+    percentage points. `pairs` = per dataset (keyed_clean, keyed_degraded) cluster sums over the
+    SAME probe clips; each bootstrap draw resamples clusters within each dataset (stratified) and
+    applies the same picks to both sides, so shared clip difficulty cancels. Datasets with < 2
+    common clusters cannot be resampled and are skipped. Returns (lo, hi, n_datasets_used)."""
+    per_ds = []
+    for k, (kc, kd) in enumerate(pairs):
+        common = sorted(set(kc) & set(kd))
+        if len(common) < 2:
+            continue
+        per_ds.append(_boot_vals([kc[g] for g in common], _FRAME_REDUCERS["combined"],
+                                 n_boot, seed=k, per_group_b=[kd[g] for g in common]))
+    if not per_ds:
+        return float("nan"), float("nan"), 0
+    vals = np.mean(per_ds, axis=0) * 100.0
+    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5)), len(per_ds)
+
+
 def generate_robustness_analysis(probe_results: list[dict]) -> tuple[str, dict[str, float]]:
-    """Δ-from-clean (combined-score percentage points) per degradation, on the probe.
+    """Δ-from-clean (combined-score percentage points) per degradation, on the probe, with a
+    paired stratified cluster-bootstrap 95% CI per cell (same probe clips clean vs degraded).
 
     Returns (markdown_section, {algorithm: mean_delta}) where mean_delta is the average drop
     across conditions (lower = more robust), surfaced as a column in the leaderboard.
     """
     scores = defaultdict(lambda: defaultdict(dict))  # {algo: {condition: {dataset: score}}}
+    keyed = defaultdict(lambda: defaultdict(dict))   # {algo: {condition: {dataset: keyed sums}}}
     for result in probe_results:
         m = result.get("metadata", {})
         algo, ds, cond = (
@@ -1041,32 +1128,44 @@ def generate_robustness_analysis(probe_results: list[dict]) -> tuple[str, dict[s
         sc = result.get("results", {}).get("combined_score")
         if algo and ds and cond and sc is not None and not np.isnan(sc):
             scores[algo][cond][ds] = sc
+            pc = result.get("results", {}).get("per_clip")
+            if pc and pc.get("rows") and all(c in pc.get("schema", []) for c in FRAME_STAT_COLS):
+                keyed[algo][cond][ds] = _frame_keyed(pc)[0]
 
     conditions = sorted({c for a in scores for c in scores[a] if c != "clean"})
     if not scores or not conditions:
         return "", {}
 
-    table, mean_delta = {}, {}
+    table, ci_table, mean_delta = {}, {}, {}
     for algo, by_cond in scores.items():
         clean = by_cond.get("clean", {})
-        table[algo] = {}
+        kclean = keyed[algo].get("clean", {})
+        table[algo], ci_table[algo] = {}, {}
         deltas = []
         for cond in conditions:
             cd = by_cond.get(cond, {})
-            paired = [clean[d] - cd[d] for d in cd if d in clean]
-            if paired:
-                delta = float(np.mean(paired)) * 100.0
+            paired_ds = [d for d in sorted(cd) if d in clean]
+            if paired_ds:
+                delta = float(np.mean([clean[d] - cd[d] for d in paired_ds])) * 100.0
                 table[algo][cond] = delta
                 deltas.append(delta)
+                kcond = keyed[algo].get(cond, {})
+                pairs = [(kclean[d], kcond[d]) for d in paired_ds
+                         if d in kclean and d in kcond]
+                lo, hi, n_used = _paired_delta_ci(pairs)
+                ci_table[algo][cond] = (lo, hi, n_used, len(paired_ds))
             else:
                 table[algo][cond] = None
+                ci_table[algo][cond] = None
         mean_delta[algo] = float(np.mean(deltas)) if deltas else None
 
     analysis = "## Robustness (By Condition)\n\n"
     analysis += (
         "Δ-from-clean in combined-score percentage points (**lower = more robust**), measured "
         "on the robustness probe. All conditions are label-preserving (ground-truth f0 stays "
-        "valid).\n\n"
+        "valid). Each Δ carries a **95% CI** from a paired cluster bootstrap (the same probe "
+        "clips are scored clean and degraded, clusters resampled within each dataset); `†` = the "
+        "CI covers only the datasets carrying per-clip stats, fewer than the point estimate.\n\n"
         "⚠ Δ-from-clean is **floor-effect-prone**: a tracker that already scores poorly on "
         "clean audio has little room to drop, so a small mean Δ is only meaningful next to a "
         "high clean score (leaderboard). Compare absolute per-condition scores before ranking "
@@ -1076,11 +1175,24 @@ def generate_robustness_analysis(probe_results: list[dict]) -> tuple[str, dict[s
     col_vals = {c: [table[a][c] for a in order] for c in conditions}
     md_vals = [mean_delta[a] for a in order]
     headers = ["**Algorithm**"] + [f"**{c}** ↓" for c in conditions] + ["**mean Δ** ↓"]
+
+    def _delta_cell(algo, cond):
+        v = table[algo][cond]
+        if v is None:
+            return "N/A"
+        valid = [x for x in col_vals[cond] if x is not None]
+        s = f"{v:.1f}"
+        ci = ci_table[algo][cond]
+        if ci and np.isfinite(ci[0]):
+            lo, hi, n_used, n_point = ci
+            s += f" [{lo:.1f}, {hi:.1f}]" + ("†" if n_used < n_point else "")
+        if valid and abs(v - min(valid)) < 1e-9:
+            s = f"**{s}**"
+        return s
+
     rows = []
     for algo in order:
-        cells = [algo] + [
-            fmt_best(table[algo][c], col_vals[c], "{:.1f}", lower=True) for c in conditions
-        ]
+        cells = [algo] + [_delta_cell(algo, c) for c in conditions]
         cells.append(fmt_best(mean_delta[algo], md_vals, "{:.1f}", lower=True))
         rows.append(cells)
 
@@ -1116,41 +1228,82 @@ def load_note_results(notes_dir: str) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# Cluster-bootstrap CIs (the ONE bootstrap, shared by the frame + note tracks)
+# Cluster-bootstrap CIs (the ONE bootstrap, shared by the frame + note + robustness tables)
 # --------------------------------------------------------------------------- #
 # Always cluster by the per-clip `group` (speaker/singer/piece via get_group), never by clip --
 # correlated clips would give false precision. We pre-SUM each cluster's columns once (metrics are
-# additive), so the inner loop is O(n_boot * n_clusters), and a reducer turns the summed clusters into
-# the frame-weighted aggregate (RPA/coverage/F1/cents/combined) or a clip-mean (note COnP).
-def _group_sums(rows, cols, group_col=1):
-    """Per cluster, {name: Σcolumn, ..., '_n': #clips}. `cols` = [(name, col_index)]. A degenerate
-    single-group key falls back to per-clip clusters (matches the old _cluster_ci behaviour)."""
+# additive), resample cluster INDICES vectorized, and a reducer turns the summed picks into the
+# frame-weighted aggregate (RPA/coverage/F1/cents/combined) or a clip-mean (note COnP). Because every
+# reducer consumes only column SUMS, evaluating it on one pre-summed dict is exactly equivalent to
+# handing it the picked dicts -- the scalar reducers stay the single, verified formula implementation.
+def _keyed_group_sums(rows, cols, group_col=1):
+    """Per cluster {name: Σcolumn, ..., '_n': #clips} KEYED by the cluster id (so two algorithms
+    scored on the same clips can be paired cluster-by-cluster). `cols` = [(name, col_index)].
+    Deliberately NO clip-level fallback for a single-group result: between-source variance is
+    inestimable from one source (clips of one source are correlated, so resampling them would
+    understate the real uncertainty). Callers render `[n/a]` and make no tie claims. Every
+    registered dataset exposes real source clusters via get_group, so this never triggers in
+    practice -- it exists for degenerate inputs (e.g. a custom dataset that is one source)."""
     groups = {}
     for r in rows:
         groups.setdefault(r[group_col], []).append(r)
-    if len(groups) == 1:
-        groups = {i: [r] for i, r in enumerate(rows)}
-    out = []
-    for rs in groups.values():
+    out = {}
+    for g, rs in groups.items():
         d = {"_n": len(rs)}
         for name, idx in cols:
             d[name] = float(sum(float(r[idx]) for r in rs))
-        out.append(d)
+        out[g] = d
     return out
 
 
-def _cluster_bootstrap(per_group, reduce_fn, n_boot=2000, seed=0):
-    """95% CI of reduce_fn over the CLUSTERS. `per_group` = list of per-cluster summed dicts; each
-    bootstrap resamples clusters with replacement and `reduce_fn(picked_dicts) -> scalar`."""
+def _group_sums(rows, cols, group_col=1):
+    """Unkeyed view of _keyed_group_sums (order-only callers)."""
+    return list(_keyed_group_sums(rows, cols, group_col).values())
+
+
+def _boot_vals(per_group, reduce_fn, n_boot=2000, seed=0, per_group_b=None):
+    """The n_boot bootstrap draws of reduce_fn over resampled clusters. If `per_group_b` is given
+    (PAIRED: the same clusters scored by a second algorithm/condition, same order), each draw picks
+    ONE set of cluster indices, applies it to BOTH sides, and returns reduce(A) - reduce(B) --
+    shared per-cluster difficulty cancels, which is the honest A-vs-B comparison on shared clips."""
     n = len(per_group)
     if n == 0:
+        return np.full(n_boot, np.nan)
+    names = sorted(per_group[0])
+    arr = np.array([[d[k] for k in names] for d in per_group], dtype=float)
+    idx = np.random.default_rng(seed).integers(0, n, (n_boot, n))
+    sums = arr[idx].sum(axis=1)                     # (n_boot, n_cols): the vectorized heavy part
+    if per_group_b is None:
+        return np.array([reduce_fn([dict(zip(names, row))]) for row in sums])
+    arr_b = np.array([[d[k] for k in names] for d in per_group_b], dtype=float)
+    sums_b = arr_b[idx].sum(axis=1)                 # SAME picks on both sides = paired
+    return np.array([reduce_fn([dict(zip(names, ra))]) - reduce_fn([dict(zip(names, rb))])
+                     for ra, rb in zip(sums, sums_b)])
+
+
+def _cluster_bootstrap(per_group, reduce_fn, n_boot=2000, seed=0, per_group_b=None):
+    """95% percentile CI of reduce_fn over the clusters (or, with per_group_b, of the PAIRED
+    difference reduce(A)-reduce(B) -- see _boot_vals). Returns (nan, nan) with < 2 clusters:
+    between-cluster variance cannot be estimated from one cluster, so no interval is produced
+    (rendered as `[n/a]`)."""
+    if len(per_group) < 2:
         return float("nan"), float("nan")
-    rng = np.random.default_rng(seed)
-    vals = np.empty(n_boot)
-    for b in range(n_boot):
-        pick = rng.integers(0, n, n)
-        vals[b] = reduce_fn([per_group[i] for i in pick])
+    vals = _boot_vals(per_group, reduce_fn, n_boot, seed, per_group_b)
+    if not np.isfinite(vals).all():
+        return float("nan"), float("nan")
     return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
+
+
+def _paired_tied(keyed_a, keyed_b, reduce_fn, n_boot=2000, seed=0):
+    """True if the paired 95% CI of reduce(A)-reduce(B) over the COMMON clusters includes 0 --
+    i.e. A and B are statistically tied on the clips both scored. A tie is a POSITIVE statistical
+    claim: with < 2 common clusters it cannot be assessed, so no tie is claimed (False)."""
+    common = sorted(set(keyed_a) & set(keyed_b))
+    if len(common) < 2:
+        return False
+    lo, hi = _cluster_bootstrap([keyed_a[g] for g in common], reduce_fn, n_boot, seed,
+                                per_group_b=[keyed_b[g] for g in common])
+    return bool(lo <= 0.0 <= hi)
 
 
 def _s(dicts, k):
@@ -1205,7 +1358,10 @@ def _cluster_ci(rows, col, n_boot=2000, seed=0):
 
 
 def _ci_cell(value, lo, hi, fmt="{:.3f}"):
-    """A 'value [lo, hi]' markdown cell (shared by the frame + note CI tables)."""
+    """A 'value [lo, hi]' markdown cell (shared by the frame + note CI tables). No interval
+    (single cluster, see _cluster_bootstrap) renders as '[n/a]'."""
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return f"{fmt.format(value)} [n/a]"
     return f"{fmt.format(value)} [{fmt.format(lo)}, {fmt.format(hi)}]"
 
 
@@ -1213,11 +1369,19 @@ _FRAME_CI_METRICS = [("Combined", "combined"), ("RPA", "rpa"), ("Voicing-F1", "v
                      ("Coverage", "coverage"), ("Cents-MAE", "cents_mae")]
 
 
+def _frame_keyed(pc):
+    """Keyed cluster sums (+ #clips) for one per_clip block's suff-stat columns."""
+    idx = [(c, pc["schema"].index(c)) for c in FRAME_STAT_COLS]
+    return _keyed_group_sums(pc["rows"], idx), len(pc["rows"])
+
+
 def generate_frame_accuracy_section(clean_results):
     """Per clean dataset: each algorithm's Combined / RPA / F1 / Coverage / Cents with a 95% cluster
     bootstrap CI (frame-weighted, recomputed from per-clip sufficient stats), clustered by speaker/
-    singer/piece. Ranked by Combined; rows whose Combined upper-CI reaches the best are bolded (tied
-    for best). Only runs on results that carry the sufficient-stat columns (fresh runs)."""
+    singer/piece. Ranked by Combined. Returns (markdown, tie_sets): tie_sets[dataset] = the set of
+    algorithms statistically tied for best Combined under a PAIRED cluster bootstrap vs the leader
+    (all algorithms score the same clips, so the paired difference is the honest comparison -- CI
+    overlap on shared clips is not). Only runs on results that carry the suff-stat columns."""
     cells = {}   # (algo, dataset) -> per_clip block
     for r in clean_results:
         m, res = r.get("metadata", {}), r.get("results", {})
@@ -1227,31 +1391,56 @@ def generate_frame_accuracy_section(clean_results):
         if pc and pc.get("rows") and all(c in pc.get("schema", []) for c in FRAME_STAT_COLS):
             cells[(m.get("algorithm_name"), m.get("dataset_name"))] = pc
     if not cells:
-        return ""
+        return "", {}
     out = ["## Frame Accuracy (per dataset, 95% CI)\n",
            "95% cluster bootstrap over per-clip **sufficient statistics**, clustered by "
            "speaker/singer/piece (`get_group`) -- frame-weighted, so the point estimates match the "
-           "leaderboard. Read **RPA with Coverage** (low coverage = RPA on an easier self-selected "
-           "subset). Rows whose **Combined** upper-CI reaches the best are **bold** (statistically "
-           "tied for best on this dataset).\n"]
+           "leaderboard. Read **RPA with Coverage** = the fraction of GT-voiced frames RPA was "
+           "actually scored on (low coverage = RPA on an easier self-selected subset). Coverage "
+           "equals voicing **recall** except on the EGG-consensus corpora (SVD/APLAWD/OSFGlottis/"
+           "AVID), where a per-frame GT-confidence mask additionally drops untrustworthy-label "
+           "frames -- there coverage = recall x (trustworthy-GT fraction). **Bold** = "
+           "statistically tied for the best **Combined**: every algorithm scores "
+           "the same clips, so ties use a **paired** cluster bootstrap of the difference vs the "
+           "leader (shared clip difficulty cancels; the 95% CI of the difference includes 0). "
+           "**Clips/Groups** shows the number of independent clusters behind each CI -- an interval "
+           "over few groups (e.g. 2 speakers) is close to decorative.\n"]
+    tie_sets = {}
     for ds in sorted({d for _a, d in cells}):
         algs = sorted({a for (a, d) in cells if d == ds})
-        ci = {a: {mk: _frame_ci(cells[(a, ds)]["rows"], cells[(a, ds)]["schema"], mkey)
-                  for mk, mkey in _FRAME_CI_METRICS} for a in algs}
+        keyed = {a: _frame_keyed(cells[(a, ds)]) for a in algs}          # a -> (keyed sums, n_clips)
+        ci = {}
+        for a in algs:
+            pg = list(keyed[a][0].values())
+            ci[a] = {mk: (_FRAME_REDUCERS[mkey](pg),                     # point = all clusters
+                          *_cluster_bootstrap(pg, _FRAME_REDUCERS[mkey]))
+                     for mk, mkey in _FRAME_CI_METRICS}
         ranked = sorted(algs, key=lambda a: -ci[a]["Combined"][0])
-        best = ci[ranked[0]]["Combined"][0]
+        leader = ranked[0]
+        if len(keyed[leader][0]) >= 2:
+            ties = {leader} | {a for a in ranked[1:]
+                               if _paired_tied(keyed[leader][0], keyed[a][0],
+                                               _FRAME_REDUCERS["combined"])}
+            tie_sets[ds] = ties
+        else:                                    # single-cluster leader: ties are unassessable
+            ties = set()
         rows_md = []
         for a in ranked:
-            name = f"**{a}**" if ci[a]["Combined"][2] >= best else a   # upper-CI reaches best
+            name = f"**{a}**" if a in ties else a
             cells_md = [name]
             for mk, _mkey in _FRAME_CI_METRICS:
                 v, lo, hi = ci[a][mk]
                 cells_md.append(_ci_cell(v, lo, hi, "{:.1f}" if mk == "Cents-MAE" else "{:.3f}"))
+            kd, n_clips = keyed[a]
+            cells_md.append(f"{n_clips}/{len(kd)}")
             rows_md.append(cells_md)
-        out.append(f"### {ds}\n")
-        out.append(md_table(["**Algorithm**"] + [f"**{mk} [95% CI]**" for mk, _ in _FRAME_CI_METRICS],
-                            rows_md) + "\n")
-    return "\n".join(out)
+        sparse = ("  _Sparse-voiced (~13-21% voiced, mostly-unvoiced sessions): read **RPA** here "
+                  "and **Voicing Precision** in the Detailed Analysis table; F1/Combined are "
+                  "FP-dominated and not comparable to the dense sets._" if ds in SPARSE_VOICED else "")
+        out.append(f"### {ds}{sparse}\n")
+        out.append(md_table(["**Algorithm**"] + [f"**{mk} [95% CI]**" for mk, _ in _FRAME_CI_METRICS]
+                            + ["**Clips/Groups**"], rows_md) + "\n")
+    return "\n".join(out), tie_sets
 
 
 def generate_note_track_section(note_results: list[dict]) -> str:
@@ -1275,28 +1464,44 @@ def generate_note_track_section(note_results: list[dict]) -> str:
            "DP + audio-derived boundary gates; `algorithms.base.notes_from_pitch_contour`), with "
            "the voicing threshold and split penalty swept per algorithm. Scoring: mir_eval "
            "COnP (onset 50 ms, pitch 50 cents) / COnPOff (+offset 20%), continuous-Hz pitch on "
-           "both sides. CIs are 95% cluster bootstrap over per-clip scores.\n"]
+           "both sides. CIs are 95% cluster bootstrap over per-clip scores, clustered by "
+           "singer/piece. **Bold** = statistically tied for best COnP (paired cluster bootstrap "
+           "vs the leader on shared clips; the difference CI includes 0). **Clips/Groups** = "
+           "independent clusters behind the CI.\n"]
+
+    def _note_keyed(pc):
+        s = pc["schema"]
+        return _keyed_group_sums(pc["rows"], [("conp", s.index("conp")),
+                                              ("conpoff", s.index("conpoff"))])
+
+    def _clip_mean(col):
+        return lambda ds_: (_s(ds_, col) / _s(ds_, "_n")) if _s(ds_, "_n") else float("nan")
+
     for ds in datasets:
         for cond in conds:
-            rows_md = []
             algs = sorted({k[0] for k in cells if k[1] == ds and k[2] == cond})
             if not algs:
                 continue
             ranked = sorted(algs, key=lambda a: -(cells[(a, ds, cond)][0] or 0))
-            best = cells[(ranked[0], ds, cond)][0] or 0
+            keyed = {a: _note_keyed(pc) for a in ranked
+                     if (pc := cells[(a, ds, cond)][2]) and pc.get("rows")}
+            leader = next((a for a in ranked if a in keyed), None)
+            ties = ({leader} | {a for a in keyed if a != leader
+                                and _paired_tied(keyed[leader], keyed[a], _clip_mean("conp"))}
+                    if leader and len(keyed[leader]) >= 2 else set())
+            rows_md = []
             for a in ranked:
                 conp, conpoff, pc, res = cells[(a, ds, cond)]
-                if pc and pc.get("rows"):
-                    lo, hi = _cluster_ci(pc["rows"], 3)
-                    lo2, hi2 = _cluster_ci(pc["rows"], 4)
-                    tie = hi >= best
-                    name = f"**{a}**" if tie else a
-                    c1 = _ci_cell(conp, lo, hi)
-                    c2 = _ci_cell(conpoff, lo2, hi2)
+                if a in keyed:
+                    kd = keyed[a]
+                    pg = list(kd.values())
+                    c1 = _ci_cell(conp, *_cluster_bootstrap(pg, _clip_mean("conp")))
+                    c2 = _ci_cell(conpoff, *_cluster_bootstrap(pg, _clip_mean("conpoff")))
+                    name = f"**{a}**" if a in ties else a
                     extra = (f"{res.get('optimal_threshold')} / {res.get('optimal_lam_per_s')}"
                              if res else "-")
                     oct_ = str(res.get("octave_errors_total", "-")) if res else "-"
-                    n = str(res.get("clips_evaluated", "-")) if res else "-"
+                    n = f"{len(pc['rows'])}/{len(kd)}"
                 else:
                     name, c1 = a, (f"{conp:.3f}" if conp is not None else "CRASHED")
                     c2, extra, oct_, n = (f"{conpoff:.3f}" if conpoff is not None else "-"), "-", "-", "-"
@@ -1304,7 +1509,7 @@ def generate_note_track_section(note_results: list[dict]) -> str:
             out.append(f"### {ds} ({cond})\n")
             out.append(md_table(
                 ["**Algorithm**", "**COnP [95% CI]**", "**COnPOff [95% CI]**",
-                 "**Octave errs**", "**n clips**", "**thr / lam**"], rows_md) + "\n")
+                 "**Octave errs**", "**Clips/Groups**", "**thr / lam**"], rows_md) + "\n")
     return "\n".join(out)
 
 
@@ -1417,9 +1622,12 @@ def main():
     report += report_note  # surfaces the "probe-only / empty" gotchas in the report itself
     report += generate_methodology_section()
     report += generate_dataset_descriptions()
-    # main performance table carries the robustness mean-Δ column
-    report += generate_combined_score_table(aggregated_pitch, robustness=robustness_score)
-    report += generate_frame_accuracy_section(clean_results)   # per-dataset CIs for the above
+    # Frame-accuracy CIs first (its paired-bootstrap tie sets drive the rankings-table bolding),
+    # rendered after the rankings so the report reads headline -> uncertainty.
+    frame_section, frame_ties = generate_frame_accuracy_section(clean_results)
+    report += generate_combined_score_table(aggregated_pitch, robustness=robustness_score,
+                                            tie_sets=frame_ties)
+    report += frame_section                                    # per-dataset CIs for the above
     report += generate_band_analysis(clean_results)
     report += robustness_section
     report += generate_ood_analysis(ood_results)

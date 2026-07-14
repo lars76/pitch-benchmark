@@ -38,6 +38,18 @@ DATASETS = [
     ("Vocadito", "Music", "../datasets/vocadito"),
     ("Bach10Synth", "Music", "../datasets/Bach10Synth/Bach10-mf0-synth"),
     ("SpeechSynth", "Speech", "datasets/speechsynth.pt"),
+    # EGG (laryngograph) speech corpora + KEELE/FDA/MOCHA/CMUArctic (consensus f0)
+    ("KEELE", "Speech", "../datasets/KEELE/KEELE"),
+    ("FDA", "Speech", "../datasets/FDA"),
+    ("MOCHA", "Speech", "../datasets/MOCHA"),
+    ("CMUArctic", "Speech", "../datasets/cmu_arctic_egg"),
+    ("SVD", "Speech", "../datasets/svd_zenodo/healthy"),
+    ("APLAWD", "Speech", "../datasets/aplawd/APLAWDW"),
+    ("OSFGlottis", "Speech", "../datasets/osf_glottis"),
+    ("AVID", "Speech", "../datasets/avid"),
+    # singing (M4Singer = voicing-only: score-grade pitch GT) + multi-instrument
+    ("M4Singer", "Music", "../datasets/m4singer"),
+    ("URMP", "Music", "../datasets/URMP"),
 ]
 
 

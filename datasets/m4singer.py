@@ -18,10 +18,14 @@ class PitchDatasetM4Singer(PitchDataset):
     per phoneme; 0 = rest). We build piecewise-constant per-frame labels by walking `ph_dur`: a frame
     is VOICED where its phoneme's `notes > 0`, with pitch = midi_to_hz(note).
 
-    LABEL QUALITY (HANDOFF §14am): the pitch is the *intended score* note (phoneme-aligned onsets,
-    not performed f0), so it is SCORE-GRADE -- reliable for VOICING (voiced/unvoiced) but not a
-    50 c/50 ms pitch benchmark. Intended use is voicing (branch selection) + relaxed sanity checks;
-    do not treat its f0 as a strict reference. Not part of the held-out accuracy leaderboard.
+    LABEL QUALITY: BOTH axes are weak references, because the label is the score MIDI mapped through
+    the phoneme forced-alignment. (1) Pitch is the *intended score* note (not performed f0) -> SCORE-
+    GRADE, not a 50c/50ms pitch benchmark. (2) Voicing is only HALF-reliable: the syllable's note is
+    assigned to its onset consonant phoneme too, so ~12-20% of `notes>0` time falls on voiceless
+    obstruents (sh/x/s/p/t/k/...) that a correct tracker unvoices -> voicing RECALL/F1 are biased low
+    (achievable recall capped ~85%), and forced-alignment jitter blurs every boundary. Only voicing
+    PRECISION is clean (the `<SP>`/`<AP>` rests are real silence). Not on any leaderboard; if used for
+    voicing at all, use precision, not F1/recall, and expect a systematic recall floor.
 
     Args:
         root_dir (str): the m4singer root (holds `meta.json` + one dir per `singer#song`).
