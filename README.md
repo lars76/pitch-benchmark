@@ -160,13 +160,19 @@ SpeechSynth needs no download — it renders at runtime from `datasets/speechsyn
 python visualize_algorithms.py your_audio.wav --selected_algorithms SwiftF0 CREPE Praat
 ```
 
-**2. Run the whole benchmark** (clean leaderboard + robustness probe + speed + report)
+**2. Run the whole benchmark** (clean leaderboard + robustness probe + note transcription + speed + OOD + report)
 
 Edit the dataset paths at the top of `run.sh`, then:
 ```bash
 ./run.sh
 ```
-It is resumable: finished results are skipped, so re-running after adding an algorithm is cheap.
+It is resumable: finished results are skipped, so re-running after adding an algorithm is cheap. Cells run
+in parallel over a bounded worker pool; tune via env vars:
+```bash
+DEVICE=mps ./run.sh                  # cpu (default, the reproducible reference) | mps | cuda for neural trackers
+WORKERS=10 THREADS=1 ./run.sh        # pool width x intra-op threads per cell (default: physical cores x 1)
+SKIP_DATASETS="AVID" ./run.sh        # space-separated datasets to drop
+```
 
 **3. Individual runs**
 
@@ -181,12 +187,17 @@ uv run python pitch_benchmark.py --dataset Vocadito --data-dir datasets/vocadito
 ```
 Degradations: `clean, white, pink, chime, demand, telephone, reverb, room` (`chime` needs `--chime-dir`, `demand` needs `--demand-dir`).
 
-**4. Speed benchmark**
+**4. Note-transcription track** (segments the pitch contour into notes; scored with COnP/COnPOff on the datasets that carry note ground truth — Vocadito, URMP):
+```bash
+uv run python note_benchmark.py --dataset Vocadito --data-dir datasets/vocadito
+```
+
+**5. Speed benchmark**
 ```bash
 uv run python speed_benchmark.py
 ```
 
-**5. Generate the report**
+**6. Generate the report** (frame + note + speed + OOD all read from one `results/` dir):
 ```bash
 uv run python generate_report.py --results-dir results/ --output benchmark_report.md
 ```
