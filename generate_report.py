@@ -86,6 +86,10 @@ def load_all_results(results_dir: str) -> tuple[list[dict], list[dict], list[dic
             print(f"Warning: skipping {file_path}: {e}")
             continue
         try:
+            # Note-track cells (note_benchmark.py, metadata.track=="notes") now share this dir; they carry
+            # conp/conpoff, not combined_score -> skip here (loaded separately by load_note_results()).
+            if data.get("metadata", {}).get("track") == "notes":
+                continue
             # Route by benchmark_type FIRST: OOD cells also carry combined_score, so they must be
             # split off here or they would pollute the accuracy leaderboard.
             bt = data.get("metadata", {}).get("benchmark_type")
@@ -1550,13 +1554,6 @@ def main():
         help="Output markdown file path",
     )
 
-    parser.add_argument(
-        "--notes-dir",
-        type=str,
-        default="results_notes",
-        help="Directory containing note-track JSON results (note_benchmark.py output)",
-    )
-
     args = parser.parse_args()
 
     if not os.path.exists(args.results_dir):
@@ -1650,7 +1647,7 @@ def main():
     report += generate_band_analysis(clean_results)
     report += robustness_section
     report += generate_ood_analysis(ood_results)
-    report += generate_note_track_section(load_note_results(args.notes_dir))
+    report += generate_note_track_section(load_note_results(args.results_dir))
     report += generate_speed_table(aggregated_speed)
     report += generate_detailed_analysis(detailed_metrics)
     report += generate_subset_analysis(aggregated_pitch)

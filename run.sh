@@ -3,90 +3,114 @@
 # all algorithms across BOTH tracks -- frame (clean leaderboard + robustness probe) AND note
 # transcription -- plus speed and OOD. Run this to get all the numbers.
 #
-# Resumable: finished result JSONs are skipped, so re-running (e.g. after adding an algorithm) is cheap.
-# Needs every backend installed: `uv sync --all-extras` (a partial install benchmarks only the
-# algorithms whose extras are present). Continues past a failing dataset/algorithm, logging a warning,
-# so one bad cell never aborts an unattended run.
+# PARALLEL: every (dataset, algorithm[, condition]) cell is an INDEPENDENT pitch_benchmark/note_benchmark
+# invocation writing its own result JSON, so they fan out over a bounded worker pool (xargs -P). This only
+# changes SCHEDULING, not output -- results are byte-identical to a serial run. Each cell is pinned to
+# $THREADS intra-op threads so $WORKERS x $THREADS never oversubscribes the cores (measured: the heaviest
+# algo, CREPE, does not scale past 1 cpu thread, so THREADS=1 + WORKERS~=physical-cores is the knee and
+# cannot run slower than serial). Resumable: finished result JSONs are skipped, so re-running (after adding
+# an algorithm, or resuming an interrupted run) is cheap. Continues past a failing cell (logs a warning),
+# so one bad dataset/algorithm never aborts an unattended run.
+#
+# Knobs (env): WORKERS (default = physical cores), THREADS (1), DEVICE (cpu; mps/cuda for GPU trackers),
+# SKIP_DATASETS (space list, e.g. "AVID" to drop the 33-min sparse-voiced long pole).
+#   uv sync --all-extras   # a partial install benchmarks only the algorithms whose extras are present
 set -uo pipefail
 cd "$(dirname "$0")"
 
-# --- paths (edit these to your machine) -------------------------------------
 PYTHON="uv run python"
 CHIME_DIR="../datasets/chime_home"
 DEMAND_DIR="../datasets/DEMAND"
-OUTPUT_DIR="results"
-NOTES_DIR="results_notes"
-# Pin the device so leaderboard numbers are reproducible (the runner defaults to auto interactively).
-# cpu is the portable reference; DEVICE=cuda ./run.sh on a CUDA box; DEVICE=mps ./run.sh = faster
-# Apple-GPU overview (neural-tracker numbers become mps-specific, so not the cpu reference board).
+OUTPUT_DIR="results"   # frame, note (notes_*), and speed (speed_*) cells all land here, keyed by metadata
 DEVICE="${DEVICE:-cpu}"
 
-# Frame datasets, "name|data-dir" (pipe-separated so paths may contain spaces). Ordered small->large so
-# the report fills in early; the giants (PTDB/NSynth/SVD/APLAWD) are the long pole. Covers the full
-# held-out gate set + the two training-domain sets (PTDB, MDBStemSynth) kept as disclosed "home data".
-# M4Singer is intentionally excluded from every leaderboard (score-grade GT; see datasets/m4singer.py).
+# --- one cell (self-reentrant: the pool invokes `bash run.sh __cell "<spec>"`) --------------------------
+# spec = kind|dataset|datadir|degradation|algo   (kind: clean | robust | note)
+if [ "${1:-}" = "__cell" ]; then
+  IFS='|' read -r kind ds dir deg algo <<< "$2"
+  export OMP_NUM_THREADS="${THREADS:-1}" MKL_NUM_THREADS="${THREADS:-1}" OPENBLAS_NUM_THREADS="${THREADS:-1}" \
+         VECLIB_MAXIMUM_THREADS="${THREADS:-1}" NUMEXPR_NUM_THREADS="${THREADS:-1}"
+  case "$kind" in
+    clean)  $PYTHON pitch_benchmark.py --dataset "$ds" --data-dir "$dir" --algorithms "$algo" \
+              --degradation clean --device "$DEVICE" --output-dir "$OUTPUT_DIR" \
+              || echo "[run.sh] WARN: clean $ds/$algo failed (continuing)" ;;
+    robust) $PYTHON pitch_benchmark.py --dataset "$ds" --data-dir "$dir" --algorithms "$algo" \
+              --degradation "$deg" --chime-dir "$CHIME_DIR" --demand-dir "$DEMAND_DIR" \
+              --max-samples "${MAX_SAMPLES:-30}" --max-seconds "${MAX_SECONDS:-10}" \
+              --device "$DEVICE" --output-dir "$OUTPUT_DIR" \
+              || echo "[run.sh] WARN: robust $deg $ds/$algo failed (continuing)" ;;
+    note)   $PYTHON note_benchmark.py --dataset "$ds" --data-dir "$dir" --algorithms "$algo" \
+              --device "$DEVICE" --output-dir "$OUTPUT_DIR" --no-isolate \
+              || echo "[run.sh] WARN: notes $ds/$algo failed (continuing)" ;;
+  esac
+  exit 0
+fi
+
+# --- config -------------------------------------------------------------------------------------------
+WORKERS="${WORKERS:-$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
+export THREADS="${THREADS:-1}"
+export MAX_SAMPLES="${MAX_SAMPLES:-30}"
+export MAX_SECONDS="${MAX_SECONDS:-10}"
+SKIP_DATASETS="${SKIP_DATASETS:-}"
+# Frame datasets ORDERED LONGEST-AUDIO FIRST so the wall-clock long poles (a slow algo on a long-clip set)
+# start immediately and the pool drains evenly; "name|data-dir" (pipe = paths may contain spaces).
+# M4Singer intentionally excluded from every leaderboard (score-grade GT; see datasets/m4singer.py).
 FRAME_DATASETS=(
-  "KEELE|../datasets/KEELE/KEELE"
-  "FDA|../datasets/FDA"
-  "Vocadito|../datasets/vocadito"
-  "Bach10Synth|../datasets/Bach10Synth/Bach10-mf0-synth"
-  "SpeechSynth|datasets/speechsynth.pt"
-  "OSFGlottis|../datasets/osf_glottis"
   "AVID|../datasets/avid"
-  "MIR1K|../datasets/MIR-1K"
-  "URMP|../datasets/URMP"
-  "MDBStemSynth|../datasets/MDB-stem-synth"
   "PTDB|../datasets/SPEECH DATA"
+  "MDBStemSynth|../datasets/MDB-stem-synth"
+  "OSFGlottis|../datasets/osf_glottis"
+  "MIR1K|../datasets/MIR-1K"
   "SVD|../datasets/svd_zenodo/healthy"
+  "URMP|../datasets/URMP"
   "NSynth|../datasets/nsynth-test"
   "APLAWD|../datasets/aplawd/APLAWDW"
+  "SpeechSynth|datasets/speechsynth.pt"
+  "Bach10Synth|../datasets/Bach10Synth/Bach10-mf0-synth"
+  "Vocadito|../datasets/vocadito"
+  "FDA|../datasets/FDA"
+  "KEELE|../datasets/KEELE/KEELE"
 )
-# Note-track datasets (== datasets.list_note_datasets() minus M4Singer, which policy excludes).
 NOTE_DATASETS=(
   "Vocadito|../datasets/vocadito"
   "URMP|../datasets/URMP"
 )
-
-# Robustness probe: small capped + truncated sample, run across each degradation.
-MAX_SAMPLES=30
-MAX_SECONDS=10
 CONDITIONS="clean white pink chime demand telephone reverb room"
+ALGOS=$($PYTHON -c "from algorithms import get_available_algorithms as g; print(' '.join(g()))")
+[ -z "$ALGOS" ] && { echo "[run.sh] FATAL: no algorithms installed (uv sync --all-extras)"; exit 1; }
 
-frame_clean() {  # <name> <data-dir>  -- full-dataset clean leaderboard cell
-  $PYTHON pitch_benchmark.py --dataset "$1" --data-dir "$2" \
-    --degradation clean --device "$DEVICE" --output-dir "$OUTPUT_DIR" \
-    || echo "[run.sh] WARN: frame clean $1 failed (continuing)"
-}
-frame_robust() {  # <name> <data-dir>  -- capped probe x each degradation
-  for cond in $CONDITIONS; do
-    $PYTHON pitch_benchmark.py --dataset "$1" --data-dir "$2" \
-      --degradation "$cond" --chime-dir "$CHIME_DIR" --demand-dir "$DEMAND_DIR" \
-      --max-samples "$MAX_SAMPLES" --max-seconds "$MAX_SECONDS" \
-      --device "$DEVICE" --output-dir "$OUTPUT_DIR" \
-      || echo "[run.sh] WARN: frame $cond $1 failed (continuing)"
-  done
-}
-note_clean() {  # <name> <data-dir>  -- note-transcription track (per-algorithm theta x lambda sweep)
-  $PYTHON note_benchmark.py --dataset "$1" --data-dir "$2" \
-    --device "$DEVICE" --output-dir "$NOTES_DIR" \
-    || echo "[run.sh] WARN: notes $1 failed (continuing)"
-}
+skipped() { case " $SKIP_DATASETS " in *" $1 "*) return 0;; *) return 1;; esac; }
 
-echo "=== FRAME: clean leaderboard (${#FRAME_DATASETS[@]} datasets, full) ==="
-for d in "${FRAME_DATASETS[@]}"; do frame_clean "${d%%|*}" "${d#*|}"; done
-echo "=== FRAME: robustness probe (capped x ${CONDITIONS}) ==="
-for d in "${FRAME_DATASETS[@]}"; do frame_robust "${d%%|*}" "${d#*|}"; done
-echo "=== NOTE TRACK (clean) ==="
-for d in "${NOTE_DATASETS[@]}"; do note_clean "${d%%|*}" "${d#*|}"; done
+# --- build the cell list (clean long-poles first, then capped robustness, then notes) ------------------
+CELLS="$(mktemp)"; trap 'rm -f "$CELLS"' EXIT
+for d in "${FRAME_DATASETS[@]}"; do
+  name="${d%%|*}"; dir="${d#*|}"; skipped "$name" && continue
+  for a in $ALGOS; do echo "clean|$name|$dir||$a"; done
+done >> "$CELLS"
+for d in "${FRAME_DATASETS[@]}"; do
+  name="${d%%|*}"; dir="${d#*|}"; skipped "$name" && continue
+  for c in $CONDITIONS; do for a in $ALGOS; do [ "$c" = clean ] && continue; echo "robust|$name|$dir|$c|$a"; done; done
+done >> "$CELLS"
+for d in "${NOTE_DATASETS[@]}"; do
+  name="${d%%|*}"; dir="${d#*|}"; skipped "$name" && continue
+  for a in $ALGOS; do echo "note|$name|$dir||$a"; done
+done >> "$CELLS"
 
+N=$(wc -l < "$CELLS" | tr -d ' ')
+echo "=== PARALLEL BENCHMARK: $N cells | $WORKERS workers x $THREADS threads | device=$DEVICE ==="
+echo "    algos: $ALGOS"
+[ -n "$SKIP_DATASETS" ] && echo "    skipping datasets: $SKIP_DATASETS"
+SECONDS=0
+xargs -P "$WORKERS" -I{} bash "$0" __cell "{}" < "$CELLS"
+echo "=== FRAME+NOTE cells done in ${SECONDS}s ($((SECONDS/3600))h$(((SECONDS%3600)/60))m) ==="
+
+# --- serial tail: speed, OOD, report (each reads the cells written above) ------------------------------
 echo "=== SPEED (synthetic timing) ==="
 case "$DEVICE" in
   cuda|mps) $PYTHON speed_benchmark.py --output-dir "$OUTPUT_DIR" --devices cpu "$DEVICE" ;;
   *)        $PYTHON speed_benchmark.py --output-dir "$OUTPUT_DIR" --devices cpu ;;
 esac
-
 echo "=== OOD generalization (synthetic, exact labels) ==="
 $PYTHON ood_benchmark.py --output-dir "$OUTPUT_DIR" --device "$DEVICE" || echo "[run.sh] WARN: OOD failed"
-
 echo "=== REPORT (frame + notes) ==="
-$PYTHON generate_report.py --results-dir "$OUTPUT_DIR" --notes-dir "$NOTES_DIR"
+$PYTHON generate_report.py --results-dir "$OUTPUT_DIR"

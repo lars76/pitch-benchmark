@@ -18,7 +18,7 @@ max(20% duration, 50 ms)). Results carry per-clip rows for CI rendering.
 
 Usage:
     uv run python note_benchmark.py --dataset Vocadito --data-dir ../datasets/vocadito \
-        --algorithms Praat SwiftF0 --output-dir results_notes
+        --algorithms Praat SwiftF0
 """
 import argparse
 import subprocess
@@ -151,7 +151,7 @@ def main():
     ap.add_argument("--dataset", required=True, help="Dataset with note GT (Vocadito, URMP)")
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--algorithms", nargs="+", required=True)
-    ap.add_argument("--output-dir", default="results_notes")
+    ap.add_argument("--output-dir", default="results")   # unified with frame/speed (notes_* prefix)
     ap.add_argument("--degradation", default=None)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--sample-rate", type=int, default=16000)
