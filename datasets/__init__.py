@@ -61,11 +61,11 @@ _PITCH_REGISTRY = {
     "MDBStemSynth": PitchDatasetMDBStemSynth,
     "SpeechSynth": PitchDatasetSpeechSynth,
     "MIR1K": PitchDatasetMIR1K,
-    # M4Singer -- score-grade GT (voicing-reliable, pitch is intended-score); selection/voicing use.
+    # M4Singer: score-grade GT (voicing-reliable, pitch is intended-score); selection/voicing use.
     "M4Singer": PitchDatasetM4Singer,
     "Vocadito": PitchDatasetVocadito,
     "Bach10Synth": PitchDatasetBach10Synth,
-    # EGG (laryngograph) speech corpora -- consensus f0 (committed npz) by default; PTDB/KEELE/FDA
+    # EGG (laryngograph) speech corpora: consensus f0 (committed npz) by default; PTDB/KEELE/FDA
     # additionally offer the dataset authors' shipped reference (label_source="reference").
     "MOCHA": PitchDatasetMOCHA,
     "CMUArctic": PitchDatasetCMUArctic,
@@ -144,7 +144,7 @@ def list_note_datasets() -> list[str]:
     """
     List the pitch datasets that also carry ground-truth notes (PitchDataset.provides_notes).
 
-    Notes are a CAPABILITY of a pitch dataset, not a separate type -- so this is the one pitch
+    Notes are a CAPABILITY of a pitch dataset, not a separate type, so this is the one pitch
     registry filtered by the capability flag, never a second registry to keep in sync. Whether a
     note-capable dataset belongs on the note LEADERBOARD is a separate policy (e.g. M4Singer has
     notes but is excluded for score-grade GT); that decision lives in the runner, not here.

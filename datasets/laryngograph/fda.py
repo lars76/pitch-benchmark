@@ -6,8 +6,8 @@ dataset authors' own reference).
 Raw Edinburgh files (read directly from the extracted download):
   - ``<id>.sig``  headerless big-endian int16 PCM speech @ 20 kHz,
   - ``<id>.fx``   an XMG f0 contour (ASCII after a 0x0c byte; ``time_ms freq_hz`` pairs; ``=`` marks
-                  an unvoiced break) -- the author reference,
-  - ``<id>.lar``  the laryngograph waveform (same raw int16 @ 20 kHz) -- the EGG for consensus.
+                  an unvoiced break), the author reference,
+  - ``<id>.lar``  the laryngograph waveform (same raw int16 @ 20 kHz), the EGG for consensus.
 """
 from pathlib import Path
 
@@ -30,7 +30,7 @@ class PitchDatasetFDA(LaryngographSpeechDataset):
     SR = 20000                      # .sig / .lar native sample rate
     FX_STEP_S = 0.005               # the uniform grid the .fx contour is rasterized onto
     # (no REFERENCE_LABEL_HOP_SECONDS: _load_reference_labels always returns explicit `times`, so the
-    # base's hop fallback is unreachable for FDA -- the 5 ms grid is FX_STEP_S, defined once above.)
+    # base's hop fallback is unreachable for FDA: the 5 ms grid is FX_STEP_S, defined once above.)
     # Label-offset sweep (scripts/check_dataset_alignment.py, 17 files x 30 s):
     # Praat +2.38 / DIO +1.22 / SWIPE +1.53 ms -> consensus +1.53 ms (labels stamped early).
     REFERENCE_LABEL_OFFSET_SECONDS = 0.0015

@@ -1,4 +1,4 @@
-"""The frame track's per-cell measurement (pure library -- evaluate.py orchestrates).
+"""The frame track's per-cell measurement (a pure library; evaluate.py orchestrates).
 
 run_single_evaluation scores ONE algorithm on ONE built dataset with a streaming threshold
 sweep; it writes nothing, caches nothing, spawns nothing.
@@ -53,7 +53,7 @@ def run_single_evaluation(
     Returns ``(metrics, crashed)``. ``crashed`` is True only when a clip raised (e.g. OOM); the caller
     stamps it into ``metadata.crashed`` so the report counts it as 0 (not dropped) and the failed cell
     is cached like any other. A deterministically empty run (all clips unvoiced, or no finite
-    threshold) returns crashed=False -- it is a normal cached result.
+    threshold) returns crashed=False; it is a normal cached result.
 
     Memory: device cache is released once per algorithm at teardown, NOT per clip. PyTorch's
     caching allocator reuses freed blocks within a run, so emptying per clip only adds malloc churn;
@@ -61,8 +61,8 @@ def run_single_evaluation(
     gc() guards against reference cycles left by some DSP libraries.
     """
     algo_name = algorithm_class.get_name()
-    # Construction can fail (e.g. a missing backend/model like BasicPitch's ONNX runtime). Record it as
-    # a crash -- same convention as a per-clip failure -- so one tracker's bad env can't abort the run.
+    # Construction can fail (e.g. a missing model file or inference backend). Record it as
+    # a crash, same convention as a per-clip failure, so one tracker's bad env can't abort the run.
     try:
         algo = build_algorithm(
             algorithm_class, dataset.sample_rate, dataset.hop_size, dataset.fmin, dataset.fmax,

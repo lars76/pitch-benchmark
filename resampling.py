@@ -3,7 +3,7 @@
   - resample_to_grid: a (pitch, periodicity) frame-label SERIES onto a target time grid (the label /
     prediction alignment used by the wrappers, loaders and consensus generator; documented below).
   - resample_audio: a raw audio WAVEFORM from one sample rate to another (the DSP step the fixed-rate
-    neural trackers -- CREPE, SPICE, RMVPE -- run before inference).
+    fixed-rate neural trackers run before inference).
 
 These are unrelated operations (label-time alignment vs signal sample-rate conversion); they live
 together only so "resampling" has one home.

@@ -10,7 +10,7 @@ from .base import LaryngographSpeechDataset
 class PitchDatasetAVID(LaryngographSpeechDataset):
     """AVID (Aalto Vocal Intensity Database): 50 speakers, ~15 min calibrated recordings in
     ``Repository 1`` as 44.1 kHz STEREO (ch0 = speech, ch1 = laryngograph/EGG; a fixed layout, so we
-    do not channel-detect here -- the HF-energy heuristic is unreliable on AVID and DIO detection
+    do not channel-detect here: the HF-energy heuristic is unreliable on AVID and DIO detection
     would pull in pyworld, an install extra that must stay out of the runtime). Consensus f0 on the
     EGG is the label; AVID ships no author f0, so this corpus is consensus-only. One item per recording
     (most speakers have one; a few have several, keyed by unique stem and grouped by speaker for CV)."""
@@ -23,7 +23,7 @@ class PitchDatasetAVID(LaryngographSpeechDataset):
     @classmethod
     def _iter_originals(cls, root: Path):
         """Yield ``(wav_path, stem)`` for each ``Repository 1/Spk*_*.wav``. ``stem`` = the file stem
-        ``SpkN_DATE`` -- unique per recording (a few speakers have >1 recording), while get_group still
+        ``SpkN_DATE``, unique per recording (a few speakers have >1 recording), while get_group still
         derives the speaker id ``SpkN`` from the first ``_``-field."""
         root = Path(root)
         for wav in sorted(root.rglob("Spk*_*.wav")):

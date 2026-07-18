@@ -135,27 +135,27 @@ paths always win:
 
 ```
 <root>/                              # your datasets directory (pass with --root)
-├── PTDB/                            # PTDB raw (archive extracts as "SPEECH DATA" — rename to PTDB)
+├── PTDB/                            # PTDB raw (archive extracts as "SPEECH DATA", rename to PTDB)
 ├── KEELE/                           # Bechtold jbof: <stem>/signal.wav + laryngograph.wav + pitch.npy
-│                                    #   (archive nests KEELE/KEELE — flatten one level)
+│                                    #   (archive nests KEELE/KEELE, flatten one level)
 ├── FDA/                             # raw .sig/.fx/.lar
 ├── Vocadito/
 ├── Bach10Synth/                     # content of the archive's Bach10-mf0-synth/ folder
 ├── OSFGlottis/                      # BIDS bids_dataset/sub-XX/... inside
 ├── AVID/                            # extracted/AVID/Repository 1/Spk*_*.wav inside
-├── MIR1K/                           # archive extracts as MIR-1K — rename
+├── MIR1K/                           # archive extracts as MIR-1K, rename
 ├── URMP/                            # multi-instrument music, Dataset/ inside
-├── MDBStemSynth/                    # archive extracts as MDB-stem-synth — rename
+├── MDBStemSynth/                    # archive extracts as MDB-stem-synth, rename
 ├── SVD/                            # content of healthy.zip: <rec>/sentences/*.nsp + overview.csv
-├── NSynth/                          # the nsynth-test held-out split — rename
+├── NSynth/                          # the nsynth-test held-out split, rename
 ├── APLAWD/                          # content of aplawdw.zip's APLAWDW/ folder: *.wav + *.egg
 ├── chime_home/                      # real-noise source for the chime degradation (upstream name)
 ├── DEMAND/                          # real-noise source for the demand degradation
 ├── MOCHA/                           # raw CSTR <spk>_<num>.wav + .lar
-├── CMUArctic/                       # -WAVEGG cmu_us_<spk>_arctic/orig/*.wav (folder: cmu_arctic_egg if you keep the download name -- use --data)
+├── CMUArctic/                       # -WAVEGG cmu_us_<spk>_arctic/orig/*.wav (folder: cmu_arctic_egg if you keep the download name; point --data at it)
 └── M4Singer/                        # score-grade GT: voicing-reliable; excluded from accuracy tables by the report
 ```
-SpeechSynth needs no download — it renders at runtime from `datasets/speechsynth.pt` inside the repo.
+SpeechSynth needs no download, it renders at runtime from `datasets/speechsynth.pt` inside the repo.
 
 ### Usage
 
@@ -164,7 +164,7 @@ SpeechSynth needs no download — it renders at runtime from `datasets/speechsyn
 python visualize_algorithms.py your_audio.wav --selected_algorithms SwiftF0 CREPE Praat
 ```
 
-**2. Run the whole benchmark** — `evaluate.py` is the ONE entry point for all four tracks
+**2. Run the whole benchmark**, `evaluate.py` is the ONE entry point for all four tracks
 (frame accuracy + robustness, note transcription, OOD, speed) and the report:
 
 ```bash
@@ -174,14 +174,14 @@ uv run python evaluate.py --data "PTDB=/data/SPEECH DATA" KEELE=/data/KEELE/KEEL
 ```
 Robustness (non-clean) cells default to the leaderboard cap (`--max-samples 30 --max-seconds 10`,
 the only affordable mode across many trackers); pass `--max-samples 0 --max-seconds 0` to run
-them on the full datasets (the verdict mode — use it for 1-3 algorithms, never a whole
+them on the full datasets (the verdict mode, use it for 1-3 algorithms, never a whole
 leaderboard). Capped cells are always tagged (`_probe` in the filename, `metadata.probe`), so a
 capped run can never masquerade as the full benchmark. Resumable: finished
 result cells are skipped, so re-running after adding an algorithm is cheap. `--workers N` fans
 cells out over child processes (also giving crash isolation); `--skip-datasets AVID` drops the
 long poles.
 
-**3. Narrowed runs** — the same entry point, restricted:
+**3. Narrowed runs**, the same entry point, restricted:
 ```bash
 uv run python evaluate.py --root ... --algorithms Praat --datasets Vocadito --tracks frame
 uv run python evaluate.py --root ... --datasets Vocadito --conditions pink --tracks frame

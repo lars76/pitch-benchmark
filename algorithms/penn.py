@@ -85,7 +85,7 @@ class PENNPitchAlgorithm(ContinuousPitchAlgorithm):
         #     ('half-window') and strides windows of WINDOW_SIZE from the padded start, so frame
         #     m's window center sits at m*hop + ((WINDOW_SIZE-1)/2 - padding)/penn.SAMPLE_RATE.
         #  2. A constant FCNF0++ content lag: the reported pitch corresponds to signal
-        #     MODEL_LAG_SAMPLES before the window center -- measured -10.99 ms at 16 kHz and
+        #     MODEL_LAG_SAMPLES before the window center, measured -10.99 ms at 16 kHz and
         #     -11.05 ms at 22.05 kHz (rate-invariant across sweep rates, same sign on the step
         #     probe, so it is corrected per the calibration policy in TIMING.md).
         hop8k = self.hopsize_seconds * penn.SAMPLE_RATE

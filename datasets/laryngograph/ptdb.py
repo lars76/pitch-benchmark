@@ -13,7 +13,7 @@ class PitchDatasetPTDB(LaryngographSpeechDataset):
     ``label_source="reference"`` instead loads PTDB's shipped RAPT-on-laryngograph f0
     (``REF/ref_*.f0``, column 0), the dataset authors' own single-method reference.
 
-    File-set policy (v2): every MIC/REF pair is included -- all utterances. Locally bad labels are
+    File-set policy (v2): every MIC/REF pair is included, all utterances. Locally bad labels are
     handled per frame by the consensus semantics (a voiced-but-pitch-uncertain frame gets f0=0, which
     drops it from RPA while keeping it in voicing F1), so whole files are not discarded."""
 

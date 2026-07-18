@@ -43,7 +43,7 @@ class REAPERPitchAlgorithm(ThresholdPitchAlgorithm):
 
     A DSP epoch/pitch tracker. Its voicing operating point is REAPER's own dynamic-programming
     `unvoiced_cost` (higher -> more voiced), so the benchmark's [0, 1] threshold maps onto that knob
-    and REAPER is re-run per threshold -- the parameter-based sweep used by RAPT/SWIPE/YAAPT. This
+    and REAPER is re-run per threshold, the parameter-based sweep used by RAPT/SWIPE/YAAPT. This
     gives a full bidirectional precision/recall sweep with an f0 available at every operating point
     (unlike thresholding the correlation, which can only make voicing more conservative because
     REAPER reports no f0 on frames it calls unvoiced).
@@ -56,7 +56,7 @@ class REAPERPitchAlgorithm(ThresholdPitchAlgorithm):
 
     Note (transparency): REAPER is also one of the four EGG estimators behind the PTDB consensus
     labels (scripts/build_consensus_labels.py, run on the laryngograph signal). As a mic tracker it is therefore
-    scored partly against labels it helped create -- a mild conflict it shares with Praat and Harvest,
+    scored partly against labels it helped create, a mild conflict it shares with Praat and Harvest,
     which are likewise both consensus generators and benchmark trackers.
     """
 

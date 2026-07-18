@@ -1,4 +1,4 @@
-"""The speed track's per-cell measurement (pure library -- evaluate.py orchestrates).
+"""The speed track's per-cell measurement (a pure library; evaluate.py orchestrates).
 
 run_speed_cell times ONE algorithm on the synthetic harmonic signal; it writes nothing.
 Timing depends on machine state, which is why evaluate always overwrites speed cells and runs
@@ -71,7 +71,7 @@ def benchmark_algorithm(
     except Exception as e:
         # A crashing tracker must not abort the whole speed run; record no measurement (rendered like
         # an unsupported device) and move on. Speed has no accuracy score, so there is no "count as 0".
-        tqdm.write(f"  ({algorithm_class.get_name()} crashed on {device}: {e}) -- no timing recorded")
+        tqdm.write(f"  ({algorithm_class.get_name()} crashed on {device}: {e}), no timing recorded")
         return float("inf")
 
 

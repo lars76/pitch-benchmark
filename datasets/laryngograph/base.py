@@ -1,16 +1,16 @@
 """Base class for laryngograph speech corpora.
 
 These corpora are recorded with an electroglottograph (EGG, a laryngograph). Audio is ALWAYS decoded
-straight from the original (extracted) dataset download -- each concrete subclass implements the
+straight from the original (extracted) dataset download; each concrete subclass implements the
 per-corpus format in ``_iter_originals`` (enumerate items) + ``_read_original`` (decode one item to
 native-rate mono speech + EGG). The SAME reader is reused by scripts/build_consensus_labels.py, so a
 corpus's on-disk format lives in exactly one place.
 
 Ground truth is selected by ``label_source``:
-  - ``consensus`` (default): the precomputed ``<NAME>.npz`` beside this module -- consensus over three
+  - ``consensus`` (default): the precomputed ``<NAME>.npz`` beside this module: consensus over three
     independent EGG estimators (Praat / differentiated-EGG / Harvest), keyed by file stem, a (3, n) float32 array of
     (voicing_conf, pitch_hz, pitch_conf) per frame. Built once by scripts/build_consensus_labels.py
-    and committed. No EGG signal or f0 estimator is needed at benchmark time -- only the audio.
+    and committed. No EGG signal or f0 estimator is needed at benchmark time; only the audio.
   - ``reference``: the DATASET AUTHORS' shipped single-method f0, read from the archive. Only corpora
     whose download actually ships an f0 file support this (``SUPPORTS_REFERENCE = True``): PTDB
     (``REF/.f0``), KEELE (its reference track), FDA (``.fx``). The other corpora ship audio + EGG but
@@ -106,14 +106,14 @@ class LaryngographSpeechDataset(PitchDataset):
 
         self._consensus = None  # lazily-read {stem: array} dict (per process; DataLoader-worker safe)
 
-        # [(locator, stem), ...] -- locator is whatever the subclass reader needs (a Path, or a
+        # [(locator, stem), ...]; locator is whatever the subclass reader needs (a Path, or a
         # small tuple for multi-file corpora); stem keys the cache, the consensus npz, and get_group.
         self.items: list[tuple] = list(self._discover())
         if not self.items:
             raise ValueError(f"No audio files found for {self.NAME} in '{root_dir}'")
 
         # Consensus labels cover only the stems in the committed .npz (a partial generation is
-        # common -- the builder also skips files it fails on). Restrict the dataset to labelled
+        # common; the builder also skips files it fails on). Restrict the dataset to labelled
         # stems here, so an unlabelled clip shrinks the dataset instead of raising a KeyError mid
         # DataLoader iteration that would abort the whole benchmark run.
         if label_source == "consensus":
@@ -165,7 +165,7 @@ class LaryngographSpeechDataset(PitchDataset):
         """Decode ONLY the speech -> ``(speech, sr)`` for the runtime loader, skipping the EGG. The
         default reads the full item and drops the EGG (correct for stereo/single-file corpora where
         the EGG comes for free); a corpus whose EGG is a SEPARATE file overrides this to avoid the
-        extra decode (the EGG is never needed at benchmark time -- only the consensus builder reads it)."""
+        extra decode (the EGG is never needed at benchmark time; only the consensus builder reads it)."""
         speech, _egg, sr = cls._read_original(locator)
         return speech, sr
 

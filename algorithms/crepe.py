@@ -210,7 +210,7 @@ class CREPEPitchAlgorithm(TensorFlowModelMixin, ContinuousPitchAlgorithm):
         )
         frames = frames.transpose().copy()
 
-        # normalize each frame -- this is expected by the model
+        # normalize each frame, as the model expects
         frames -= np.mean(frames, axis=1)[:, np.newaxis]
         frames /= np.clip(np.std(frames, axis=1)[:, np.newaxis], 1e-8, None)
 

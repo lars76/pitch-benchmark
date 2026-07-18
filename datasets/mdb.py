@@ -60,7 +60,7 @@ class PitchDatasetMDBStemSynth(PitchDataset):
         """Return group identifier for sample = the source TRACK (Artist_Title).
 
         Filenames are `Artist_Title_STEM_NN.RESYN.wav`, so the previous `stem.split("_")[0]` returned
-        only the first token -- collapsing every distinct `MusicDelta_*` track (Beethoven, Rock, ...)
+        only the first token, collapsing every distinct `MusicDelta_*` track (Beethoven, Rock, ...)
         into one 100-clip 'MusicDelta' group, which fabricates within-group correlation for the cluster
         bootstrap. The leakage-safe unit is the full track: drop `.RESYN.wav` then strip the trailing
         `_STEM_NN` stem index."""

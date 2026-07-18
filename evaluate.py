@@ -2,23 +2,23 @@
 """THE benchmark: the one entry point, the one orchestrator.
 
 The benchmark = every registered dataset x every condition x four tracks
-(frame, note, ood, speed), evaluated as ATOMIC CELLS -- one (track, dataset-or-family,
+(frame, note, ood, speed), evaluated as ATOMIC CELLS, one (track, dataset-or-family,
 condition, algorithm) unit each. The track modules (pitch/note/ood/speed_benchmark) are pure
 measurement libraries; THIS module owns everything else: cell enumeration, dataset paths,
 filenames, result envelopes, cache-as-done, crash recording, process isolation, and the worker
 pool. If the question is "who spawns / who names / who caches / who writes", the answer is
 always: evaluate.
 
-Dataset location -- the user says where each dataset's files start, explicitly:
-`paths={"PTDB": "/my/ptdb_dir", ...}` / `--data PTDB=/my/ptdb_dir` (the loader then reads its
-corpus's documented structure from exactly there -- no searching). As a convenience, a dataset
+Dataset locations are explicit: the user says where each dataset's files start via
+`paths={"PTDB": "/my/ptdb_dir", ...}` / `--data PTDB=/my/ptdb_dir`, and the loader reads its
+corpus's documented structure from exactly there (no searching). As a convenience, a dataset
 WITHOUT an explicit path resolves to `<root>/<Name>` when --root is given (the README's
 convention layout). SpeechSynth is self-contained (a committed synthetic corpus inside this
 repo) and needs neither. The chime/demand noise banks resolve the same way under the names
 `chime_home` / `DEMAND`.
 
 One sizing decision: robustness (non-clean) frame cells default to the LEADERBOARD CAP of
-30 clips / 10 s (`max_samples=30, max_seconds=10.0`) -- adequate for ranking DIFFERENT trackers
+30 clips / 10 s (`max_samples=30, max_seconds=10.0`), adequate for ranking DIFFERENT trackers
 (gaps >= 0.04: paired CI ~ +-0.02 at n=30) and the only affordable mode across many trackers (a
 full pass measures 0.5-60 CORE-HOURS per tracker). Override or uncap (0/None) as needed: full
 cells are required for experiment verdicts (deltas of 0.005-0.02 need hundreds of clips) and
@@ -29,10 +29,10 @@ a verdict must explicitly uncap.
 Execution policy (the whole table):
   frame/note   cache-as-done. workers=1: in-process, cells grouped by (dataset, condition)
                over ONE shared dataset instance (decode + degradation synthesis paid once per
-               group -- measured as the only redundancy worth avoiding). workers>1: one child
+               group, measured as the only redundancy worth avoiding). workers>1: one child
                process per cell (isolation for free; resume can't livelock).
   ood          cache-as-done; cells ALWAYS run in child processes (the synthetic stimuli are
-               exactly what makes some C-extension trackers SIGSEGV) -- except injected
+               exactly what makes some C-extension trackers SIGSEGV), except custom
                classes, which cannot exist in a fresh interpreter and run in-process.
   speed        always overwrites (timing depends on machine state; a stale cached number is
                worse than a re-run); always serial and in-process (timing under a busy pool
@@ -83,12 +83,12 @@ from datasets import (
 from datasets.augment import REGISTRY as CONDITION_REGISTRY
 
 # ---------------------------------------------------------------------------- #
-# THE BENCHMARK DEFINITION -- registered = benchmarked, nothing more to declare:
+# THE BENCHMARK DEFINITION: registered = benchmarked, nothing more to declare.
 # datasets from datasets.list_pitch_datasets(), conditions from datasets.augment.REGISTRY,
 # note membership from the provides_notes capability, tracks = the four measurement libraries.
 # Opt out per run with --skip-datasets / --datasets; interpretation caveats (score-grade GT,
 # train/test overlap) live on the dataset classes and in the report, not as exclusions here.
-# Robustness (non-clean) frame cells default to the leaderboard cap of 30 clips / 10 s -- see
+# Robustness (non-clean) frame cells default to the leaderboard cap of 30 clips / 10 s; see
 # run_cells(max_samples=, max_seconds=); capped cells are always tagged (filename +
 # metadata.probe) and assert_full() rejects them, so a verdict must explicitly uncap.
 # Everything below this section is execution machinery, not definition.
@@ -103,7 +103,7 @@ BUNDLED = {"SpeechSynth": os.path.join(REPO, "datasets", "speechsynth.pt")}
 
 def _data_dir(name, paths, root, required=True):
     """Where `name`'s files start: explicit path > BUNDLED > <root>/<name>. With required=False
-    (the chime_home/DEMAND noise banks) an unresolved name is None -- an error only if a run
+    (the chime_home/DEMAND noise banks) an unresolved name is None, an error only if a run
     actually requests that degradation."""
     if paths and name in paths:
         return paths[name]
@@ -119,14 +119,14 @@ def _data_dir(name, paths, root, required=True):
 
 
 # ---------------------------------------------------------------------------- #
-# Dataset build (the one sequence) -- used by the orchestrator and by tests that need
+# Dataset build (the one sequence), used by the orchestrator and by tests that need
 # custom-capped cells (e.g. an algorithm's own parity/regression tests).
 # ---------------------------------------------------------------------------- #
 def build_eval_dataset(dataset, data_dir, *, sample_rate=16000, hop_size=256, max_samples=None,
                        max_seconds=None, degradation=None, chime_dir=None, demand_dir=None,
                        seed=42):
     """load -> probe cap (even-stride subset) -> truncate -> degrade (Augment; skipped when
-    degradation is None -- an empty pipeline would be a literal pass-through anyway). Returns
+    degradation is None; an empty pipeline would be a literal pass-through anyway). Returns
     (eval_dataset, is_probe)."""
     if degradation == "chime" and not chime_dir:
         raise ValueError("chime_dir is required for the chime degradation")
@@ -187,7 +187,7 @@ def write_cell(result_path, metadata, parameters, results):
     cache_skip treats as finished."""
     os.makedirs(os.path.dirname(result_path) or ".", exist_ok=True)
     obj = {"metadata": metadata, "parameters": parameters, "results": results}
-    tmp_path = result_path + ".tmp"
+    tmp_path = f"{result_path}.{os.getpid()}.tmp"    # per-process: concurrent writers cannot collide
     with open(tmp_path, "w") as f:
         json.dump(metrics.to_json_safe(obj), f, indent=4)
     os.replace(tmp_path, result_path)
@@ -199,7 +199,7 @@ def write_cell(result_path, metadata, parameters, results):
 def enumerate_cells(algos, *, datasets=None, conditions=None, tracks=TRACKS,
                     families=None, skip_datasets=()):
     """The benchmark matrix as atomic cells: dicts of (track, dataset, condition, algo).
-    Enumeration is PURE structure -- cell sizing (the robustness cap) is an execution decision
+    Enumeration is PURE structure; cell sizing (the robustness cap) is an execution decision
     applied by run_cells. `datasets` / `conditions` / `families` narrow the matrix (for
     screens); narrowing is visible in the result coverage, never silent."""
     frame_ds = [d for d in (datasets or list_pitch_datasets()) if d not in skip_datasets]
@@ -239,7 +239,10 @@ def enumerate_cells(algos, *, datasets=None, conditions=None, tracks=TRACKS,
 
 def _cell_cap(cell, cap):
     """The one sizing rule: the run's cap applies exactly to robustness (non-clean) frame
-    cells; clean and the other tracks always run full."""
+    cells; clean and the other tracks always run full. (A capped run ADDITIONALLY emits a
+    probe-sized clean baseline per dataset, see _run_probe_clean_baselines, so the report's
+    Delta-from-clean pairs identical probe clips; the full clean leaderboard cell and the
+    tagged baseline coexist under distinct filenames.)"""
     return cap if (cell["track"] == "frame" and cell["condition"] != "clean") else {}
 
 
@@ -247,7 +250,7 @@ def _algo_classes(algos):
     """The algorithm contract: an algorithm IS a PitchAlgorithm subclass; a string is shorthand
     for a registry class, resolved once here. Returns ({name: class_or_None}, any_custom).
     class None = a named backend that is not installed (executors record it as a crashed cell).
-    any_custom = at least one class that the registry cannot resolve by name -- such a class
+    any_custom = at least one class that the registry cannot resolve by name; such a class
     exists only in THIS process, so those runs stay in-process (no child processes)."""
     cls_map, custom = {}, False
     for a in algos:
@@ -272,7 +275,7 @@ def run_and_write_frame_cell(eval_dataset, cls, *, out_dir, dataset, condition, 
     need custom-capped cells."""
     algo_name = algo_name or (cls.get_name() if cls is not None else "unknown")
     if cls is None:
-        print(f"FATAL: {algo_name} is not installed -- recording as crashed")
+        print(f"FATAL: {algo_name} is not installed, recording as crashed")
         eff = device
     else:
         eff = cls.resolve_effective_device(device)
@@ -285,7 +288,7 @@ def run_and_write_frame_cell(eval_dataset, cls, *, out_dir, dataset, condition, 
         return path
     t0 = time.time()
     if cls is None:
-        result, crashed = metrics.to_json_safe(pitch_benchmark._failure_dict(0)), True
+        result, crashed = pitch_benchmark._failure_dict(0), True
     else:
         result, crashed = pitch_benchmark.run_single_evaluation(
             dataset=eval_dataset, algorithm_class=cls,
@@ -342,6 +345,36 @@ def _run_frame_cells(cells, *, paths, root, out_dir, device, seed, run_cap, cls_
                 sample_rate=16000, hop_size=256, device=device, algo_name=c["algo"])
 
 
+def _run_probe_clean_baselines(frame_cells, *, paths, root, out_dir, device, seed, run_cap,
+                               cls_map, _inproc=False):
+    """The Delta-from-clean baseline: for every dataset in a CAPPED frame run, one clean cell at
+    the SAME probe size (tagged like every capped cell). Without it the robustness table's
+    documented pairing, "the same probe clips scored clean and degraded", has no clean
+    side. Always in-process: a handful of tiny cells."""
+    if not run_cap or _inproc:      # children run ONE narrowed cell; the parent owns baselines
+        return
+    by_ds = {}
+    for c in frame_cells:
+        by_ds.setdefault(c["dataset"], set()).add(c["algo"])
+    for ds, algos in by_ds.items():
+        pending = [a for a in sorted(algos) if not os.path.exists(os.path.join(
+            out_dir, frame_cell_filename(
+                ds, a, "clean", is_probe=True, max_samples=run_cap.get("max_samples"),
+                max_seconds=run_cap.get("max_seconds"),
+                device=(cls_map[a].resolve_effective_device(device)
+                        if cls_map[a] is not None else device), seed=seed)))]
+        if not pending:
+            continue
+        eval_ds, is_probe = build_eval_dataset(
+            ds, _data_dir(ds, paths, root), degradation="clean", seed=seed, **run_cap)
+        for a in pending:
+            run_and_write_frame_cell(
+                eval_ds, cls_map[a], out_dir=out_dir, dataset=ds, condition="clean",
+                is_probe=is_probe, max_samples=run_cap.get("max_samples"),
+                max_seconds=run_cap.get("max_seconds"), seed=seed,
+                sample_rate=16000, hop_size=256, device=device, algo_name=a)
+
+
 def _run_note_cells(cells, *, paths, root, out_dir, device, seed, cls_map):
     """Note cells grouped by dataset (always clean, never capped): one shared dataset build."""
     groups = {}
@@ -367,7 +400,7 @@ def _run_note_cell(eval_dataset, algo_name, cls, dataset, cond, thresholds, out_
     path = os.path.join(out_dir, note_cell_filename(algo_name, dataset, cond, seed))
     t0 = time.time()
     if cls is None:
-        print(f"FATAL: {algo_name} is not installed -- recording as crashed")
+        print(f"FATAL: {algo_name} is not installed, recording as crashed")
     result, crashed = (
         note_benchmark.run_note_evaluation(eval_dataset, cls, thresholds, device=device)
         if cls is not None else ({"conp": float("nan"), "conpoff": float("nan")}, True))
@@ -418,7 +451,7 @@ def _run_one_ood_cell(cell, *, out_dir, device, in_process, cls_map):
     cls = cls_map[cell["algo"]]
     algo, family = cell["algo"], cell["dataset"]
     eff = cls.resolve_effective_device(device) if cls is not None else device
-    ftype = "control" if family in ood_benchmark.CONTROL_FAMILIES else "voiced"
+    ftype = ood_benchmark.family_type(family)
     path = os.path.join(out_dir, ood_cell_filename(algo, family, eff))
     if os.path.exists(path):     # cache-as-done
         return "skip"
@@ -433,7 +466,7 @@ def _run_one_ood_cell(cell, *, out_dir, device, in_process, cls_map):
             _write_ood_cell(out_dir, algo, family, ftype, eff, {}, crashed=True, error=str(e))
             return str(e)
     # ood needs no data paths, and its stimuli are seed-frozen by design (item_rng with fixed
-    # family ids) -- the child's --seed is unused, so any value works here.
+    # family ids), the child's --seed is unused, so any value works here.
     return _spawn_cell(cell, paths=None, root=None, out_dir=out_dir, device=device, seed=42,
                        cap={}, expected=path,
                        on_crash=lambda k, _a=algo, _f=family, _t=ftype, _e=eff:
@@ -529,7 +562,7 @@ def _spawn_cell(cell, *, paths, root, out_dir, device, seed, cap, expected, on_c
         cmd += ["--families", cell["dataset"]]
     # Only ood cells get a timeout: their runtime is known and bounded (fixed 2-s synthetic
     # clips) AND their stimuli are what makes fragile C-extension trackers hang. Frame/note
-    # runtimes are data x algorithm dependent -- any fixed bound would kill honest work.
+    # runtimes are data x algorithm dependent; any fixed bound would kill honest work.
     timeout = 300 if cell["track"] == "ood" else None
     kind = None
     try:
@@ -570,7 +603,7 @@ def _crash_writer(cell, out_dir, device, seed, cap, cls):
                           "timestamp_utc": datetime.now(timezone.utc).isoformat()},
                 parameters={"max_samples": cap.get("max_samples"),
                             "max_seconds": cap.get("max_seconds")},
-                results=metrics.to_json_safe(pitch_benchmark._failure_dict(0)))
+                results=pitch_benchmark._failure_dict(0))
         elif cell["track"] == "note":
             write_cell(
                 _expected_path(cell, out_dir, device, seed, cap, cls),
@@ -587,8 +620,8 @@ def run_cells(algos, *, paths=None, root=None, max_samples=30, max_seconds=10.0,
               families=None, skip_datasets=(), seed=42, workers=1, _inproc=False):
     """Run every missing cell, then return load_cells(out_dir). Data locations: `paths` maps
     dataset name -> the directory where its files start (always wins); `root` is the optional
-    <root>/<Name> convention fallback -- a frame/note run needs one of the two per dataset.
-    Robustness (non-clean) frame cells run under (max_samples, max_seconds) -- default: the
+    <root>/<Name> convention fallback; a frame/note run needs one of the two per dataset.
+    Robustness (non-clean) frame cells run under (max_samples, max_seconds), default: the
     30-clip/10-s leaderboard cap; pass None/0 for both to uncap (verdict mode; assert_full
     accepts nothing less)."""
     max_samples = max_samples or None
@@ -605,8 +638,9 @@ def run_cells(algos, *, paths=None, root=None, max_samples=30, max_seconds=10.0,
     ood_cells = [c for c in cells if c["track"] == "ood"]
     speed_cells = [c for c in cells if c["track"] == "speed"]
     if cap and frame_cells and any(c["condition"] == "clean" for c in frame_cells):
-        print("[frame] note: clean cells always run FULL -- the cap applies to robustness "
-              "(non-clean) cells only")
+        print("[frame] note: clean cells always run FULL (plus one probe-sized clean baseline "
+              "per dataset for the report's Delta-from-clean pairing); the cap applies to "
+              "robustness cells")
     if workers > 1 and custom:
         print("evaluate: custom algorithm class -> running in-process (workers ignored)")
         workers = 1
@@ -632,9 +666,14 @@ def run_cells(algos, *, paths=None, root=None, max_samples=30, max_seconds=10.0,
                                                cls_map[cell["algo"]]))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(_child, frame_cells + note_cells + ood_cells))
+        _run_probe_clean_baselines(frame_cells, paths=paths, root=root, out_dir=out_dir,
+                                   device=device, seed=seed, run_cap=cap, cls_map=cls_map)
     else:
         _run_frame_cells(frame_cells, paths=paths, root=root, out_dir=out_dir,
                          device=device, seed=seed, run_cap=cap, cls_map=cls_map)
+        _run_probe_clean_baselines(frame_cells, paths=paths, root=root, out_dir=out_dir,
+                                   device=device, seed=seed, run_cap=cap, cls_map=cls_map,
+                                   _inproc=_inproc)
         _run_note_cells(note_cells, paths=paths, root=root, out_dir=out_dir,
                         device=device, seed=seed, cls_map=cls_map)
         _run_ood_cells(ood_cells, out_dir=out_dir, device=device,
@@ -668,6 +707,11 @@ def load_cells(results_dir, algos=None):
             key = ("speed", None, None, algo)
         elif m.get("dataset_name"):
             key = ("frame", m.get("dataset_name"), m.get("condition"), algo)
+            # The clean-probe BASELINE (report-only, for Delta-from-clean pairing) shares this
+            # key with the full clean leaderboard cell: the full cell always wins, explicitly --
+            # not by glob order.
+            if key in cells and m.get("probe") and not cells[key]["metadata"].get("probe"):
+                continue
         else:
             continue
         cells[key] = d
@@ -726,7 +770,7 @@ def main():
     )
     p.add_argument("--max-samples", type=int, default=30,
                    help="Clip cap for robustness (non-clean) cells; 0 = uncapped. The default "
-                        "is the leaderboard cap -- uncapped verdict runs are affordable only "
+                        "is the leaderboard cap; uncapped verdict runs are affordable only "
                         "for a few algorithms (hours), never a whole leaderboard (days)")
     p.add_argument("--max-seconds", type=float, default=10.0,
                    help="Per-clip duration cap for robustness cells; 0 = uncapped")

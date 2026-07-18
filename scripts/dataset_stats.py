@@ -73,7 +73,7 @@ def measure(name, data_dir):
         try:
             it = ds[i]
         except Exception as e:
-            bar.write(f"  {name}[{i}]: item error ({str(e)[:50]}) -- skipping clip")
+            bar.write(f"  {name}[{i}]: item error ({str(e)[:50]}), skipping clip")
             continue
         n_ok += 1
         audio = np.asarray(it["audio"]).reshape(-1)

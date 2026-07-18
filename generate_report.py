@@ -97,7 +97,7 @@ def load_all_results(results_dir: str) -> tuple[list[dict], list[dict], list[dic
             continue
         except OSError as e:
             # A transient read failure (permission, concurrent removal, NFS) must not take down the
-            # whole report -- skip this file and keep going, as the pre-refactor except Exception did.
+            # whole report; skip this file and keep going.
             print(f"Warning: skipping {file_path}: {e}")
             continue
         try:
@@ -125,7 +125,7 @@ def load_all_results(results_dir: str) -> tuple[list[dict], list[dict], list[dic
 
 def _dedupe_prefer_cpu(results: list[dict], key_fn) -> list[dict]:
     """Keep one result per key_fn(metadata, parameters). A non-crashed result always beats a crashed
-    one for the same cell -- a valid result on disk must not be shadowed by a stale crash cell (e.g. an
+    one for the same cell; a valid result on disk must not be shadowed by a stale crash cell (e.g. an
     `_auto_` cell written before a backend was installed, which lingers under a different device string
     than the later `_mps_`/`_cuda_` result). Among non-crashed results prefer `device=="cpu"` (the
     reproducible reference), else whatever ran; a crash is kept only if EVERY cell for the key crashed
@@ -155,21 +155,37 @@ def _ood_key(m, _p):
     return (m.get("algorithm_name"), m.get("family"))
 
 
-# Synthetic OOD families (kept in sync with ood_benchmark.py FAMILIES): two axes.
-OOD_MECHANISMS = ["missing_f0", "unresolved", "irn", "vibrato_fast", "glide"]
+# Synthetic OOD families: MEMBERSHIP is derived from ood_benchmark (the authority) so a new
+# family can never be silently dropped from the report; only the PROSE below is report copy
+# (rendered with a graceful fallback when a description is missing).
+import ood_benchmark as _ood
+
+OOD_BANDS = list(_ood.BANDS_F0)                        # range-table column order (bass..vhigh)
+_range_prefixes = {f.rsplit("_", 1)[0] for f in _ood.FAMILIES
+                   if "_" in f and f.rsplit("_", 1)[1] in OOD_BANDS}
+OOD_RANGE_SIGNALS = ([s for s in ("sine", "harm", "tilt") if s in _range_prefixes]
+                     + sorted(_range_prefixes - {"sine", "harm", "tilt"}))
+OOD_CONTROL_ORDER = [f for f in _ood.FAMILIES if _ood.family_type(f) == "control"]
+# Mechanisms = every voiced family that is NOT part of the range sweep (the catch-all: a newly
+# added voiced family lands here automatically).
+OOD_MECHANISMS = [
+    f for f in _ood.FAMILIES
+    if _ood.family_type(f) == "voiced"
+    and not ("_" in f and f.rsplit("_", 1)[1] in OOD_BANDS and f.rsplit("_", 1)[0] in OOD_RANGE_SIGNALS)
+]
 OOD_MECH_AXIS = {
     "missing_f0": "fundamental presence (no energy at f0)",
     "unresolved": "harmonic resolvability (high harmonics only)",
     "irn": "noise-based periodicity (rippled noise)",
     "vibrato_fast": "temporal dynamics (fast FM)",
     "glide": "temporal dynamics (monotonic octave sweep)",
+    "sine_level": "absolute level, pure tone (-6..-66 dBFS, level-invariance)",
+    "harm_level": "absolute level, harmonic tone (-6..-66 dBFS)",
+    "interference": "two periodic sources: follow the dominant f0, ignore a quieter interfering tone at -20/-10/-5 dB",
 }
-OOD_RANGE_SIGNALS = ["sine", "harm", "tilt"]          # family-name prefixes of the pitch-range axis
 OOD_SIGNAL_LABEL = {
     "sine": "sine (pure tone)", "harm": "harmonic (normal tone)", "tilt": "tilt (bright)",
 }
-OOD_BANDS = ["bass", "low", "mid", "high", "vhigh"]   # range-table column order
-OOD_CONTROL_ORDER = ["noise", "whisper"]
 
 
 def _ood_summary_vals(cells, fams):
@@ -186,7 +202,7 @@ def _ood_summary_vals(cells, fams):
 
 
 def _ood_collect(ood_results):
-    """-> (voiced[algo][family]=acc|None, octv[algo][family]=octave_rate, control[algo][family]=fp|None)."""
+    """-> (voiced[algo][fam]=acc|None, octv[algo][fam]=octave_rate, control[algo][fam]=fp|None)."""
     voiced, octv, control = defaultdict(dict), defaultdict(dict), defaultdict(dict)
     for r in ood_results:
         m, res = r.get("metadata", {}), r.get("results", {})
@@ -220,7 +236,7 @@ def _ood_mechanism_section(voiced) -> str:
         "### OOD mechanisms (spectral structure; probed at low-mid pitch)\n\n"
         + md_table(headers, rows) + "\n"
         + "A **crash counts as 0** in mean/worst (a crash is a total failure); the detail cell stays "
-        + "`N/A`. Axis: " + "; ".join(f"`{f}` = {OOD_MECH_AXIS[f]}" for f in fams) + "\n\n"
+        + "`N/A`. Axis: " + "; ".join(f"`{f}` = {OOD_MECH_AXIS.get(f, f)}" for f in fams) + "\n\n"
     )
 
 
@@ -251,7 +267,7 @@ def _ood_range_section(voiced, octv) -> str:
             ok = [b for b in bands
                   if isinstance(voiced[a].get(f"{sig}_{b}"), (int, float)) and voiced[a][f"{sig}_{b}"] >= 0.5]
             rows.append([a, *cells, ok[0] if ok else "-", ok[-1] if ok else "-"])
-        out += f"**{OOD_SIGNAL_LABEL[sig]}**\n\n" + md_table(headers, rows) + "\n"
+        out += f"**{OOD_SIGNAL_LABEL.get(sig, sig)}**\n\n" + md_table(headers, rows) + "\n"
     return out + _ood_range_notes(voiced, octv, present)
 
 
@@ -307,7 +323,7 @@ def _ood_controls_section(control) -> str:
 
 
 def generate_ood_analysis(ood_results: list[dict]) -> str:
-    """OOD section: a spectral-mechanism matrix + a pitch-range matrix + unvoiced controls."""
+    """OOD section: spectral mechanisms + pitch range + unvoiced controls."""
     if not ood_results:
         return ""
     voiced, octv, control = _ood_collect(ood_results)
@@ -328,7 +344,7 @@ def aggregate_pitch_results(
 ) -> dict[str, dict[str, list[float]]]:
     """Aggregate pitch results by algorithm and dataset.
 
-    A recorded crash (metadata.crashed) counts as 0.0 -- a crash is a total failure, not missing data,
+    A recorded crash (metadata.crashed) counts as 0.0: a crash is a total failure, not missing data,
     so it is scored, not dropped (same policy as the OOD table; shared metadata.crashed convention with
     pitch_benchmark/ood_benchmark). A non-crashed NaN (a deterministically empty run, e.g. all frames
     unvoiced) is genuinely no data and is dropped."""
@@ -532,13 +548,13 @@ def generate_dataset_descriptions() -> str:
             "AVID",
             "Speech",
             "Real",
-            "Aalto Vocal Intensity Database: calibrated stereo speech+EGG recordings at graded vocal intensities. Consensus f0 on the EGG; no shipped author f0. **Sparse-voiced** (~21% voiced: long graded-intensity sessions, mostly silence) -- read RPA + voicing precision; F1/combined are false-positive-dominated and not comparable to dense sets.",
+            "Aalto Vocal Intensity Database: calibrated stereo speech+EGG recordings at graded vocal intensities. Consensus f0 on the EGG; no shipped author f0. **Sparse-voiced** (~21% voiced: long graded-intensity sessions, mostly silence); read RPA + voicing precision; F1/combined are false-positive-dominated and not comparable to dense sets.",
         ),
         (
             "OSFGlottis",
             "Speech",
             "Real",
-            "OSF 'Physical Models of the Glottis' subjects reading Harvard sentences with simultaneous EGG (10 kHz). Consensus f0 on the EGG; no shipped author f0. **Sparse-voiced** (~19% voiced: ~28-min lab sessions, mostly silence) -- read RPA + voicing precision; F1/combined are false-positive-dominated and not comparable to dense sets.",
+            "OSF 'Physical Models of the Glottis' subjects reading Harvard sentences with simultaneous EGG (10 kHz). Consensus f0 on the EGG; no shipped author f0. **Sparse-voiced** (~19% voiced: ~28-min lab sessions, mostly silence); read RPA + voicing precision; F1/combined are false-positive-dominated and not comparable to dense sets.",
         ),
         (
             "SVD",
@@ -574,7 +590,7 @@ def generate_dataset_descriptions() -> str:
             "M4Singer",
             "Music",
             "Real",
-            "Mandarin solo-singing corpus (20 singers). Labels are derived from the score MIDI crossed with a phoneme forced-alignment (a frame is voiced iff its phoneme carries a score note). This makes BOTH axes weak references: (1) **pitch is score-grade** (intended notated pitch, not performed f0), so every tracker scores RPA ~0.72 / ~50-cent error regardless of quality; (2) **voicing is only half-reliable** -- the syllable's note is assigned to its onset consonant too, so ~12-20% of 'voiced' time lands on voiceless obstruents (sh, x, s, p, t, k, ...) that a correct tracker unvoices, capping achievable recall/F1 near ~85% (voicing PRECISION is meaningful -- the unvoiced rests are real silence -- but recall/F1 are biased low, and alignment jitter blurs every boundary). M4Singer is therefore **excluded from every leaderboard here** (accuracy, note, and voicing); it is retained only as a loadable corpus for upstream use.",
+            "Mandarin solo-singing corpus (20 singers). Labels are derived from the score MIDI crossed with a phoneme forced-alignment (a frame is voiced iff its phoneme carries a score note). This makes BOTH axes weak references: (1) **pitch is score-grade** (intended notated pitch, not performed f0), so every tracker scores RPA ~0.72 / ~50-cent error regardless of quality; (2) **voicing is only half-reliable**: the syllable's note is assigned to its onset consonant too, so ~12-20% of 'voiced' time lands on voiceless obstruents (sh, x, s, p, t, k, ...) that a correct tracker unvoices, capping achievable recall/F1 near ~85% (voicing PRECISION is meaningful because the unvoiced rests are real silence, but recall/F1 are biased low, and alignment jitter blurs every boundary). M4Singer is therefore **excluded from every leaderboard here** (accuracy, note, and voicing); it is retained only as a loadable corpus for upstream use.",
         ),
     ]
 
@@ -679,7 +695,7 @@ def generate_methodology_section() -> str:
         "memorization rather than generalization. Two structural mitigations temper this: "
         "low-parameter models lack the capacity to memorize whole corpora, and the degraded "
         "conditions (noise, reverb, band-limiting) move inputs away from anything seen verbatim in "
-        "training -- a clean-only advantage that collapses under degradation is a leakage "
+        "training. A clean-only advantage that collapses under degradation is a leakage "
         "signature. Interpret per-dataset clean scores with this in mind.\n\n"
     )
 
@@ -688,9 +704,9 @@ def generate_methodology_section() -> str:
         "Beyond the HM components above, the detailed tables report:\n\n"
         "- **Coverage**: fraction of ground-truth-voiced frames that entered pitch scoring "
         "(pitch is scored only where both sides are voiced). RPA at low coverage is computed "
-        "on an easier, self-selected subset of frames -- always read RPA together with Coverage. "
+        "on an easier, self-selected subset of frames; always read RPA together with Coverage. "
         "Coverage counts a mutually-voiced frame only where both sides also carry positive finite "
-        "pitch, so it equals voicing **recall** whenever every mutually-voiced frame does -- true for "
+        "pitch, so it equals voicing **recall** whenever every mutually-voiced frame does; true for "
         "all corpora here except the EGG-consensus sets (SVD/APLAWD/OSFGlottis/AVID), where a per-frame "
         "GT-confidence mask drops untrustworthy-label frames and coverage = recall x (trustworthy-GT "
         "fraction). It is reported alongside RPA (not in the voicing table) because its role here is "
@@ -707,9 +723,9 @@ def generate_methodology_section() -> str:
         "- **Octave / Gross Error rate**: fraction of scored frames off by ~an octave "
         "(chroma-preserving) / by more than 200 cents.\n"
         "- **Relative Smoothness**: coefficient of variation (std/mean) of relative pitch changes "
-        "between consecutive predicted-voiced frames -- jitter of the contour, lower is smoother.\n"
+        "between consecutive predicted-voiced frames: jitter of the contour; lower is smoother.\n"
         "- **Continuity Breaks**: fraction of ground-truth voiced segments (> 1 frame) in which the "
-        "tracker's voicing drops out at least once mid-segment -- spurious contour splits.\n"
+        "tracker's voicing drops out at least once mid-segment: spurious contour splits.\n"
         "- **Pitch bands** (per-band tables): bass < 80 Hz, low 80-260, mid 260-650, "
         "high 650-1050, vhigh > 1050 Hz, by ground-truth f0.\n\n"
     )
@@ -724,12 +740,12 @@ def generate_methodology_section() -> str:
         "statistics inside every resample** rather than averaged, so intervals match the reported "
         "frame-weighted values exactly. \"Tied for best\" claims (**bold**) use a **paired** "
         "bootstrap: all algorithms score the same clips, so the resampled clusters are shared and "
-        "the CI is taken on the *difference* vs the leader -- two overlapping unpaired CIs on "
+        "the CI is taken on the *difference* vs the leader; two overlapping unpaired CIs on "
         "shared data would say nothing. Intervals are per cell with **no multiplicity "
         "correction** across the many cells of this report; for a confirmatory A-vs-B decision, "
         "run a paired test on the exported per-clip sufficient statistics (`per_clip` in each "
         "result JSON) rather than reading intervals off the tables. Cluster counts are shown "
-        "next to every CI -- an interval over very few clusters (e.g. a 2-speaker corpus) is "
+        "next to every CI; an interval over very few clusters (e.g. a 2-speaker corpus) is "
         "close to decorative. A result whose clips all come from a single cluster gets **no "
         "interval and no tie claim** (`[n/a]`) rather than a clip-level one: clips of one source "
         "are correlated, so resampling them would understate the real uncertainty.\n\n"
@@ -756,7 +772,7 @@ def generate_combined_score_table(
     """Generate the main performance table showing combined scores as percentages. Per-dataset
     bolding is STATISTICAL only: bold = tied for best under the paired cluster bootstrap, the same
     tie definition as the Frame Accuracy section (`tie_sets` comes from there). A dataset absent
-    from tie_sets cannot support the claim, so nothing is bolded for it -- there is no
+    from tie_sets cannot support the claim, so nothing is bolded for it; there is no
     display-best fallback."""
     if not aggregated_results:
         return "No pitch benchmark results found.\n"
@@ -803,7 +819,7 @@ def generate_combined_score_table(
 
     rows = []
     for i, r in enumerate(table_data):
-        # Bold the top row as best overall only when the Average actually ranks it -- if every set
+        # Bold the top row as best overall only when the Average actually ranks it; if every set
         # is sparse-voiced (excluded from the Average), avg is None and there is no ranking to claim.
         name = f"**{r['algo']}**" if i == 0 and r["avg"] is not None else r["algo"]
         cells = [name] + [_score_cell(r["algo"], d, r["scores"][d]) for d in all_datasets]
@@ -815,20 +831,20 @@ def generate_combined_score_table(
         rows.append(cells)
 
     note = ("\n**Bold** per dataset = statistically tied for best (paired cluster bootstrap on "
-            "shared clips -- see Frame Accuracy).")
+            "shared clips; see Frame Accuracy).")
     sparse_here = [d for d in all_datasets if d in SPARSE_VOICED]
     if sparse_here:
         note += (f" ⚠ {', '.join(sparse_here)} are **sparse-voiced** (~13-21% voiced): their "
                  f"combined score is false-positive-dominated, so they are **excluded from the "
-                 f"Average** -- judge them by RPA + voicing precision (Frame Accuracy / Detailed "
+                 f"Average**; judge them by RPA + voicing precision (Frame Accuracy / Detailed "
                  f"Analysis), not this column.")
-    return "## Overall Performance Rankings\n\n" + md_table(headers, rows) + note + "\n"
+    return "## Overall Performance Rankings\n\n" + md_table(headers, rows) + note + "\n\n"
 
 
 def generate_speed_table(speed_results: dict[str, dict[str, float]]) -> str:
     """Generate CPU speed performance table."""
     if not speed_results:
-        return "No speed benchmark results found.\n"
+        return "No speed benchmark results found.\n\n"
 
     # Sort by absolute time (ascending - faster is better)
     sorted_algos = sorted(
@@ -971,7 +987,7 @@ def generate_detailed_analysis(
 
 # Dataset groupings for the subset analysis (single source; descriptions derived from this).
 # The EGG (laryngograph) speech corpora are all Real + Speech; URMP is Real + Music. Keep these in
-# sync with datasets/__init__._PITCH_REGISTRY -- _check_group_coverage() below warns on any registered
+# sync with datasets/__init__._PITCH_REGISTRY; _check_group_coverage() below warns on any registered
 # dataset that appears in the results but is missing from every group here (a silent-omission guard).
 _EGG_SPEECH = ["PTDB", "MOCHA", "CMUArctic", "AVID", "OSFGlottis", "SVD", "APLAWD", "KEELE", "FDA"]
 DATASET_GROUPS = {
@@ -1124,7 +1140,7 @@ FAMILY_SECTIONS = {
         "Additive-noise generalization",
         "Across the additive provenances: mean drop and the **worst-provenance** drop (max over "
         "sources). A low mean with a high worst-provenance flags a tracker robust only on some noise "
-        "types -- a generalization/overfitting signal, since a tracker's training noise is unknown.",
+        "types, a generalization/overfitting signal, since a tracker's training noise is unknown.",
     ),
     "convolutional": (
         "Reverberation generalization",
@@ -1247,7 +1263,7 @@ def generate_robustness_analysis(probe_results: list[dict]) -> tuple[str, dict[s
     # Per-family generalization aggregates (additive, convolutional). The per-condition columns are
     # already above; each family section surfaces the mean and the WORST-case (max) drop over its
     # members. Uniformly-low = genuinely robust; low mean but high worst = likely overfit to one
-    # provenance/character -- the fair generalization signal, since a tracker's training data is
+    # provenance/character, the fair generalization signal, since a tracker's training data is
     # unknown. Rendered only when >= 2 of a family's conditions are present (see FAMILY_SECTIONS).
     family_sections = "".join(
         _family_aggregate_section(CONDITION_FAMILIES[fam], conditions, table, heading, blurb)
@@ -1285,7 +1301,7 @@ def generate_frame_accuracy_section(clean_results):
     bootstrap CI (frame-weighted, recomputed from per-clip sufficient stats), clustered by speaker/
     singer/piece. Ranked by Combined. Returns (markdown, tie_sets): tie_sets[dataset] = the set of
     algorithms statistically tied for best Combined under a PAIRED cluster bootstrap vs the leader
-    (all algorithms score the same clips, so the paired difference is the honest comparison -- CI
+    (all algorithms score the same clips, so the paired difference is the honest comparison; CI
     overlap on shared clips is not). Only runs on results that carry the suff-stat columns."""
     cells = {}   # (algo, dataset) -> per_clip block
     for r in clean_results:
@@ -1299,17 +1315,17 @@ def generate_frame_accuracy_section(clean_results):
         return "", {}
     out = ["## Frame Accuracy (per dataset, 95% CI)\n",
            "95% cluster bootstrap over per-clip **sufficient statistics**, clustered by "
-           "speaker/singer/piece (`get_group`) -- frame-weighted, so the point estimates match the "
+           "speaker/singer/piece (`get_group`), frame-weighted, so the point estimates match the "
            "leaderboard. Read **RPA with Coverage** = the fraction of GT-voiced frames RPA was "
            "actually scored on (low coverage = RPA on an easier self-selected subset). Coverage "
            "counts only mutually-voiced frames with positive finite pitch on both sides, so it "
            "equals voicing **recall** for every corpus here except the EGG-consensus sets (SVD/APLAWD/"
            "OSFGlottis/AVID), where a per-frame GT-confidence mask additionally drops untrustworthy-"
-           "label frames -- there coverage = recall x (trustworthy-GT fraction). **Bold** = "
+           "label frames; there coverage = recall x (trustworthy-GT fraction). **Bold** = "
            "statistically tied for the best **Combined**: every algorithm scores "
            "the same clips, so ties use a **paired** cluster bootstrap of the difference vs the "
            "leader (shared clip difficulty cancels; the 95% CI of the difference includes 0). "
-           "**Clips/Groups** shows the number of independent clusters behind each CI -- an interval "
+           "**Clips/Groups** shows the number of independent clusters behind each CI; an interval "
            "over few groups (e.g. 2 speakers) is close to decorative.\n"]
     tie_sets = {}
     for ds in sorted({d for _a, d in cells}):
@@ -1352,7 +1368,7 @@ def generate_frame_accuracy_section(clean_results):
 def generate_note_track_section(note_results: list[dict]) -> str:
     """Note-transcription leaderboard: per (algorithm, dataset, condition), COnP/COnPOff with
     cluster-bootstrap CIs from per_clip rows; crashed cells shown as 0. Each contour tracker is
-    ranked at its own best (voicing threshold, split penalty) -- see note_benchmark.py."""
+    ranked at its own best (voicing threshold, split penalty); see note_benchmark.py."""
     # Voicing-only corpora (score-grade note onsets/pitch) would score a spurious ~0.26 COnP here.
     note_results = [r for r in note_results
                     if r.get("metadata", {}).get("dataset_name") not in VOICING_ONLY]
@@ -1450,7 +1466,7 @@ def main():
     # Voicing-only corpora carry SCORE-GRADE pitch GT (the notated note, not the performed f0), so
     # their RPA / cents / note metrics are a ground-truth artifact, not tracker skill: e.g. on M4Singer
     # a correct tracker scores RPA ~0.59 (median err ~39c from vibrato/portamento) vs ~0.95 on real-f0
-    # MIR1K -- it would make every good tracker look broken on the accuracy + note leaderboards. They
+    # MIR1K; it would make every good tracker look broken on the accuracy + note leaderboards. They
     # are registered (usable as loadable datasets, e.g. for voicing/selection) but EXCLUDED from the
     # accuracy comparison here. Their voicing labels are reliable; the pitch VALUES are not.
     dropped = sorted({r.get("metadata", {}).get("dataset_name") for r in pitch_results

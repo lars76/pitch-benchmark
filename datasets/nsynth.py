@@ -197,7 +197,7 @@ class PitchDatasetNSynth(PitchDataset):
         periodicity = self._detect_voiced_frames(waveform, num_frames)
 
         # The voicing gate uses center=True (frame i is the audio centered on sample i*hop), so frame
-        # i's true time is i*hop/sr -- matching the center-aligned eval grid. Passing these true times
+        # i's true time is i*hop/sr, matching the center-aligned eval grid. Passing these true times
         # routes the labels through the one shared time-based resampler, same as every other dataset.
         label_times = np.arange(num_frames) * (self.hop_size / sample_rate)
 

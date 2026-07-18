@@ -5,7 +5,7 @@ from .base import LaryngographSpeechDataset
 
 class PitchDatasetAPLAWD(LaryngographSpeechDataset):
     """APLAWDW: the APLAWD corpus (recorded at UCL 1987-88 for the SPAR project; Lindsey, Breen &
-    Nevard) in M. Brookes's 2015 Imperial College repackaging -- 151 short utterances x 10 British-RP
+    Nevard) in M. Brookes's 2015 Imperial College repackaging: 151 short utterances x 10 British-RP
     speakers (a-e male, f-j female), 20 kHz speech + simultaneous laryngograph (EGG). Read straight
     from the extracted ``APLAWDW/`` tree: each utterance is ``<...>/a<wtype><NN><spk><rep>.wav`` (speech) +
     ``.egg`` (laryngograph), both ordinary 20 kHz mono RIFF. Consensus f0 on the EGG is the label;

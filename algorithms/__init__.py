@@ -25,7 +25,7 @@ _ALGORITHM_METADATA = {
     "Harvest": ("harvest", "HarvestPitchAlgorithm"),
 }
 
-# Trackers that need NO `uv sync --extra` -- there is no pip package to add. NOT a statement of
+# Trackers that need NO `uv sync --extra`: there is no pip package to add. NOT a statement of
 # importance: RMVPE's model is implemented in-repo (algorithms/rmvpe.py, torch + librosa only,
 # weights downloaded at runtime) and pYIN is just librosa.pyin; both torch and librosa are core
 # dependencies. Everything else ships an external backend package and thus a pyproject extra.

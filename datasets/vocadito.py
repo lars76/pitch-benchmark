@@ -26,7 +26,7 @@ class PitchDatasetVocadito(PitchDataset):
     # Constant timing correction (seconds) added to the F0 annotation timestamps: the label-offset
     # sweep (scripts/check_dataset_alignment.py, TIMING.md) measures the annotation content a
     # systematic +2.7 ms after the CSV timestamps, agreeing to 0.1 ms across three calibrated
-    # reference trackers (+2.65/+2.77/+2.73 ms) -- an annotation-tool frame convention offset.
+    # reference trackers (+2.65/+2.77/+2.73 ms), an annotation-tool frame convention offset.
     F0_LABEL_OFFSET_SECONDS = 0.0027
 
     def __init__(self, root_dir: str, use_cache: bool = True, **kwargs):

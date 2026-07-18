@@ -29,7 +29,7 @@ class TorchCREPEPitchAlgorithm(ContinuousPitchAlgorithm):
             decoder: Strategy for converting network output to pitch ('weighted_argmax', 'argmax' or 'viterbi')
             model: Model capacity ('tiny', or 'full')
             device: Computation device ("cpu" or "cuda")
-            batch_size: Frames per model forward pass -- bounds peak memory independently of clip
+            batch_size: Frames per model forward pass; bounds peak memory independently of clip
                 length. NOTE: torchcrepe runs the Viterbi decode *per batch*, so batch_size shifts
                 results slightly at batch boundaries (a few Hz on a handful of frames). 256 keeps
                 peak ~9 GB for model='full' (upstream default 2048 needs ~19 GB); drop batch_size
@@ -69,7 +69,7 @@ class TorchCREPEPitchAlgorithm(ContinuousPitchAlgorithm):
 
         # torchcrepe resamples to its 16 kHz and strides with the TRUNCATED hop
         # int(hop_size*16000/sample_rate) (torchcrepe.core.preprocess); pad=True centers frame t at
-        # t*hop16k on that timeline. Stamp from that actual stride -- identical to the nominal hop
+        # t*hop16k on that timeline. Stamp from that actual stride, identical to the nominal hop
         # at 16 kHz, but stamping the nominal hop at e.g. 22.05 kHz drifts ~0.4% per frame.
         hop16k = model_hop_length(self.hop_size, self.sample_rate, torchcrepe.SAMPLE_RATE)
         times = frame_times(len(pitch), hop16k, torchcrepe.SAMPLE_RATE)

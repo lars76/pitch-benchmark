@@ -1,13 +1,13 @@
-"""The note track's per-cell measurement (pure library -- evaluate.py orchestrates).
+"""The note track's per-cell measurement (a pure library; evaluate.py orchestrates).
 
 run_note_evaluation scores ONE algorithm on ONE built dataset; it writes nothing, caches
 nothing, spawns nothing. Datasets must return ground-truth "notes" (list of {start, end,
-midi_pitch}) -- currently Vocadito and URMP.
+midi_pitch}), currently Vocadito and URMP.
 
 Fairness design: every contour tracker is segmented by the benchmark's own note layer
 (algorithms.base.notes_from_pitch_contour: exact changepoint DP + audio-derived boundary
 gates). The voicing threshold AND the split penalty lam are swept per algorithm, so each
-tracker is ranked at its own best note operating point -- the same per-algorithm
+tracker is ranked at its own best note operating point, the same per-algorithm
 optimal-threshold policy as the pitch track. The gates read the audio (identical input
 for every tracker), so they cannot favor any one algorithm.
 
@@ -86,7 +86,7 @@ def run_note_evaluation(dataset, algorithm_class, thresholds, device="auto"):
             if not ref_notes:
                 continue
             audio = sample["audio"].numpy()
-            # group = the true speaker/singer/piece (get_group), NOT dirname -- so the note-track
+            # group = the true speaker/singer/piece (get_group), NOT dirname, so the note-track
             # cluster-bootstrap CIs cluster correctly (shared helper with the frame track).
             clip_id, group = clip_and_group(dataset, sample.get("wav_path"), idx)
             contours = algo.extract_pitch(

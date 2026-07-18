@@ -6,8 +6,8 @@ loop) and measures per-family F0 accuracy, so we can say "signal type X breaks t
 pitch_benchmark.py (accuracy on real data + label-preserving degradations) and speed_benchmark.py
 (timing); generate_report.py merges all three.
 
-A pure per-cell measurement library -- evaluate.py orchestrates. NOTE: some C-extension trackers
-(pyreaper, pysptk) ABORT (SIGSEGV/SIGABRT) on these degenerate stimuli (a pure sine, an extreme
+A pure per-cell measurement library; evaluate.py orchestrates. NOTE: some C-extension trackers
+ABORT (SIGSEGV/SIGABRT) on these degenerate stimuli (a pure sine, an extreme
 spectral tilt); that is why evaluate runs every ood cell in a child process by default.
 
 Voiced families are scored by RPA (reusing the 11-threshold sweep + metrics.MetricAccumulator from the
@@ -43,7 +43,12 @@ BANDS_F0 = {                                 # pitch-range axis (2 f0s/band; rea
 # name -> (kind, f0_list). `kind` selects the generator; `f0_list` the pitches pooled into that cell.
 # Two reported axes: spectral MECHANISMS (isolated at low-mid) and a pitch-RANGE sweep
 # (sine/harmonic/tilt per band). `harm_low` doubles as the normal-tone positive control.
-CONTROL_KINDS = ("noise", "whisper")
+LEVELS_DB = (-6.0, -16.0, -26.0, -36.0, -46.0, -56.0, -66.0)  # absolute-level sweep, 10 dB steps
+LEVEL_F0 = 160.0     # a MECH_F0 member: every tracker is competent here at nominal level, so any
+                     # drop under attenuation isolates LEVEL, not pitch range
+INTERF_DB = (-20.0, -10.0, -5.0)   # interfering-source level RELATIVE to the dominant source
+INTERF_F0 = 50.0                   # the interfering source's f0 (a 50 Hz tone + 2nd harmonic)
+CONTROL_KINDS = ("noise", "whisper", "silence")
 FAMILIES = {
     "missing_f0":   ("missing_f0", MECH_F0),
     "unresolved":   ("unresolved", MECH_F0),
@@ -65,6 +70,11 @@ FAMILIES = {
     "tilt_vhigh":   ("tilt", BANDS_F0["vhigh"]),
     "noise":        ("noise", None),
     "whisper":      ("whisper", None),
+    "harm_bass":    ("harmonic", BANDS_F0["bass"]),   # bass complexes (sine_bass is a pure sine)
+    "sine_level":   ("level_sine", None),             # absolute-level sweep (pure tone)
+    "harm_level":   ("level_harm", None),             # absolute-level sweep (harmonic tone)
+    "interference": ("interference", None),           # two periodic sources; follow the dominant
+    "silence":      ("silence", None),                # near-silence FP control
 }
 VOICED_FAMILIES = [n for n, (k, _) in FAMILIES.items() if k not in CONTROL_KINDS]
 CONTROL_FAMILIES = [n for n, (k, _) in FAMILIES.items() if k in CONTROL_KINDS]
@@ -97,6 +107,15 @@ def _finalize(x):
     peak = np.max(np.abs(x))
     if peak > 0.95:
         x = x * (0.95 / peak)                 # guard against clipping for high-crest-factor signals
+    return x.astype(np.float32)
+
+
+def _finalize_at(x, rms):
+    """Stimulus conditioning at an explicit rms, for the level families. _finalize normalizes
+    every stimulus to TARGET_RMS, which would erase the level axis. No peak guard: every swept
+    level is at or below TARGET_RMS."""
+    x = _ramp(x)
+    x = x * (rms / (np.sqrt(np.mean(x ** 2)) + 1e-9))
     return x.astype(np.float32)
 
 
@@ -150,7 +169,11 @@ def _irn(f0, rng, n_iter=8, gain=1.0):
 
 
 def _control_signal(family, rng):
-    """Broadband noise (`noise`) or formant-shaped noise (`whisper`): no periodicity, no f0."""
+    """Broadband noise (`noise`), formant-shaped noise (`whisper`), or near-silence
+    (`silence`): no periodicity, no f0."""
+    if family == "silence":
+        # NOT _finalize'd: RMS-normalizing silence up to TARGET_RMS would defeat the probe.
+        return (1e-6 * rng.standard_normal(N)).astype(np.float32)
     x = rng.standard_normal(N)
     if family == "whisper":
         spec = np.fft.rfft(x)
@@ -162,19 +185,24 @@ def _control_signal(family, rng):
     return _finalize(x)
 
 
-# FROZEN per-family ids for stochastic-clip seeding (noise/whisper/irn). These are the
-# alphabetical ranks at the time the first results were generated. Frozen because a sorted-rank
-# lookup silently RENUMBERS later families whenever a new one is added (e.g. adding "glide"
-# would shift harm_* .. whisper by one and re-roll every stochastic clip, invalidating all
-# existing results_ood_* comparisons). Add new families at the END with the next unused id;
-# never renumber. test_ood.py locks the table against FAMILIES drift.
+# FROZEN per-family ids for stochastic-clip seeding (noise/whisper/irn). The values are
+# arbitrary; what matters is that they NEVER change: a sorted-rank lookup would silently
+# renumber families whenever one is added, re-rolling every stochastic clip and invalidating
+# existing result comparisons. Give a new family the next unused id, at the end; never
+# renumber. test_ood.py locks the table against FAMILIES drift.
 _FAMILY_IDS = {
     "harm_high": 0, "harm_low": 1, "harm_mid": 2, "harm_vhigh": 3, "irn": 4, "missing_f0": 5,
     "noise": 6, "sine_bass": 7, "sine_high": 8, "sine_low": 9, "sine_mid": 10, "sine_vhigh": 11,
     "tilt_high": 12, "tilt_low": 13, "tilt_mid": 14, "tilt_vhigh": 15, "unresolved": 16,
     "vibrato_fast": 17, "whisper": 18,
-    "glide": 19,                       # added 2026-07-10 (deterministic kind; id reserved anyway)
+    "glide": 19,
+    "harm_bass": 20, "sine_level": 21, "harm_level": 22, "interference": 23, "silence": 24,
 }
+
+
+def family_type(name):
+    """The one routing rule: control (FP-rate) or voiced (coverage-aware RPA)."""
+    return "control" if FAMILIES[name][0] in CONTROL_KINDS else "voiced"
 
 
 def _family_id(family):
@@ -185,11 +213,7 @@ def _family_id(family):
 def make_clips(family):
     """Return a list of (audio, f0_per_frame, voiced_per_frame) clips with exact labels.
 
-    Stochastic clips (noise/whisper/IRN) use the shared per-item seeding idiom
-    (datasets.augment.item_rng, a pure function of the ids), replacing the earlier ad-hoc
-    `default_rng(100+i)`/`200+i` scheme -- deterministic like before, but collision-free by
-    construction and consistent with the rest of the codebase. The clips this generates differ
-    from the pre-A5-fix era either way (the label-grid fix already invalidated old OOD results)."""
+    Stochastic clips (noise/whisper/IRN) are seeded by item_rng over the frozen family ids."""
     kind, f0_list = FAMILIES[family]
 
     if kind in CONTROL_KINDS:
@@ -203,7 +227,7 @@ def make_clips(family):
         return [_voiced_clip(ft, _harm_parts(ft, lambda k: 1.0 / k))]
 
     if kind == "glide":
-        # Monotonic one-octave glides (600 cents/s -- the calibration-probe slope, but scored as
+        # Monotonic one-octave glides (600 cents/s, the calibration-probe slope, but scored as
         # RPA against exact per-frame labels): up + down, low + mid register. Deterministic.
         t = np.arange(N) / SR
         clips = []
@@ -211,6 +235,36 @@ def make_clips(family):
             ft = f_start * 2.0 ** (octaves * t * SR / N)
             clips.append(_voiced_clip(ft, _harm_parts(ft, lambda k: 1.0 / k)))
         return clips
+
+    if kind in ("level_sine", "level_harm"):
+        amp = (lambda k: 1.0 if k == 1 else 0.0) if kind == "level_sine" else (lambda k: 1.0 / k)
+        ft = np.full(N, LEVEL_F0)
+        parts = _harm_parts(ft, amp)
+        x = np.zeros(N)
+        for fr, a in parts:
+            x += a * np.sin(2 * np.pi * np.cumsum(fr) / SR)
+        return [(_finalize_at(x, TARGET_RMS * 10 ** (db / 20.0)),
+                 _frame_f0(ft, N), np.ones(N // HOP, dtype=np.float32))
+                for db in LEVELS_DB]
+
+    if kind == "interference":
+        # Two simultaneous periodic sources: a dominant one (220 Hz with vibrato, so following
+        # is tested rather than coincidence) and a quieter one (a 50 Hz tone, swept relative
+        # level). GT is the dominant source's contour; a tracker that switches to the quieter
+        # source scores 0 on those frames. The quieter source stays below equal level on
+        # purpose: "the f0" of equal-level polyphony is undefined for a monophonic tracker.
+        t = np.arange(N) / SR
+        ft = 220.0 * 2 ** (1.0 / 12 * np.sin(2 * np.pi * 3 * t))
+        target = np.zeros(N)
+        for fr, a in _harm_parts(ft, lambda k: 1.0 / k):
+            target += a * np.sin(2 * np.pi * np.cumsum(fr) / SR)
+        target /= np.sqrt(np.mean(target ** 2)) + 1e-9
+        interferer = (np.sin(2 * np.pi * INTERF_F0 * t)
+                      + 0.5 * np.sin(2 * np.pi * 2 * INTERF_F0 * t))
+        interferer /= np.sqrt(np.mean(interferer ** 2)) + 1e-9
+        return [(_finalize(target + 10 ** (db / 20.0) * interferer),
+                 _frame_f0(ft, N), np.ones(N // HOP, dtype=np.float32))
+                for db in INTERF_DB]
 
     clips = []
     for i, f0 in enumerate(f0_list):
@@ -251,7 +305,7 @@ def _score_voiced(algo, clips):
         return {"ood_accuracy": float("nan")}
     # Coverage-aware accuracy: correct frames / ALL ground-truth-voiced frames (tp + fn). Unlike the
     # conditional pitch_accuracy.rpa (only over frames the tracker chose to voice), this DROPS when a
-    # tracker copes with a hard signal by refusing to voice it -- the OOD failure we care about. GT is
+    # tracker copes with a hard signal by refusing to voice it, the OOD failure we care about. GT is
     # all-voiced here, so it is "fraction of frames voiced AND within 50 cents of f0".
     best = accs[best_idx]
     p = best.pitch_metrics()
@@ -273,14 +327,14 @@ def _score_control(algo, clips):
 
 
 # --------------------------------------------------------------------------- #
-# The per-cell measurement (pure: no writing, no processes -- evaluate.py owns those)
+# The per-cell measurement (pure: no writing, no processes; evaluate.py owns those)
 # --------------------------------------------------------------------------- #
 def run_ood_cell(algorithm_class, family, device="auto"):
     """Score one (tracker, family) cell. Same shape as the other tracks: takes the algorithm
     CLASS, returns the results dict, touches nothing else."""
     algo_obj = build_algorithm(algorithm_class, SR, HOP, FMIN, FMAX, device=device)
     clips = make_clips(family)
-    if family in CONTROL_FAMILIES:
+    if family_type(family) == "control":
         results = _score_control(algo_obj, clips)
     else:
         results = _score_voiced(algo_obj, clips)

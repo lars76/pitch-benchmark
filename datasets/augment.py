@@ -118,7 +118,7 @@ class ColoredNoise:
       - the DC bin is zeroed, so the noise has no spurious mean/offset and DC is excluded from the
         power normalization (a raw 1/f^(alpha/2) at f->0 would inject a large constant offset);
       - the 1/f divergence is bounded by a low-frequency floor (flat below `fmin_hz`), so pink/brown
-        do not dump most of their power into sub-audible rumble below the pitch range -- which would
+        do not dump most of their power into sub-audible rumble below the pitch range, which would
         make the audible-band SNR far milder than the nominal SNR the condition asks for.
     """
 
@@ -180,11 +180,38 @@ class AddNoise:
             return audio
         sig_power = _voiced_power(audio, periodicity, hop)
         # SNR enters as a multiplier of the signal power, so a silent / near-silent clip gets ~zero
-        # added noise (silent-in -> silent-out) -- the same behavior as torchaudio.add_noise and
+        # added noise (silent-in -> silent-out), the same behavior as torchaudio.add_noise and
         # audiomentations. The noise denominator is guarded above (_POWER_THRESHOLD); there is no
         # signal-power floor, by design (a floor would fabricate a fixed noise level on silent clips).
         scale = np.sqrt(sig_power / (10 ** (self.snr_db / 10) * noise_power + _EPS))
         return (audio + scale * noise).astype(np.float32)
+
+
+class Gain:
+    """Static level change (dB). Attenuation flows through untouched (the eval-side
+    peak-normalize triggers only above 1.0), the absolute-level robustness condition,
+    catching trackers whose voicing depends on absolute signal level."""
+
+    def __init__(self, db):
+        self.scale = 10.0 ** (db / 20.0)
+
+    def __call__(self, audio, sr, periodicity, hop, rng):
+        return (audio * self.scale).astype(np.float32)
+
+
+class Fade:
+    """Linear-in-dB gain ramp across the clip (db_start -> db_end): the AGC/fade-out class.
+    A DISTINCT failure mode from static Gain: it catches trackers whose voicing decision is
+    relative to a GLOBAL clip statistic (per-frame level invariance does not help against a
+    within-clip ramp)."""
+
+    def __init__(self, db_start=0.0, db_end=-40.0):
+        self.db_start = float(db_start)
+        self.db_end = float(db_end)
+
+    def __call__(self, audio, sr, periodicity, hop, rng):
+        g = 10.0 ** (np.linspace(self.db_start, self.db_end, len(audio)) / 20.0)
+        return (audio * g).astype(np.float32)
 
 
 class Reverb:
@@ -272,7 +299,7 @@ def item_seed(seed: int, *ids: int) -> int:
     SpeechSynth word choice, OOD noise clips): derive one private seed per item instead of drawing
     from the global RNG stream, so the item is independent of access order, cache state, worker
     processes, and any other code that consumes randomness. The uint32 derivation is part of the
-    contract -- changing it re-rolls every stream built on it and invalidates benchmark results."""
+    contract: changing it re-rolls every stream built on it and invalidates benchmark results."""
     return int(
         np.random.SeedSequence([int(seed), *(int(i) for i in ids)])
         .generate_state(1, dtype=np.uint32)[0]
@@ -301,18 +328,19 @@ class Augment(Dataset):
     """Apply a pipeline (list of transforms) to a base dataset's audio, deterministically.
 
     Two seeding modes, selected by `epoch`:
-      - epoch is None (default, EVAL): the per-item stream is item_rng(seed, idx) -- FROZEN across
+      - epoch is None (default, EVAL): the per-item stream is item_rng(seed, idx), FROZEN across
         accesses, so two benchmark runs at the same seed produce bit-identical degraded audio. This
         is the reproducibility contract the benchmark depends on; leave epoch=None for eval.
       - epoch is an int (TRAINING): the stream is item_rng(seed, epoch, idx), so every epoch re-rolls
         every transform's randomness (fresh noise / SNR / condition choice each pass) while staying a
-        PURE function of (seed, epoch, idx) -- reproducible and resumable (set_epoch(N) after a
+        PURE function of (seed, epoch, idx), reproducible and resumable (set_epoch(N) after a
         checkpoint continues the identical stream), independent of shuffle order, worker count and
         cache state. Call set_epoch(e) once per epoch before iterating.
 
     Adding the epoch key changes the derived seed, so the two modes are intentionally distinct
-    streams; the None path is kept byte-identical to the original two-key derivation so eval numbers
-    do not move. An empty pipeline is a pass-through (the 'clean' condition)."""
+    streams; the eval (None) path derives from exactly (seed, idx), the stream every eval
+    result is built on, so it must never change. An empty pipeline is a pass-through (the
+    'clean' condition)."""
 
     def __init__(self, base_dataset, pipeline, seed: int = 0, epoch: int | None = None):
         self.base_dataset = base_dataset
@@ -324,7 +352,7 @@ class Augment(Dataset):
     def set_epoch(self, epoch: int) -> None:
         """Switch to training seeding for `epoch` (see class docstring). Call once per epoch, before
         the DataLoader iterator is created, so re-forked workers pick up the new epoch. With
-        persistent_workers=True a worker holds a stale copy and never sees this -- use
+        persistent_workers=True a worker holds a stale copy and never sees this; use
         persistent_workers=False for training (the decode cache is off there anyway)."""
         self.epoch = int(epoch)
 
@@ -345,7 +373,7 @@ class Augment(Dataset):
             audio = audio.squeeze(0)
         x = audio.detach().cpu().numpy().astype(np.float32).reshape(-1)
 
-        # None -> eval: item_rng(seed, idx), bit-identical to the original derivation (frozen stream).
+        # None -> eval: item_rng(seed, idx), the frozen stream eval results are built on.
         # int  -> training: fold the epoch in so each epoch re-rolls, still pure(seed, epoch, idx).
         rng = (
             item_rng(self.seed, idx)
@@ -518,7 +546,7 @@ def _nonpitched_demand_segments(demand_dir, sample_rate, cap=BANK_CAP):
 
 def _real_noise(scan, directory, name, sample_rate):
     """Pipeline for a real-noise corpus: sample its non-pitched segments at AddNoise's default 0 dB
-    SNR. The two corpora (chime, demand) differ only in `scan` -- the gated-segment scanner -- so
+    SNR. The two corpora (chime, demand) differ only in `scan`, the gated-segment scanner, so
     they share this body. `name` names the required --<name>-dir."""
     if not directory:
         raise ValueError(f"{name} condition requires --{name}-dir")
@@ -527,7 +555,7 @@ def _real_noise(scan, directory, name, sample_rate):
 
 class Codec:
     """G.711-style telephone codec, label-preserving: narrowband 8 kHz round-trip (linear-phase
-    resample_poly -- no group delay, honoring the same zero-phase contract as BandLimit) plus an
+    resample_poly, no group delay, honoring the same zero-phase contract as BandLimit) plus an
     8-bit mu-law companding round-trip (quantization distortion). Deterministic (rng unused).
     Complements 'telephone' (pure band-limit): codec adds the NONLINEAR quantization artifacts of
     real phone/VoIP chains while keeping f0 (<4 kHz) intact."""
@@ -565,6 +593,13 @@ REGISTRY = {
     "codec": lambda **k: [Codec()],
     "reverb": lambda **k: [Reverb(0.4)],
     "room": lambda **k: [RoomReverb()],
+    # Absolute level + dynamics, and the pink SNR dose-response around the 0 dB point, where
+    # many trackers sit on a cliff, the knee location, not the single-point survival, is the
+    # actual robustness measurement.
+    "gain-40": lambda **k: [Gain(-40.0)],
+    "fade": lambda **k: [Fade(0.0, -40.0)],
+    "pink_snr+10": lambda sample_rate=16000, **k: [AddNoise(ColoredNoise(1.0, sample_rate), snr_db=10.0)],
+    "pink_snr-5": lambda sample_rate=16000, **k: [AddNoise(ColoredNoise(1.0, sample_rate), snr_db=-5.0)],
 }
 
 # Condition families: the single source of truth for how the degradations group. generate_report
@@ -575,6 +610,8 @@ CONDITION_FAMILIES = {
     "additive": ("white", "pink", "chime", "demand"),   # per-source + mean + worst-provenance
     "convolutional": ("reverb", "room"),
     "filtering": ("telephone", "codec"),
+    "dynamics": ("gain-40", "fade"),
+    "snr": ("pink_snr+10", "pink_snr-5"),
 }
 
 

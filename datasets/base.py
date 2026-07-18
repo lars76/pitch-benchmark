@@ -29,17 +29,17 @@ def frame_rms(
     `center` is REQUIRED (no default) because it decides which samples frame i's energy describes,
     and getting that silently wrong is exactly the half-hop timing-bug class the calibration work
     eliminated (TIMING.md):
-      - center=True:  frame i spans [i*hop - L//2, i*hop + L - L//2) -- centered on sample i*hop,
+      - center=True:  frame i spans [i*hop - L//2, i*hop + L - L//2), centered on sample i*hop,
         matching the benchmark grid contract (frame i IS the audio centered at i*hop). Every
         voicing/silence gate in the repo uses this.
-      - center=False: frame i spans [i*hop, i*hop + L) -- forward-looking, energy centered half a
+      - center=False: frame i spans [i*hop, i*hop + L), forward-looking, energy centered half a
         window LATE relative to the grid. Only for callers that explicitly want trailing windows.
 
     The signal is zero-padded (left for centering, right so the final window is complete); returns
     shape (n_frames,). This is the one per-frame energy primitive behind every RMS-vs-peak
     silence/voicing gate in the repo (NSynth's voicing detector, the laryngograph energy gate, and
     the offline consensus silence gate). Each caller keeps its OWN normalization/threshold/policy
-    on top -- this returns only the raw per-frame RMS they share."""
+    on top; this returns only the raw per-frame RMS they share."""
     if frame_length is None:
         frame_length = hop_size
     waveform = waveform.squeeze()
@@ -98,7 +98,7 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
 
     # Capability flag: True on datasets whose __getitem__ also yields a "notes" key (ground-truth
     # note intervals). Notes are an OPTIONAL capability of a pitch dataset, not a separate dataset
-    # type -- the note track selects note datasets by this flag (via datasets.list_note_datasets) and
+    # type; the note track selects note datasets by this flag (via datasets.list_note_datasets) and
     # validates it up front, so a note run against a non-notes dataset errors instead of silently
     # scoring nothing.
     provides_notes = False
@@ -395,7 +395,7 @@ class PitchDataset(ABC, torch.utils.data.Dataset):
 
         The load itself lives in the subclass `_load_sample`; this wrapper owns the bounds check and
         the one shared decode-cache. Callers always get a fresh shallow copy, so replacing keys on a
-        returned dict can never corrupt the cache (tensor values are still shared -- consumers must
+        returned dict can never corrupt the cache (tensor values are still shared; consumers must
         replace, not mutate in place, which is what datasets.augment does)."""
         if not 0 <= idx < len(self):
             raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")

@@ -242,7 +242,7 @@ class PitchDatasetSpeechSynth(PitchDataset):
       1. A LightSpeech TTS model (trained in lars76/fastspeech2-clean on AISHELL-3 + biaobei +
          more, 219 speakers) INVENTS a per-frame f0/periodicity contour and a mel spectrogram for
          a random Chinese word sequence. The contour is a generative output, not a measurement of
-         any waveform -- it becomes the label.
+         any waveform: it becomes the label.
       2. A HiFi-GAN vocoder renders the mel to audio. This audio is used only as a TIMBRE DONOR.
       3. WORLD re-synthesizes the final waveform FROM the label contour: CheapTrick (spectral
          envelope) and D4C (aperiodicity) analyze the donor's voice character, and
@@ -260,7 +260,7 @@ class PitchDatasetSpeechSynth(PitchDataset):
     linear fit) because LightSpeech's decoder was trained with mistimed pitch labels (index-warped
     PENN targets in the upstream preprocessing) and learned to treat pitch conditioning as a soft
     hint. exact_f0=False returns that raw audio with the therefore-mislabeled contour, for
-    listening/debugging only -- never for benchmarking.
+    listening/debugging only, never for benchmarking.
 
     Character caveats (documented, accepted): the audio is analysis/synthesis (WORLD-vocoded)
     rather than raw neural speech, and the invented prosody is somewhat idealized. Exactness of
@@ -450,8 +450,8 @@ class PitchDatasetSpeechSynth(PitchDataset):
     def _generate_word_sequence(self, idx: int) -> tuple[list[int], list[int]]:
         """Generate sample `idx`'s word sequence and convert to tokens.
 
-        The words come from a PRIVATE RNG seeded per (dataset seed, idx) -- the same pattern the
-        augmentation layer uses (datasets/augment.py) -- so sample `idx` is a pure function of
+        The words come from a PRIVATE RNG seeded per (dataset seed, idx), the same pattern the
+        augmentation layer uses (datasets/augment.py), so sample `idx` is a pure function of
         (checkpoint, seed, idx). Drawing from the GLOBAL `random` stream instead would make each
         sample depend on everything that consumed the stream earlier (other libraries, access
         order, cache state), silently changing the corpus between otherwise-identical runs. The
@@ -561,7 +561,7 @@ class PitchDatasetSpeechSynth(PitchDataset):
         frame_period_s = pyworld.default_frame_period / 1000.0  # 5 ms
         t = np.arange(int(len(x) / fs / frame_period_s) + 1) * frame_period_s
         # Label contour onto WORLD's grid at true times, gap-aware (never interpolates through
-        # the unvoiced 0 sentinel) -- the benchmark's one resampler.
+        # the unvoiced 0 sentinel), the benchmark's one resampler.
         f0, _ = resample_to_grid(
             pitch.numpy(),
             (pitch.numpy() > 0).astype(np.float64),

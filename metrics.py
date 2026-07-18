@@ -11,7 +11,7 @@ from scipy.ndimage import find_objects, label
 
 
 def clip_and_group(dataset, wav_path, idx):
-    """(clip_id, group) for a per-clip row -- the ONE place both runners (pitch_benchmark.py,
+    """(clip_id, group) for a per-clip row: the ONE place both runners (pitch_benchmark.py,
     note_benchmark.py) derive them, so their cluster-bootstrap CIs share the same grouping.
 
     group = the dataset's leakage-safe get_group (speaker / singer / piece), forwarded through the
@@ -212,7 +212,7 @@ class MetricAccumulator:
     def update(self, pred_pitch, pred_voicing, true_pitch, true_voicing, pitch_conf=None) -> None:
         # A frame the tracker calls voiced but assigns no pitch (pred_pitch <= 0) is a VOICING miss,
         # not a pitch error: fold the pitch-present test into the voicing decision so the frame is
-        # charged exactly once (as a recall miss) and excluded from RPA -- instead of escaping BOTH
+        # charged exactly once (as a recall miss) and excluded from RPA, instead of escaping BOTH
         # axes at low voicing thresholds, where pred_voicing is forced True yet the cents are
         # non-finite and _PitchBin.add drops the frame silently.
         pred_voicing = np.asarray(pred_voicing).astype(bool) & (np.asarray(pred_pitch) > 0)
@@ -258,7 +258,7 @@ class MetricAccumulator:
         """The additive sufficient statistics behind every scalar metric (overall pitch bin + voicing
         counts). Summing these across clips reproduces the full-dataset accumulator EXACTLY, so a
         cluster bootstrap can resample clips, sum, and RECOMPUTE any aggregate (RPA/coverage/F1/cents/
-        combined) frame-weighted -- the honest way to CI a nonlinear aggregate like combined_score."""
+        combined) frame-weighted: the honest way to CI a nonlinear aggregate like combined_score."""
         o = self._overall
         return {"valid": int(o.valid), "n_rpa": int(o.n_rpa), "sum_cents": float(o.sum_cents),
                 "n_octave": int(o.n_octave), "n_gross": int(o.n_gross),
@@ -316,7 +316,7 @@ def voicing_boundary_latency(pred_voiced, true_voiced, frame_period, min_frames=
 
     For each GT voiced region of >= min_frames, onset latency = time from the region's first
     frame to the tracker's first voiced frame inside it (region length if never voiced);
-    offset latency symmetric. Aggregate voicing F1 is position-blind -- a tracker that
+    offset latency symmetric. Aggregate voicing F1 is position-blind: a tracker that
     systematically eats the first 30 ms of every region (e.g. the low start of a rising tone)
     can share an F1 with one that scatters its misses; this is the metric that separates them.
     Returns (onset_ms_list, offset_ms_list), one entry per qualifying region."""
@@ -379,7 +379,7 @@ def summarize_threshold_sweep(accumulators, thresholds):
 # --------------------------------------------------------------------------- #
 # Cluster-bootstrap statistics over per-clip sufficient stats (the ONE bootstrap, shared by the
 # report tables and evaluate.compare). Always cluster by the per-clip `group` (speaker/singer/
-# piece via get_group), never by clip -- correlated clips would give false precision. We pre-SUM
+# piece via get_group), never by clip; correlated clips would give false precision. We pre-SUM
 # each cluster's columns once (metrics are additive), resample cluster INDICES vectorized, and a
 # reducer turns the summed picks into the frame-weighted aggregate (RPA/coverage/F1/cents/
 # combined) or a clip-mean (note COnP). Because every reducer consumes only column SUMS,
@@ -393,7 +393,7 @@ def keyed_group_sums(rows, cols, group_col=1):
     inestimable from one source (clips of one source are correlated, so resampling them would
     understate the real uncertainty). Callers render `[n/a]` and make no tie claims. Every
     registered dataset exposes real source clusters via get_group, so this never triggers in
-    practice -- it exists for degenerate inputs (e.g. a custom dataset that is one source)."""
+    practice; it exists for degenerate inputs (e.g. a custom dataset that is one source)."""
     groups = {}
     for r in rows:
         groups.setdefault(r[group_col], []).append(r)
@@ -428,7 +428,7 @@ def boot_vals(per_group, reduce_fn, n_boot=2000, seed=0, per_group_b=None):
 
 def cluster_bootstrap(per_group, reduce_fn, n_boot=2000, seed=0, per_group_b=None):
     """95% percentile CI of reduce_fn over the clusters (or, with per_group_b, of the PAIRED
-    difference reduce(A)-reduce(B) -- see boot_vals). Returns (nan, nan) with < 2 clusters:
+    difference reduce(A)-reduce(B); see boot_vals). Returns (nan, nan) with < 2 clusters:
     between-cluster variance cannot be estimated from one cluster, so no interval is produced
     (rendered as `[n/a]`)."""
     if len(per_group) < 2:

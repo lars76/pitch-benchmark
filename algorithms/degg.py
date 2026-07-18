@@ -4,7 +4,7 @@ the EGG (laryngograph) signal, NOT on a microphone waveform.
 The EGG tracks vocal-fold contact area; its derivative has one sharp peak per cycle at the
 glottal-closure instant (GCI), and f0 = sr / (inter-GCI interval). A radiated mic signal has no single
 sharp closure peak per cycle (formant ringing), so this method is meaningful ONLY on the EGG. It is
-therefore deliberately left OUT of algorithms/__init__::_ALGORITHM_METADATA -- it must never appear as a
+therefore deliberately left OUT of algorithms/__init__::_ALGORITHM_METADATA: it must never appear as a
 selectable benchmark tracker. scripts/build_consensus_labels.py imports it directly as the
 period-marking family of the cross-family consensus ground truth. Ref: Henrich et al. 2004.
 
@@ -36,7 +36,7 @@ def _parabolic(d: np.ndarray, pk: np.ndarray) -> np.ndarray:
 class DEGGPitchAlgorithm(ContinuousPitchAlgorithm):
     # Whole-file statistics (90th-percentile peak height, median inter-GCI spacing) and the on-grid
     # no-op that preserves the per-cycle hold both require the whole signal in one pass, so chunking is
-    # disabled (the method is O(n) numpy with no large activation buffer -- no memory reason to chunk).
+    # disabled (the method is O(n) numpy with no large activation buffer, so there is no memory reason to chunk).
     CHUNK_SECONDS = None
 
     def _extract_raw_pitch_and_periodicity(

@@ -38,7 +38,7 @@ class PitchDatasetSVD(LaryngographSpeechDataset):
 
     Subset = which zip you extract, not code: SVD is a voice-DISORDER database (mostly pathological
     voices, whose irregular phonation makes unreliable f0 ground truth). Extracting ``healthy.zip``
-    gives only the healthy control speakers -- the clean subset appropriate for an f0 benchmark, and
+    gives only the healthy control speakers, the clean subset appropriate for an f0 benchmark, and
     the recommended ``--data-dir``. The reader simply enumerates whatever recording dirs (+ their
     ``overview.csv``) are under ``root``, so pointing it at an all-pathologies extraction would work
     too, but is not recommended.

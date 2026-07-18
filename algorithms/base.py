@@ -84,30 +84,30 @@ class TensorFlowModelMixin:
 class PitchAlgorithm(ABC):
     """Base pitch tracker.
 
-    Prediction contract -- `extract_pitch(audio, thresholds, compute_notes)` returns a LIST of
+    Prediction contract: `extract_pitch(audio, thresholds, compute_notes)` returns a LIST of
     `(pitch, voicing, notes)`, one tuple per threshold:
       - pitch:   np.ndarray float, shape (F,), Hz; 0.0 on unvoiced frames; clamped to [fmin, fmax]
                  on voiced frames; NaN mapped to 0.
-      - voicing: np.ndarray bool, shape (F,). A committed decision at the operating point -- unlike
-                 the ground-truth `periodicity`, which is a [0,1] confidence; the metric compares
-                 this bool against (true periodicity >= 0.5).
+      - voicing: np.ndarray bool, shape (F,). Already thresholded: the binary voiced/unvoiced
+                 decision for this entry's threshold. (The ground-truth `periodicity` is instead
+                 a [0,1] confidence; the metric compares this bool against periodicity >= 0.5.)
       - notes:   Optional[List[{start, end, midi_pitch}]] (None if compute_notes=False).
 
     All arrays are length F = len(audio) // hop_size on the shared eval grid: frame m is the audio
     CENTERED at sample m*hop_size (time m*hop_size / sample_rate). Each backend's native frame times
-    are resampled onto this grid (resampling.resample_to_grid) -- the SAME grid the ground truth uses
-    -- so predictions and labels line up frame-for-frame.
+    are resampled onto this grid (resampling.resample_to_grid), the SAME grid the ground truth uses
+   , so predictions and labels line up frame-for-frame.
 
     The `thresholds` list in [0,1] selects the voicing operating point. Backends respond in one of
     three ways (see ContinuousPitchAlgorithm / ThresholdPitchAlgorithm):
-      - confidence-based: threshold a real [0,1] confidence (run once) -- smooth precision/recall sweep;
+      - confidence-based: threshold a real [0,1] confidence (run once); smooth precision/recall sweep;
       - parameter-based:  the threshold maps to an internal voicing parameter (re-run per threshold);
-      - fixed operating point: no confidence and no parameter (Harvest) -- the sweep is DEGENERATE
+      - fixed operating point: no confidence and no parameter (Harvest); the sweep is DEGENERATE
         (all thresholds give the same voicing); the algorithm reports a single point.
     """
 
     # Audio longer than CHUNK_SECONDS is processed in overlapping windows so peak memory is
-    # O(window) instead of O(file length) -- every backend here processes the whole signal at
+    # O(window) instead of O(file length); every backend here processes the whole signal at
     # once, so without this the activation/peak footprint grows with clip length and long files
     # OOM. CHUNK_OVERLAP_SECONDS of context is fed on each side and then trimmed, so the result
     # is seamless (must exceed any backend's analysis window; ~1 s >> the ~1024-sample frames).
@@ -125,12 +125,12 @@ class PitchAlgorithm(ABC):
 
     @classmethod
     def resolve_effective_device(cls, requested="cpu") -> str:
-        """The device this tracker actually runs on for `requested` -- the cache key + metadata stamp.
+        """The device this tracker actually runs on for `requested`: the cache key + metadata stamp.
 
         Dispatches on `device_backend`, so device semantics live in one place and a new tracker only
         sets the attribute. torch trackers resolve against real availability; TF trackers use the GPU
         only for a literal "cuda" request when an NVIDIA GPU is present (torch.cuda availability is a
-        cheap proxy -- avoids importing TF here; a CPU-only TF build on a CUDA box is the residual edge).
+        cheap proxy that avoids importing TF here; a CPU-only TF build on a CUDA box is the residual edge).
         """
         if cls.device_backend == "torch":
             return resolve_device(requested).type
@@ -210,7 +210,7 @@ class PitchAlgorithm(ABC):
 
     def native_frames(self, audio: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """The tracker's raw (times, pitch, periodicity) through the SAME path production uses
-        (_extract_windowed) but BEFORE grid resampling -- the quantity whose timestamp truthfulness
+        (_extract_windowed) but BEFORE grid resampling: the quantity whose timestamp truthfulness
         the eval grid depends on. Parameter-based trackers run at their default threshold.
         Diagnostic API shared by the timestamp calibration (tests/test_time_calibration.py) and the
         dataset label-offset sweep (scripts/check_dataset_alignment.py)."""
@@ -251,7 +251,7 @@ class PitchAlgorithm(ABC):
         pitch = np.nan_to_num(pitch, nan=0.0)
 
         # A frame with no pitch (<=0, incl. NaN mapped to 0 above) is unvoiced regardless of the
-        # backend's confidence -- otherwise np.clip(0, fmin, fmax) would fabricate a voiced fmin (e.g.
+        # backend's confidence; otherwise np.clip(0, fmin, fmax) would fabricate a voiced fmin (e.g.
         # pyin reports f0=NaN with voiced_prob>0 on unvoiced frames). Zero its confidence too so nothing
         # downstream (resample_to_grid's f0>0 gap-mask, the 0.0 sweep point, consensus voiced=pitch>0)
         # can treat it as a real detection.
@@ -364,7 +364,7 @@ class PitchAlgorithm(ABC):
         thresholds: float | list[float] | None = None,
         compute_notes: bool = True,
     ) -> list[tuple[np.ndarray, np.ndarray, list[dict[str, float]] | None]]:
-        """Always returns a list of (pitch, voicing, notes) -- one entry per threshold.
+        """Always returns a list of (pitch, voicing, notes), one entry per threshold.
 
         `compute_notes=False` skips note segmentation (the benchmark discards notes, so the
         hot path passes False; other callers keep the default to get notes).

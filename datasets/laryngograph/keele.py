@@ -20,7 +20,7 @@ class PitchDatasetKEELE(LaryngographSpeechDataset):
     per-item tree is therefore ``<stem>/signal.wav`` (speech), ``<stem>/laryngograph.wav`` (EGG), and
     ``<stem>/pitch.npy`` (the reference, a 10 ms ``(time, pitch)`` structured grid; NEGATIVE values
     mark uncertain frames). This is the one EGG corpus whose canonical form is a curated packaging
-    rather than a first-party raw download -- see the README KEELE entry."""
+    rather than a first-party raw download; see the README KEELE entry."""
 
     NAME = "KEELE"
     SUPPORTS_REFERENCE = True
@@ -54,7 +54,7 @@ class PitchDatasetKEELE(LaryngographSpeechDataset):
     def _load_reference_labels(self, item_dir, stem):
         # KEELE marks frames where the laryngograph gave no reliable period with NEGATIVE sentinels
         # (e.g. -20000). Map them to voiced-but-pitch-uncertain (pitch 0, periodicity 1): F1 counts
-        # them positive and the metric's finite-frame rule drops them from RPA -- the same three-state
+        # them positive and the metric's finite-frame rule drops them from RPA, the same three-state
         # semantics as the consensus labels. Scoring them as confident unvoiced would penalize
         # trackers on frames the corpus itself declines to judge.
         arr = np.load(Path(item_dir) / "pitch.npy")

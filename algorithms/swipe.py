@@ -13,7 +13,7 @@ class SWIPEPitchAlgorithm(ThresholdPitchAlgorithm):
     # benchmark code). One allocation per file avoids that pattern: 0 crashes across the whole
     # MDB-stem-synth corpus incl. its 514 s files, with peak RSS plateauing at ~3.5 GB (a
     # fragmentation high-water-mark, not an unbounded leak). Unchunked is also the MOST correct
-    # result -- SWIPE has a weak global dependency (ERB loudness normalization), so any chunking
+    # result: SWIPE has a weak global dependency (ERB loudness normalization), so any chunking
     # perturbs a few boundary frames; no overlap removes it. Other trackers keep the base windowing.
     CHUNK_SECONDS = None
 
