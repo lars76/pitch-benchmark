@@ -10,10 +10,25 @@ from pathlib import Path
 
 import numpy as np
 
+from metrics import (
+    FRAME_STAT_COLS,
+    FRAME_REDUCERS,
+    ci_cell,
+    cluster_bootstrap,
+    frame_keyed,
+    keyed_group_sums,
+    paired_delta_ci,
+    paired_tied,
+    sum_col,
+)
 from datasets.augment import (
     CONDITION_FAMILIES,  # single source of truth for condition families
 )
 from metrics import PITCH_BANDS, band_label, calculate_combined_score
+
+# Frame CI table rendering order: (column label, metrics.FRAME_REDUCERS key).
+FRAME_CI_METRICS = [("Combined", "combined"), ("RPA", "rpa"), ("Voicing-F1", "voicing_f1"),
+                    ("Coverage", "coverage"), ("Cents-MAE", "cents_mae")]
 
 # Datasets whose pitch/note ground truth is SCORE-GRADE (the notated note, not the performed f0):
 # reliable for VOICING, but their RPA/cents/note scores are a GT artifact and must not enter the
@@ -656,6 +671,18 @@ def generate_methodology_section() -> str:
         "every frame. Voicing quality is captured separately by P/R/F1.\n\n"
     )
 
+    methodology += (
+        "### Training-Data Leakage\n"
+        "The learned trackers (and any tuned thresholds) may have been trained or tuned on some of "
+        "these corpora: most are public and widely used, and not every algorithm documents its "
+        "training data. Unusually strong results on one particular dataset can therefore reflect "
+        "memorization rather than generalization. Two structural mitigations temper this: "
+        "low-parameter models lack the capacity to memorize whole corpora, and the degraded "
+        "conditions (noise, reverb, band-limiting) move inputs away from anything seen verbatim in "
+        "training -- a clean-only advantage that collapses under degradation is a leakage "
+        "signature. Interpret per-dataset clean scores with this in mind.\n\n"
+    )
+
     methodology += "### Detailed-Table Metric Definitions\n"
     methodology += (
         "Beyond the HM components above, the detailed tables report:\n\n"
@@ -1130,25 +1157,6 @@ def _family_aggregate_section(member_conds, present_conds, table, heading, blurb
     return f"\n### {heading}\n\n{blurb}\n\n" + md_table(headers, rows) + "\n"
 
 
-def _paired_delta_ci(pairs, n_boot=2000):
-    """95% CI of the mean-over-datasets PAIRED combined-score delta (clean - degraded), in
-    percentage points. `pairs` = per dataset (keyed_clean, keyed_degraded) cluster sums over the
-    SAME probe clips; each bootstrap draw resamples clusters within each dataset (stratified) and
-    applies the same picks to both sides, so shared clip difficulty cancels. Datasets with < 2
-    common clusters cannot be resampled and are skipped. Returns (lo, hi, n_datasets_used)."""
-    per_ds = []
-    for k, (kc, kd) in enumerate(pairs):
-        common = sorted(set(kc) & set(kd))
-        if len(common) < 2:
-            continue
-        per_ds.append(_boot_vals([kc[g] for g in common], _FRAME_REDUCERS["combined"],
-                                 n_boot, seed=k, per_group_b=[kd[g] for g in common]))
-    if not per_ds:
-        return float("nan"), float("nan"), 0
-    vals = np.mean(per_ds, axis=0) * 100.0
-    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5)), len(per_ds)
-
-
 def generate_robustness_analysis(probe_results: list[dict]) -> tuple[str, dict[str, float]]:
     """Δ-from-clean (combined-score percentage points) per degradation, on the probe, with a
     paired stratified cluster-bootstrap 95% CI per cell (same probe clips clean vs degraded).
@@ -1170,7 +1178,7 @@ def generate_robustness_analysis(probe_results: list[dict]) -> tuple[str, dict[s
             scores[algo][cond][ds] = sc
             pc = result.get("results", {}).get("per_clip")
             if pc and pc.get("rows") and all(c in pc.get("schema", []) for c in FRAME_STAT_COLS):
-                keyed[algo][cond][ds] = _frame_keyed(pc)[0]
+                keyed[algo][cond][ds] = frame_keyed(pc)[0]
 
     conditions = sorted({c for a in scores for c in scores[a] if c != "clean"})
     if not scores or not conditions:
@@ -1192,7 +1200,7 @@ def generate_robustness_analysis(probe_results: list[dict]) -> tuple[str, dict[s
                 kcond = keyed[algo].get(cond, {})
                 pairs = [(kclean[d], kcond[d]) for d in paired_ds
                          if d in kclean and d in kcond]
-                lo, hi, n_used = _paired_delta_ci(pairs)
+                lo, hi, n_used = paired_delta_ci(pairs)
                 ci_table[algo][cond] = (lo, hi, n_used, len(paired_ds))
             else:
                 table[algo][cond] = None
@@ -1272,131 +1280,6 @@ def load_note_results(notes_dir: str) -> list[dict]:
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Cluster-bootstrap CIs (the ONE bootstrap, shared by the frame + note + robustness tables)
-# --------------------------------------------------------------------------- #
-# Always cluster by the per-clip `group` (speaker/singer/piece via get_group), never by clip --
-# correlated clips would give false precision. We pre-SUM each cluster's columns once (metrics are
-# additive), resample cluster INDICES vectorized, and a reducer turns the summed picks into the
-# frame-weighted aggregate (RPA/coverage/F1/cents/combined) or a clip-mean (note COnP). Because every
-# reducer consumes only column SUMS, evaluating it on one pre-summed dict is exactly equivalent to
-# handing it the picked dicts -- the scalar reducers stay the single, verified formula implementation.
-def _keyed_group_sums(rows, cols, group_col=1):
-    """Per cluster {name: Σcolumn, ..., '_n': #clips} KEYED by the cluster id (so two algorithms
-    scored on the same clips can be paired cluster-by-cluster). `cols` = [(name, col_index)].
-    Deliberately NO clip-level fallback for a single-group result: between-source variance is
-    inestimable from one source (clips of one source are correlated, so resampling them would
-    understate the real uncertainty). Callers render `[n/a]` and make no tie claims. Every
-    registered dataset exposes real source clusters via get_group, so this never triggers in
-    practice -- it exists for degenerate inputs (e.g. a custom dataset that is one source)."""
-    groups = {}
-    for r in rows:
-        groups.setdefault(r[group_col], []).append(r)
-    out = {}
-    for g, rs in groups.items():
-        d = {"_n": len(rs)}
-        for name, idx in cols:
-            d[name] = float(sum(float(r[idx]) for r in rs))
-        out[g] = d
-    return out
-
-
-def _boot_vals(per_group, reduce_fn, n_boot=2000, seed=0, per_group_b=None):
-    """The n_boot bootstrap draws of reduce_fn over resampled clusters. If `per_group_b` is given
-    (PAIRED: the same clusters scored by a second algorithm/condition, same order), each draw picks
-    ONE set of cluster indices, applies it to BOTH sides, and returns reduce(A) - reduce(B) --
-    shared per-cluster difficulty cancels, which is the honest A-vs-B comparison on shared clips."""
-    n = len(per_group)
-    if n == 0:
-        return np.full(n_boot, np.nan)
-    names = sorted(per_group[0])
-    arr = np.array([[d[k] for k in names] for d in per_group], dtype=float)
-    idx = np.random.default_rng(seed).integers(0, n, (n_boot, n))
-    sums = arr[idx].sum(axis=1)                     # (n_boot, n_cols): the vectorized heavy part
-    if per_group_b is None:
-        return np.array([reduce_fn([dict(zip(names, row))]) for row in sums])
-    arr_b = np.array([[d[k] for k in names] for d in per_group_b], dtype=float)
-    sums_b = arr_b[idx].sum(axis=1)                 # SAME picks on both sides = paired
-    return np.array([reduce_fn([dict(zip(names, ra))]) - reduce_fn([dict(zip(names, rb))])
-                     for ra, rb in zip(sums, sums_b)])
-
-
-def _cluster_bootstrap(per_group, reduce_fn, n_boot=2000, seed=0, per_group_b=None):
-    """95% percentile CI of reduce_fn over the clusters (or, with per_group_b, of the PAIRED
-    difference reduce(A)-reduce(B) -- see _boot_vals). Returns (nan, nan) with < 2 clusters:
-    between-cluster variance cannot be estimated from one cluster, so no interval is produced
-    (rendered as `[n/a]`)."""
-    if len(per_group) < 2:
-        return float("nan"), float("nan")
-    vals = _boot_vals(per_group, reduce_fn, n_boot, seed, per_group_b)
-    if not np.isfinite(vals).all():
-        return float("nan"), float("nan")
-    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
-
-
-def _paired_tied(keyed_a, keyed_b, reduce_fn, n_boot=2000, seed=0):
-    """True if the paired 95% CI of reduce(A)-reduce(B) over the COMMON clusters includes 0 --
-    i.e. A and B are statistically tied on the clips both scored. A tie is a POSITIVE statistical
-    claim: with < 2 common clusters it cannot be assessed, so no tie is claimed (False)."""
-    common = sorted(set(keyed_a) & set(keyed_b))
-    if len(common) < 2:
-        return False
-    lo, hi = _cluster_bootstrap([keyed_a[g] for g in common], reduce_fn, n_boot, seed,
-                                per_group_b=[keyed_b[g] for g in common])
-    return bool(lo <= 0.0 <= hi)
-
-
-def _s(dicts, k):
-    return sum(d[k] for d in dicts)
-
-
-# Frame reducers: recompute the FRAME-weighted aggregate from summed sufficient stats (so CIs match the
-# reported pitch_accuracy.* / combined_score exactly).
-def _agg_from_sums(dicts):
-    v = _s(dicts, "valid"); tp, fp, fn = _s(dicts, "tp"), _s(dicts, "fp"), _s(dicts, "fn")
-    pm = {"rpa": _s(dicts, "n_rpa") / v if v else 0.0,
-          "cents_error": _s(dicts, "sum_cents") / v if v else 0.0,
-          "octave_error_rate": _s(dicts, "n_octave") / v if v else 0.0,
-          "gross_error_rate": _s(dicts, "n_gross") / v if v else 0.0}
-    vm = {"precision": tp / (tp + fp) if (tp + fp) else 0.0,
-          "recall": tp / (tp + fn) if (tp + fn) else 0.0}
-    vm["f1"] = 0.0 if (vm["precision"] + vm["recall"]) == 0 else \
-        2 * vm["precision"] * vm["recall"] / (vm["precision"] + vm["recall"])
-    coverage = v / (tp + fn) if (tp + fn) else 0.0
-    return pm, vm, coverage
-
-def _reduce_combined(ds):
-    pm, vm, _ = _agg_from_sums(ds)
-    return calculate_combined_score(vm, pm)
-
-FRAME_STAT_COLS = ("valid", "n_rpa", "sum_cents", "n_octave", "n_gross", "tp", "fp", "fn")
-_FRAME_REDUCERS = {
-    "combined": _reduce_combined,
-    "rpa": lambda ds: _agg_from_sums(ds)[0]["rpa"],
-    "voicing_f1": lambda ds: _agg_from_sums(ds)[1]["f1"],
-    "coverage": lambda ds: _agg_from_sums(ds)[2],
-    "cents_mae": lambda ds: _agg_from_sums(ds)[0]["cents_error"],
-}
-
-
-def _ci_cell(value, lo, hi, fmt="{:.3f}"):
-    """A 'value [lo, hi]' markdown cell (shared by the frame + note CI tables). No interval
-    (single cluster, see _cluster_bootstrap) renders as '[n/a]'."""
-    if not (np.isfinite(lo) and np.isfinite(hi)):
-        return f"{fmt.format(value)} [n/a]"
-    return f"{fmt.format(value)} [{fmt.format(lo)}, {fmt.format(hi)}]"
-
-
-_FRAME_CI_METRICS = [("Combined", "combined"), ("RPA", "rpa"), ("Voicing-F1", "voicing_f1"),
-                     ("Coverage", "coverage"), ("Cents-MAE", "cents_mae")]
-
-
-def _frame_keyed(pc):
-    """Keyed cluster sums (+ #clips) for one per_clip block's suff-stat columns."""
-    idx = [(c, pc["schema"].index(c)) for c in FRAME_STAT_COLS]
-    return _keyed_group_sums(pc["rows"], idx), len(pc["rows"])
-
-
 def generate_frame_accuracy_section(clean_results):
     """Per clean dataset: each algorithm's Combined / RPA / F1 / Coverage / Cents with a 95% cluster
     bootstrap CI (frame-weighted, recomputed from per-clip sufficient stats), clustered by speaker/
@@ -1431,19 +1314,19 @@ def generate_frame_accuracy_section(clean_results):
     tie_sets = {}
     for ds in sorted({d for _a, d in cells}):
         algs = sorted({a for (a, d) in cells if d == ds})
-        keyed = {a: _frame_keyed(cells[(a, ds)]) for a in algs}          # a -> (keyed sums, n_clips)
+        keyed = {a: frame_keyed(cells[(a, ds)]) for a in algs}          # a -> (keyed sums, n_clips)
         ci = {}
         for a in algs:
             pg = list(keyed[a][0].values())
-            ci[a] = {mk: (_FRAME_REDUCERS[mkey](pg),                     # point = all clusters
-                          *_cluster_bootstrap(pg, _FRAME_REDUCERS[mkey]))
-                     for mk, mkey in _FRAME_CI_METRICS}
+            ci[a] = {mk: (FRAME_REDUCERS[mkey](pg),                     # point = all clusters
+                          *cluster_bootstrap(pg, FRAME_REDUCERS[mkey]))
+                     for mk, mkey in FRAME_CI_METRICS}
         ranked = sorted(algs, key=lambda a: -ci[a]["Combined"][0])
         leader = ranked[0]
         if len(keyed[leader][0]) >= 2:
             ties = {leader} | {a for a in ranked[1:]
-                               if _paired_tied(keyed[leader][0], keyed[a][0],
-                                               _FRAME_REDUCERS["combined"])}
+                               if paired_tied(keyed[leader][0], keyed[a][0],
+                                               FRAME_REDUCERS["combined"])}
             tie_sets[ds] = ties
         else:                                    # single-cluster leader: ties are unassessable
             ties = set()
@@ -1451,9 +1334,9 @@ def generate_frame_accuracy_section(clean_results):
         for a in ranked:
             name = f"**{a}**" if a in ties else a
             cells_md = [name]
-            for mk, _mkey in _FRAME_CI_METRICS:
+            for mk, _mkey in FRAME_CI_METRICS:
                 v, lo, hi = ci[a][mk]
-                cells_md.append(_ci_cell(v, lo, hi, "{:.1f}" if mk == "Cents-MAE" else "{:.3f}"))
+                cells_md.append(ci_cell(v, lo, hi, "{:.1f}" if mk == "Cents-MAE" else "{:.3f}"))
             kd, n_clips = keyed[a]
             cells_md.append(f"{n_clips}/{len(kd)}")
             rows_md.append(cells_md)
@@ -1461,7 +1344,7 @@ def generate_frame_accuracy_section(clean_results):
                   "and **Voicing Precision** in the Detailed Analysis table; F1/Combined are "
                   "FP-dominated and not comparable to the dense sets._" if ds in SPARSE_VOICED else "")
         out.append(f"### {ds}{sparse}\n")
-        out.append(md_table(["**Algorithm**"] + [f"**{mk} [95% CI]**" for mk, _ in _FRAME_CI_METRICS]
+        out.append(md_table(["**Algorithm**"] + [f"**{mk} [95% CI]**" for mk, _ in FRAME_CI_METRICS]
                             + ["**Clips/Groups**"], rows_md) + "\n")
     return "\n".join(out), tie_sets
 
@@ -1494,11 +1377,11 @@ def generate_note_track_section(note_results: list[dict]) -> str:
 
     def _note_keyed(pc):
         s = pc["schema"]
-        return _keyed_group_sums(pc["rows"], [("conp", s.index("conp")),
+        return keyed_group_sums(pc["rows"], [("conp", s.index("conp")),
                                               ("conpoff", s.index("conpoff"))])
 
     def _clip_mean(col):
-        return lambda ds_: (_s(ds_, col) / _s(ds_, "_n")) if _s(ds_, "_n") else float("nan")
+        return lambda ds_: (sum_col(ds_, col) / sum_col(ds_, "_n")) if sum_col(ds_, "_n") else float("nan")
 
     for ds in datasets:
         for cond in conds:
@@ -1510,7 +1393,7 @@ def generate_note_track_section(note_results: list[dict]) -> str:
                      if (pc := cells[(a, ds, cond)][2]) and pc.get("rows")}
             leader = next((a for a in ranked if a in keyed), None)
             ties = ({leader} | {a for a in keyed if a != leader
-                                and _paired_tied(keyed[leader], keyed[a], _clip_mean("conp"))}
+                                and paired_tied(keyed[leader], keyed[a], _clip_mean("conp"))}
                     if leader and len(keyed[leader]) >= 2 else set())
             rows_md = []
             for a in ranked:
@@ -1518,8 +1401,8 @@ def generate_note_track_section(note_results: list[dict]) -> str:
                 if a in keyed:
                     kd = keyed[a]
                     pg = list(kd.values())
-                    c1 = _ci_cell(conp, *_cluster_bootstrap(pg, _clip_mean("conp")))
-                    c2 = _ci_cell(conpoff, *_cluster_bootstrap(pg, _clip_mean("conpoff")))
+                    c1 = ci_cell(conp, *cluster_bootstrap(pg, _clip_mean("conp")))
+                    c2 = ci_cell(conpoff, *cluster_bootstrap(pg, _clip_mean("conpoff")))
                     name = f"**{a}**" if a in ties else a
                     extra = (f"{res.get('optimal_threshold')} / {res.get('optimal_lam_per_s')}"
                              if res else "-")

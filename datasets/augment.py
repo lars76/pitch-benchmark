@@ -434,7 +434,7 @@ class Truncate(Dataset):
 # --------------------------------------------------------------------------- #
 # Condition registry: name -> a builder returning the transform pipeline.
 # Mirrors datasets/_PITCH_REGISTRY (one explicit dict, no auto-registration). The default benchmark
-# conditions (see run.sh) are the minimal-but-expressive set: an additive-noise family at a common
+# conditions (the benchmark default; see evaluate.py) are the minimal-but-expressive set: an additive-noise family at a common
 # SNR, reported per-source (white, pink, and the real-noise provenances chime + demand), plus
 # telephone (low-cut) and reverb/room (convolutional). The real-noise banks are SIGNAL-gated to
 # non-pitched segments (the gate above) so they stay label-preserving.

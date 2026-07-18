@@ -62,12 +62,11 @@ Prefix commands with `uv run` to use the managed environment (e.g. `uv run pytho
 
 ### Device (CPU / CUDA / MPS)
 
-`pitch_benchmark.py --device {auto,cpu,cuda,mps}` selects the compute device for the neural trackers
-(TorchCREPE, RMVPE, PENN); the DSP/own-runtime trackers always run on CPU. `auto` (the default) picks
-`cuda → mps → cpu`. **cpu/cuda are the reproducible reference** for the leaderboard (`run.sh` pins
-`--device cpu`, or run `DEVICE=cuda ./run.sh` on a CUDA box); **mps is a local speed option** (Apple GPU)
-whose numerics differ slightly (within the 50-cent RPA tolerance). `speed_benchmark.py` defaults to CPU
-only; pass `--devices cpu mps` (or `cuda`) to also time the GPU-capable trackers.
+`evaluate.py --device {auto,cpu,cuda,mps}` selects the compute device for the neural trackers
+(TorchCREPE, RMVPE, PENN); the DSP/own-runtime trackers always run on CPU. **cpu/cuda are the
+reproducible reference** for the leaderboard (the default is cpu); **mps is a local speed option**
+(Apple GPU) whose numerics differ slightly (within the 50-cent RPA tolerance). The speed track
+always times cpu and additionally the requested GPU device.
 
 ### Dataset Setup
 
@@ -124,32 +123,37 @@ reads whichever form is present for each.)
 
 **Noise sources** (only for the real-noise robustness conditions `--degradation chime|demand`):
 
-- [CHiME-Home](https://archive.org/details/chime-home) - Domestic background noise ([Foster et al., WASPAA 2015](https://ieeexplore.ieee.org/document/7314880)); pass with `--chime-dir`
-- [DEMAND](https://zenodo.org/records/1227121) - Multi-environment acoustic noise ([Thiemann, Ito & Vincent, Proc. Mtgs. Acoust. 2013](https://hal.science/hal-00796707)); pass with `--demand-dir`
+- [CHiME-Home](https://archive.org/details/chime-home) - Domestic background noise ([Foster et al., WASPAA 2015](https://ieeexplore.ieee.org/document/7314880)); found at `<root>/chime_home`
+- [DEMAND](https://zenodo.org/records/1227121) - Multi-environment acoustic noise ([Thiemann, Ito & Vincent, Proc. Mtgs. Acoust. 2013](https://hal.science/hal-00796707)); found at `<root>/DEMAND`
 
-The datasets live in a `datasets/` directory **beside** the repo — `run.sh` points at `../datasets`
-(override per dataset with `--data-dir`). Each `--dataset NAME` is fixed; the folder name is whatever
-you pass. These are the exact paths `run.sh` uses by default (edit the block at the top of `run.sh` if
-your layout differs):
+**Dataset locations**: you tell the benchmark where each dataset's files start, explicitly —
+`--data "PTDB=/my/SPEECH DATA" KEELE=/my/KEELE/KEELE ...` (the loader reads its corpus's
+documented structure from exactly that directory; nothing is searched for). As a convenience,
+any dataset you do NOT give a path for falls back to `<root>/<Name>` when `--root` is passed —
+the convention layout below (registry name = folder name). Use whichever mix you like; explicit
+paths always win:
+
 ```
-datasets/                            # a sibling of the repo (run.sh: ../datasets)
-├── KEELE/KEELE/                     # Bechtold jbof: <stem>/signal.wav + laryngograph.wav + pitch.npy (--dataset KEELE)
-├── FDA/                             # raw .sig/.fx/.lar (--dataset FDA)
-├── vocadito/                        # (--dataset Vocadito)
-├── Bach10Synth/Bach10-mf0-synth/    # (--dataset Bach10Synth)
-├── osf_glottis/                     # BIDS bids_dataset/sub-XX/... inside (--dataset OSFGlottis)
-├── avid/                            # extracted/AVID/Repository 1/Spk*_*.wav inside (--dataset AVID)
-├── MIR-1K/                          # (--dataset MIR1K)
-├── URMP/                            # multi-instrument music, Dataset/ inside (--dataset URMP)
-├── MDB-stem-synth/                  # (--dataset MDBStemSynth)
-├── "SPEECH DATA"/                   # PTDB raw; note the space (--dataset PTDB --data-dir "../datasets/SPEECH DATA")
-├── svd_zenodo/healthy/              # extracted healthy.zip: <rec>/sentences/*.nsp + overview.csv (--dataset SVD)
-├── nsynth-test/                     # NSynth held-out test split (--dataset NSynth)
-├── aplawd/APLAWDW/                  # extracted aplawdw.zip: <...>/*.wav + *.egg (--dataset APLAWD)
-├── chime_home/                      # real-noise source for --degradation chime (--chime-dir)
-├── DEMAND/                          # real-noise source for --degradation demand (--demand-dir)
-├── MOCHA/                           # optional (not in run.sh): raw CSTR <spk>_<num>.wav + .lar (--dataset MOCHA)
-└── cmu_arctic_egg/                  # optional (not in run.sh): -WAVEGG cmu_us_<spk>_arctic/orig/*.wav (--dataset CMUArctic)
+<root>/                              # your datasets directory (pass with --root)
+├── PTDB/                            # PTDB raw (archive extracts as "SPEECH DATA" — rename to PTDB)
+├── KEELE/                           # Bechtold jbof: <stem>/signal.wav + laryngograph.wav + pitch.npy
+│                                    #   (archive nests KEELE/KEELE — flatten one level)
+├── FDA/                             # raw .sig/.fx/.lar
+├── Vocadito/
+├── Bach10Synth/                     # content of the archive's Bach10-mf0-synth/ folder
+├── OSFGlottis/                      # BIDS bids_dataset/sub-XX/... inside
+├── AVID/                            # extracted/AVID/Repository 1/Spk*_*.wav inside
+├── MIR1K/                           # archive extracts as MIR-1K — rename
+├── URMP/                            # multi-instrument music, Dataset/ inside
+├── MDBStemSynth/                    # archive extracts as MDB-stem-synth — rename
+├── SVD/                            # content of healthy.zip: <rec>/sentences/*.nsp + overview.csv
+├── NSynth/                          # the nsynth-test held-out split — rename
+├── APLAWD/                          # content of aplawdw.zip's APLAWDW/ folder: *.wav + *.egg
+├── chime_home/                      # real-noise source for the chime degradation (upstream name)
+├── DEMAND/                          # real-noise source for the demand degradation
+├── MOCHA/                           # raw CSTR <spk>_<num>.wav + .lar
+├── CMUArctic/                       # -WAVEGG cmu_us_<spk>_arctic/orig/*.wav (folder: cmu_arctic_egg if you keep the download name -- use --data)
+└── M4Singer/                        # score-grade GT: voicing-reliable; excluded from accuracy tables by the report
 ```
 SpeechSynth needs no download — it renders at runtime from `datasets/speechsynth.pt` inside the repo.
 
@@ -160,44 +164,41 @@ SpeechSynth needs no download — it renders at runtime from `datasets/speechsyn
 python visualize_algorithms.py your_audio.wav --selected_algorithms SwiftF0 CREPE Praat
 ```
 
-**2. Run the whole benchmark** (clean leaderboard + robustness probe + note transcription + speed + OOD + report)
+**2. Run the whole benchmark** — `evaluate.py` is the ONE entry point for all four tracks
+(frame accuracy + robustness, note transcription, OOD, speed) and the report:
 
-Edit the dataset paths at the top of `run.sh`, then:
 ```bash
-./run.sh
+uv run python evaluate.py --root /path/to/your/datasets --workers 10 --report
+# or point at datasets wherever they already live (mixes freely with --root):
+uv run python evaluate.py --data "PTDB=/data/SPEECH DATA" KEELE=/data/KEELE/KEELE --datasets PTDB KEELE --tracks frame
 ```
-It is resumable: finished results are skipped, so re-running after adding an algorithm is cheap. Cells run
-in parallel over a bounded worker pool; tune via env vars:
-```bash
-DEVICE=mps ./run.sh                  # cpu (default, the reproducible reference) | mps | cuda for neural trackers
-WORKERS=10 THREADS=1 ./run.sh        # pool width x intra-op threads per cell (default: physical cores x 1)
-SKIP_DATASETS="AVID" ./run.sh        # space-separated datasets to drop
-```
+Robustness (non-clean) cells default to the leaderboard cap (`--max-samples 30 --max-seconds 10`,
+the only affordable mode across many trackers); pass `--max-samples 0 --max-seconds 0` to run
+them on the full datasets (the verdict mode — use it for 1-3 algorithms, never a whole
+leaderboard). Capped cells are always tagged (`_probe` in the filename, `metadata.probe`), so a
+capped run can never masquerade as the full benchmark. Resumable: finished
+result cells are skipped, so re-running after adding an algorithm is cheap. `--workers N` fans
+cells out over child processes (also giving crash isolation); `--skip-datasets AVID` drops the
+long poles.
 
-**3. Individual runs**
-
-Clean is the default condition (no `--chime-dir` needed):
+**3. Narrowed runs** — the same entry point, restricted:
 ```bash
-uv run python pitch_benchmark.py --dataset Vocadito --data-dir datasets/vocadito
+uv run python evaluate.py --root ... --algorithms Praat --datasets Vocadito --tracks frame
+uv run python evaluate.py --root ... --datasets Vocadito --conditions pink --tracks frame
+uv run python evaluate.py --root ... --tracks speed ood
 ```
-Robustness to a degradation on a small probe (capped + truncated sample):
-```bash
-uv run python pitch_benchmark.py --dataset Vocadito --data-dir datasets/vocadito \
-  --degradation pink --max-samples 30 --max-seconds 10
-```
-Degradations: `clean, white, pink, chime, demand, telephone, reverb, room` (`chime` needs `--chime-dir`, `demand` needs `--demand-dir`).
+Conditions: `clean, white, pink, chime, demand, telephone, reverb, room` (chime/demand read their
+noise banks from `<root>/chime_home` / `<root>/DEMAND` automatically).
 
-**4. Note-transcription track** (segments the pitch contour into notes; scored with COnP/COnPOff on the datasets that carry note ground truth — Vocadito, URMP):
-```bash
-uv run python note_benchmark.py --dataset Vocadito --data-dir datasets/vocadito
-```
-
-**5. Speed benchmark**
-```bash
-uv run python speed_benchmark.py
+**4. Programmatic use** (your own tracker class, no registry edits):
+```python
+from evaluate import run_cells, compare
+cells = run_cells([MyTracker, "SwiftF0"], root="/data", datasets=["KEELE"],
+                  max_samples=None, max_seconds=None)   # uncapped = verdict mode
+delta, lo, hi = compare(cells, "MyTracker", "SwiftF0", metric="voicing_f1")
 ```
 
-**6. Generate the report** (frame + note + speed + OOD all read from one `results/` dir):
+**5. Generate the report separately** (or just pass `--report` above):
 ```bash
 uv run python generate_report.py --results-dir results/ --output benchmark_report.md
 ```

@@ -29,7 +29,7 @@ from metrics import PITCH_BANDS, band_label, is_voiced
 SR, HOP = 16000, 256
 
 # (name, domain, data-dir). Order matches generate_report.py:corpus_stats so the paste is 1:1. Paths
-# are relative to the repo root (mirroring run.sh); edit them for your machine.
+# are relative to the repo root (this maintainer script keeps its own table); edit them for your machine.
 DATASETS = [
     ("NSynth", "Music", "../datasets/nsynth-test"),
     ("PTDB", "Speech", "../datasets/SPEECH DATA"),

@@ -375,3 +375,167 @@ def summarize_threshold_sweep(accumulators, thresholds):
         "threshold_sweep": threshold_sweep,
     }
     return best_idx, best_metrics
+
+# --------------------------------------------------------------------------- #
+# Cluster-bootstrap statistics over per-clip sufficient stats (the ONE bootstrap, shared by the
+# report tables and evaluate.compare). Always cluster by the per-clip `group` (speaker/singer/
+# piece via get_group), never by clip -- correlated clips would give false precision. We pre-SUM
+# each cluster's columns once (metrics are additive), resample cluster INDICES vectorized, and a
+# reducer turns the summed picks into the frame-weighted aggregate (RPA/coverage/F1/cents/
+# combined) or a clip-mean (note COnP). Because every reducer consumes only column SUMS,
+# evaluating it on one pre-summed dict is exactly equivalent to handing it the picked dicts --
+# the scalar reducers stay the single, verified formula implementation.
+# --------------------------------------------------------------------------- #
+def keyed_group_sums(rows, cols, group_col=1):
+    """Per cluster {name: Σcolumn, ..., '_n': #clips} KEYED by the cluster id (so two algorithms
+    scored on the same clips can be paired cluster-by-cluster). `cols` = [(name, col_index)].
+    Deliberately NO clip-level fallback for a single-group result: between-source variance is
+    inestimable from one source (clips of one source are correlated, so resampling them would
+    understate the real uncertainty). Callers render `[n/a]` and make no tie claims. Every
+    registered dataset exposes real source clusters via get_group, so this never triggers in
+    practice -- it exists for degenerate inputs (e.g. a custom dataset that is one source)."""
+    groups = {}
+    for r in rows:
+        groups.setdefault(r[group_col], []).append(r)
+    out = {}
+    for g, rs in groups.items():
+        d = {"_n": len(rs)}
+        for name, idx in cols:
+            d[name] = float(sum(float(r[idx]) for r in rs))
+        out[g] = d
+    return out
+
+
+def boot_vals(per_group, reduce_fn, n_boot=2000, seed=0, per_group_b=None):
+    """The n_boot bootstrap draws of reduce_fn over resampled clusters. If `per_group_b` is given
+    (PAIRED: the same clusters scored by a second algorithm/condition, same order), each draw picks
+    ONE set of cluster indices, applies it to BOTH sides, and returns reduce(A) - reduce(B) --
+    shared per-cluster difficulty cancels, which is the honest A-vs-B comparison on shared clips."""
+    n = len(per_group)
+    if n == 0:
+        return np.full(n_boot, np.nan)
+    names = sorted(per_group[0])
+    arr = np.array([[d[k] for k in names] for d in per_group], dtype=float)
+    idx = np.random.default_rng(seed).integers(0, n, (n_boot, n))
+    sums = arr[idx].sum(axis=1)                     # (n_boot, n_cols): the vectorized heavy part
+    if per_group_b is None:
+        return np.array([reduce_fn([dict(zip(names, row))]) for row in sums])
+    arr_b = np.array([[d[k] for k in names] for d in per_group_b], dtype=float)
+    sums_b = arr_b[idx].sum(axis=1)                 # SAME picks on both sides = paired
+    return np.array([reduce_fn([dict(zip(names, ra))]) - reduce_fn([dict(zip(names, rb))])
+                     for ra, rb in zip(sums, sums_b)])
+
+
+def cluster_bootstrap(per_group, reduce_fn, n_boot=2000, seed=0, per_group_b=None):
+    """95% percentile CI of reduce_fn over the clusters (or, with per_group_b, of the PAIRED
+    difference reduce(A)-reduce(B) -- see boot_vals). Returns (nan, nan) with < 2 clusters:
+    between-cluster variance cannot be estimated from one cluster, so no interval is produced
+    (rendered as `[n/a]`)."""
+    if len(per_group) < 2:
+        return float("nan"), float("nan")
+    vals = boot_vals(per_group, reduce_fn, n_boot, seed, per_group_b)
+    if not np.isfinite(vals).all():
+        return float("nan"), float("nan")
+    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
+
+
+def paired_tied(keyed_a, keyed_b, reduce_fn, n_boot=2000, seed=0):
+    """True if the paired 95% CI of reduce(A)-reduce(B) over the COMMON clusters includes 0 --
+    i.e. A and B are statistically tied on the clips both scored. A tie is a POSITIVE statistical
+    claim: with < 2 common clusters it cannot be assessed, so no tie is claimed (False)."""
+    common = sorted(set(keyed_a) & set(keyed_b))
+    if len(common) < 2:
+        return False
+    lo, hi = cluster_bootstrap([keyed_a[g] for g in common], reduce_fn, n_boot, seed,
+                               per_group_b=[keyed_b[g] for g in common])
+    return bool(lo <= 0.0 <= hi)
+
+
+def paired_delta_ci(pairs, n_boot=2000):
+    """95% CI of the mean-over-datasets PAIRED combined-score delta (clean - degraded), in
+    percentage points. `pairs` = per dataset (keyed_clean, keyed_degraded) cluster sums over the
+    SAME probe clips; each bootstrap draw resamples clusters within each dataset (stratified) and
+    applies the same picks to both sides, so shared clip difficulty cancels. Datasets with < 2
+    common clusters cannot be resampled and are skipped. Returns (lo, hi, n_datasets_used)."""
+    per_ds = []
+    for k, (kc, kd) in enumerate(pairs):
+        common = sorted(set(kc) & set(kd))
+        if len(common) < 2:
+            continue
+        per_ds.append(boot_vals([kc[g] for g in common], FRAME_REDUCERS["combined"],
+                                n_boot, seed=k, per_group_b=[kd[g] for g in common]))
+    if not per_ds:
+        return float("nan"), float("nan"), 0
+    vals = np.mean(per_ds, axis=0) * 100.0
+    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5)), len(per_ds)
+
+
+def sum_col(dicts, k):
+    return sum(d[k] for d in dicts)
+
+
+# Frame reducers: recompute the FRAME-weighted aggregate from summed sufficient stats (so CIs match
+# the reported pitch_accuracy.* / combined_score exactly).
+def agg_from_sums(dicts):
+    v = sum_col(dicts, "valid")
+    tp, fp, fn = sum_col(dicts, "tp"), sum_col(dicts, "fp"), sum_col(dicts, "fn")
+    pm = {"rpa": sum_col(dicts, "n_rpa") / v if v else 0.0,
+          "cents_error": sum_col(dicts, "sum_cents") / v if v else 0.0,
+          "octave_error_rate": sum_col(dicts, "n_octave") / v if v else 0.0,
+          "gross_error_rate": sum_col(dicts, "n_gross") / v if v else 0.0}
+    vm = {"precision": tp / (tp + fp) if (tp + fp) else 0.0,
+          "recall": tp / (tp + fn) if (tp + fn) else 0.0}
+    vm["f1"] = 0.0 if (vm["precision"] + vm["recall"]) == 0 else \
+        2 * vm["precision"] * vm["recall"] / (vm["precision"] + vm["recall"])
+    coverage = v / (tp + fn) if (tp + fn) else 0.0
+    return pm, vm, coverage
+
+
+def reduce_combined(ds):
+    pm, vm, _ = agg_from_sums(ds)
+    return calculate_combined_score(vm, pm)
+
+
+FRAME_STAT_COLS = ("valid", "n_rpa", "sum_cents", "n_octave", "n_gross", "tp", "fp", "fn")
+FRAME_REDUCERS = {
+    "combined": reduce_combined,
+    "rpa": lambda ds: agg_from_sums(ds)[0]["rpa"],
+    "voicing_f1": lambda ds: agg_from_sums(ds)[1]["f1"],
+    "coverage": lambda ds: agg_from_sums(ds)[2],
+    "cents_mae": lambda ds: agg_from_sums(ds)[0]["cents_error"],
+}
+
+
+def frame_keyed(pc):
+    """Keyed cluster sums (+ #clips) for one per_clip block's suff-stat columns."""
+    idx = [(c, pc["schema"].index(c)) for c in FRAME_STAT_COLS]
+    return keyed_group_sums(pc["rows"], idx), len(pc["rows"])
+
+
+def ci_cell(value, lo, hi, fmt="{:.3f}"):
+    """A 'value [lo, hi]' markdown cell (shared by the frame + note CI tables). No interval
+    (single cluster, see cluster_bootstrap) renders as '[n/a]'."""
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return f"{fmt.format(value)} [n/a]"
+    return f"{fmt.format(value)} [{fmt.format(lo)}, {fmt.format(hi)}]"
+
+
+def compare_keyed(keyed_a, keyed_b, metric="voicing_f1", n_boot=2000, seed=0):
+    """Paired comparison of two keyed-cluster-sum dicts on their COMMON clusters.
+    Returns (delta, ci_lo, ci_hi): point delta = reduce(A) - reduce(B) over all common clusters,
+    CI from the paired cluster bootstrap. (delta, nan, nan) with < 2 common clusters."""
+    reduce_fn = FRAME_REDUCERS[metric]
+    common = sorted(set(keyed_a) & set(keyed_b))
+    if not common:
+        return float("nan"), float("nan"), float("nan")
+    pa, pb = [keyed_a[g] for g in common], [keyed_b[g] for g in common]
+    delta = float(reduce_fn(pa) - reduce_fn(pb))
+    lo, hi = cluster_bootstrap(pa, reduce_fn, n_boot, seed, per_group_b=pb)
+    return delta, lo, hi
+
+
+def compare(per_clip_a, per_clip_b, metric="voicing_f1", n_boot=2000, seed=0):
+    """Paired comparison of two algorithms from their per_clip blocks (same cell, both scored the
+    same clips). Returns (delta, ci_lo, ci_hi) of A - B on the chosen frame metric."""
+    return compare_keyed(frame_keyed(per_clip_a)[0], frame_keyed(per_clip_b)[0],
+                         metric, n_boot, seed)

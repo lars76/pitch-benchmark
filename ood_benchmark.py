@@ -4,34 +4,22 @@
 Generates synthetic signal families with EXACT, non-circular labels (no pitch detector in the label
 loop) and measures per-family F0 accuracy, so we can say "signal type X breaks tracker Y". Complements
 pitch_benchmark.py (accuracy on real data + label-preserving degradations) and speed_benchmark.py
-(timing); generate_report.py merges all three. Mirrors speed_benchmark.py's structure.
+(timing); generate_report.py merges all three.
 
-Each (tracker, family) cell runs in its OWN subprocess: some C-extension trackers (pyreaper, pysptk)
-ABORT (SIGSEGV/SIGABRT) on degenerate inputs such as a pure sine or an extreme spectral tilt, and
-per-cell isolation keeps one abort from killing the whole run (it is recorded as a crashed cell).
+A pure per-cell measurement library -- evaluate.py orchestrates. NOTE: some C-extension trackers
+(pyreaper, pysptk) ABORT (SIGSEGV/SIGABRT) on these degenerate stimuli (a pure sine, an extreme
+spectral tilt); that is why evaluate runs every ood cell in a child process by default.
 
 Voiced families are scored by RPA (reusing the 11-threshold sweep + metrics.MetricAccumulator from the
 main runner); unvoiced controls, where the correct answer is "no pitch", are scored by false-positive
 rate. Ground truth is exact by construction, which is why the first cut is synthetic-only: OOD is
 exactly where detector-derived labels are least trustworthy.
 """
-import argparse
-import json
-import os
-import subprocess
-import sys
-from datetime import datetime, timezone
-
 import numpy as np
-from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from algorithms import (
-    build_algorithm,
-    get_algorithm,
-    list_algorithms,
-    resolve_requested_algorithms,
-)
+import gc
+
+from algorithms import build_algorithm
 from datasets.augment import item_rng
 from metrics import (
     DEFAULT_THRESHOLDS as THRESHOLDS,
@@ -39,16 +27,12 @@ from metrics import (
 from metrics import (
     MetricAccumulator,
     summarize_threshold_sweep,
-    to_json_safe,
 )
-
-AVAILABLE_ALGORITHMS = list_algorithms()
 
 SR, HOP = 16000, 256
 FMIN, FMAX = 50.0, 2000.0                     # wide common range so the pitch-range axis is not clamped
 NYQ = SR / 2.0
 N = 2 * SR                                   # 2 s per clip
-CELL_TIMEOUT = 300                           # seconds per (tracker, family) subprocess
 
 MECH_F0 = [90.0, 160.0, 250.0, 370.0]        # low-mid grid for the spectral-mechanism families
 BANDS_F0 = {                                 # pitch-range axis (2 f0s/band; reaches ~2 kHz)
@@ -289,121 +273,17 @@ def _score_control(algo, clips):
 
 
 # --------------------------------------------------------------------------- #
-# JSON cells (resumable, one per (tracker, family); mirrors pitch_benchmark.py)
+# The per-cell measurement (pure: no writing, no processes -- evaluate.py owns those)
 # --------------------------------------------------------------------------- #
-def _cell_path(output_dir, algo, family, device):
-    # Device is in the filename so cpu/gpu cells coexist rather than overwrite (mirrors pitch_benchmark).
-    return os.path.join(output_dir, f"ood_{algo}_{family}_{device}_sr{SR // 1000}k_hop{HOP}.json")
-
-
-def _write_cell(output_dir, algo, family, ftype, device, results, crashed=False, error=None):
-    meta = {
-        "benchmark_type": "ood",
-        "algorithm_name": algo,
-        "family": family,
-        "family_type": ftype,
-        "device": device,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-    }
-    if crashed:
-        meta["crashed"] = True
-        meta["error"] = error
-    obj = {
-        "metadata": meta,
-        "parameters": {
-            "sample_rate": SR, "hop_size": HOP, "fmin": FMIN, "fmax": FMAX,
-            "n_seconds": N / SR, "f0s": FAMILIES.get(family, (None, None))[1],
-        },
-        "results": results,
-    }
-    with open(_cell_path(output_dir, algo, family, device), "w") as f:
-        json.dump(to_json_safe(obj), f, indent=2)
-
-
-# --------------------------------------------------------------------------- #
-# Worker (one tracker x one family, isolated) and parent (spawns + records)
-# --------------------------------------------------------------------------- #
-def run_worker(algo, family, output_dir, device):
-    ftype = "control" if family in CONTROL_FAMILIES else "voiced"
-    cls = get_algorithm(algo)
-    algo_obj = build_algorithm(cls, SR, HOP, FMIN, FMAX, device=device)
-    eff_device = cls.resolve_effective_device(device)
+def run_ood_cell(algorithm_class, family, device="auto"):
+    """Score one (tracker, family) cell. Same shape as the other tracks: takes the algorithm
+    CLASS, returns the results dict, touches nothing else."""
+    algo_obj = build_algorithm(algorithm_class, SR, HOP, FMIN, FMAX, device=device)
     clips = make_clips(family)
-    results = _score_control(algo_obj, clips) if ftype == "control" else _score_voiced(algo_obj, clips)
-    _write_cell(output_dir, algo, family, ftype, eff_device, results)
-
-
-def run_parent(algos, output_dir, device):
-    os.makedirs(output_dir, exist_ok=True)
-    # Effective device is part of the filename, so cpu/gpu cells coexist. fail_silently: an uninstalled
-    # backend is left to the worker (which fails and gets recorded as a crashed cell), keeping per-cell
-    # isolation instead of crashing the whole parent. Resolve once per algo, reuse across families.
-    eff = {}
-    for algo in algos:
-        cls = get_algorithm(algo, fail_silently=True)
-        eff[algo] = cls.resolve_effective_device(device) if cls is not None else device
-
-    cells = [(a, f) for a in algos for f in ALL_FAMILIES]
-    counts = {"done": 0, "skip": 0, "crash": 0}
-    # One bar over every (tracker, family) cell; ETA/rate come free. Per-cell crashes/timeouts go to
-    # bar.write so they log above the bar; the running done/skip/crash tally rides in the postfix.
-    bar = tqdm(cells, desc="OOD cells", unit="cell")
-    for algo, family in bar:
-        effective = eff[algo]
-        path = _cell_path(output_dir, algo, family, effective)
-        # Cache-as-done: any existing cell is skipped, a recorded crash included (delete the file to redo).
-        if os.path.exists(path):
-            counts["skip"] += 1
-            bar.set_postfix(**counts)
-            continue
-        ftype = "control" if family in CONTROL_FAMILIES else "voiced"
-        cmd = [
-            sys.executable, os.path.abspath(__file__), "--_worker",
-            "--algo", algo, "--family", family, "--output-dir", output_dir, "--device", device,
-        ]
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=CELL_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            _write_cell(output_dir, algo, family, ftype, effective, {}, crashed=True,
-                        error=f"timeout > {CELL_TIMEOUT}s")
-            counts["crash"] += 1
-            bar.write(f"TIMEOUT {algo}/{family}")
-        else:
-            if not os.path.exists(path):        # worker died (e.g. C-extension abort) before writing
-                tail = (out.stderr.strip().splitlines() or ["(no stderr)"])[-3:]
-                _write_cell(output_dir, algo, family, ftype, effective, {}, crashed=True,
-                            error=f"exit {out.returncode}: " + " | ".join(tail))
-                counts["crash"] += 1
-                bar.write(f"CRASH {algo}/{family} (exit {out.returncode})")
-            else:
-                counts["done"] += 1
-        bar.set_postfix(**counts)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Synthetic OOD generalization test for pitch trackers.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--algorithms", type=str, nargs="+", default=None, choices=AVAILABLE_ALGORITHMS,
-                        help="Algorithms to test (default: every installed algorithm).")
-    parser.add_argument("--output-dir", type=str, default="results", help="Directory for result JSONs.")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="Device for device-aware trackers (auto, matching pitch_benchmark).")
-    # Hidden worker plumbing (parent re-invokes itself per cell for crash isolation).
-    parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--algo", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--family", type=str, default=None, help=argparse.SUPPRESS)
-    args = parser.parse_args()
-
-    if args._worker:
-        run_worker(args.algo, args.family, args.output_dir, args.device)
-        return
-
-    algos = resolve_requested_algorithms(args.algorithms, on_empty=parser.error)
-    print(f"OOD probe: {len(algos)} algorithms x {len(ALL_FAMILIES)} families -> {args.output_dir}")
-    run_parent(algos, args.output_dir, args.device)
-
-
-if __name__ == "__main__":
-    main()
+    if family in CONTROL_FAMILIES:
+        results = _score_control(algo_obj, clips)
+    else:
+        results = _score_voiced(algo_obj, clips)
+    del algo_obj
+    gc.collect()
+    return results

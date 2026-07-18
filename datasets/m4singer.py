@@ -31,6 +31,9 @@ class PitchDatasetM4Singer(PitchDataset):
         root_dir (str): the m4singer root (holds `meta.json` + one dir per `singer#song`).
         use_cache (bool): cache decoded samples. Defaults to True.
     """
+    # Caveat: score-grade GT (the intended note, not the performed f0) -- voicing labels are
+    # reliable, pitch-accuracy labels are not; the report excludes it from accuracy/note
+    # leaderboards (generate_report.VOICING_ONLY).
 
     # Has note intervals (score MIDI), so the CAPABILITY is present -- but the note leaderboard
     # EXCLUDES M4Singer by runner/report policy (score-grade GT, not 50ms/50c reference). Capability

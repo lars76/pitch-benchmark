@@ -270,8 +270,9 @@ class PitchDatasetSpeechSynth(PitchDataset):
     in the dio/harvest extras and in --all-extras).
 
     Args:
-        root_dir (str): Path to the TTS model checkpoint (LightSpeech architecture).
-            Defaults to "datasets/speechsynth.pt".
+        root_dir (str): Path to the TTS model checkpoint (LightSpeech architecture). The
+            checkpoint ships committed with the benchmark repo (datasets/speechsynth.pt);
+            evaluate.py supplies that path automatically (evaluate.BUNDLED).
         samples_per_speaker (int): Number of samples per speaker. Defaults to 1
         word_range (Tuple): Range of words per generated sample. Defaults to (3, 9)
         periodicity_threshold (float): Threshold for periodicity detection. Defaults to 0.4
@@ -291,7 +292,7 @@ class PitchDatasetSpeechSynth(PitchDataset):
 
     def __init__(
         self,
-        root_dir: str = "datasets/speechsynth.pt",
+        root_dir: str,
         samples_per_speaker: int = 1,
         word_range: tuple = (3, 9),
         periodicity_threshold: float = 0.4,
