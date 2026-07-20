@@ -4,32 +4,32 @@ A comprehensive benchmark suite evaluating pitch detection algorithms across dat
 
 ## Which Algorithm Should I Use?
 
-**TL;DR Recommendations:**
-- **Best Overall**: **SwiftF0** (90.2% accuracy, 90× faster than CREPE)
-- **Need Maximum Speed**: **Praat** (2.8ms per second of audio, 84.7% accuracy)
-- **Best Pitch Accuracy**: **CREPE** (85.3% accuracy, best RPA/RCA but slow and not good on all metrics)
-- **Best Human singing**: **RMVPE** (87.2% accuracy, best on Vocadito and MIR-1K)
+> **v2 rebuild in progress.** The scoring system was rewritten (see
+> [Benchmark Report](benchmark_report.md) for the metric definitions); every algorithm
+> is being re-measured under it. The table below lists only trackers with a complete
+> v2 run — more are added as they finish, so treat it as a growing leaderboard, not a
+> final ranking.
+
+**From the trackers measured so far:**
+- **Best overall**: **Praat** — no weak axis, and the fastest of the two.
+- **Best on real recordings**: **RMVPE** — leads on clean accuracy and is by far the
+  most noise-robust, but it collapses on synthetic signal classes (pure tones,
+  missing-fundamental, IRN) that it never saw in training. If your audio is real
+  speech or music, that weakness may not reach you; if you feed it synthesised or
+  degenerate signals, it will.
+
+That contrast is the point of the multi-track design: one number cannot tell you
+whether a tracker is strong everywhere or excellent in one place and broken in
+another. Read the track columns, not just the overall.
 
 ## Overall Results
 
-The table below shows the harmonic-mean accuracy score for each algorithm across the seven benchmark datasets. The average score determines the overall ranking.
+The overall score is the harmonic mean of the seven track scores (see the benchmark report for definitions and diagnostics).
 
-| **Algorithm** | **Bach10Synth** | **MDBStemSynth** | **MIR1K** | **NSynth** | **PTDB** | **SpeechSynth** | **Vocadito** | **Average** |
+| **Algorithm** | **Overall** | **Accuracy** | **Noise** | **Signals** | **Stability** | **Dynamics** | **Notes** | **Speed** |
 |---|---|---|---|---|---|---|---|---|
-| **SwiftF0** | 97.5% | 92.0% | 95.0% | **89.3%** | 90.4% | **90.7%** | 92.6% | **90.2%** |
-| RMVPE | 98.1% | 90.6% | **96.0%** | 68.2% | 88.9% | 90.6% | **96.4%** | 87.2% |
-| CREPE | **98.5%** | 90.5% | 95.7% | 80.2% | 79.7% | 88.3% | 95.6% | 85.3% |
-| PENN | 97.3% | **94.0%** | 89.0% | 63.3% | **91.0%** | 84.8% | 82.4% | 84.8% |
-| Praat | 96.0% | 90.7% | 92.6% | 70.7% | 86.2% | 88.2% | 88.2% | 84.7% |
-| SPICE | 95.0% | 89.4% | 92.7% | 68.8% | 77.8% | 87.9% | 92.3% | 82.5% |
-| TorchCREPE | 96.7% | 85.1% | 71.4% | 83.8% | 78.3% | 79.7% | 89.0% | 80.6% |
-| pYIN | 97.5% | 90.3% | 91.2% | 74.3% | 72.1% | 81.4% | 79.5% | 78.7% |
-| RAPT | 91.9% | 79.6% | 82.4% | 54.6% | 68.4% | 74.3% | 87.5% | 73.5% |
-| SWIPE | 77.8% | 65.6% | 77.1% | 51.4% | 66.6% | 77.1% | 66.6% | 65.9% |
-| YAAPT | 58.5% | 39.6% | 82.0% | 6.4% | 69.8% | 83.5% | 88.6% | 60.0% |
-| BasicPitch | 23.7% | 12.4% | 36.5% | 77.7% | 23.1% | 61.2% | 17.8% | 33.1% |
-
-For a detailed breakdown of results, see [Benchmark Report](benchmark_report.md).
+| Praat | 0.871 | 0.827 | 0.666 | 0.953 | 0.995 | 0.987 | 0.793 | 0.997 |
+| RMVPE | 0.784 | 0.845 | 0.895 | 0.471 | 0.993 | 0.949 | 0.785 | 0.853 |
 
 ## Running Your Own Benchmarks
 

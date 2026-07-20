@@ -2,8 +2,8 @@
 """THE benchmark: the one entry point, the one orchestrator.
 
 The benchmark = every registered dataset x every condition x four tracks
-(frame, note, ood, speed), evaluated as ATOMIC CELLS, one (track, dataset-or-family,
-condition, algorithm) unit each. The track modules (pitch/note/ood/speed_benchmark) are pure
+(frame, note, synthetic, speed), evaluated as ATOMIC CELLS, one (track, dataset-or-family,
+condition, algorithm) unit each. The track modules (frame/note/synthetic/speed_benchmark) are pure
 measurement libraries; THIS module owns everything else: cell enumeration, dataset paths,
 filenames, result envelopes, cache-as-done, crash recording, process isolation, and the worker
 pool. If the question is "who spawns / who names / who caches / who writes", the answer is
@@ -31,7 +31,7 @@ Execution policy (the whole table):
                over ONE shared dataset instance (decode + degradation synthesis paid once per
                group, measured as the only redundancy worth avoiding). workers>1: one child
                process per cell (isolation for free; resume can't livelock).
-  ood          cache-as-done; cells ALWAYS run in child processes (the synthetic stimuli are
+  synthetic    cache-as-done; cells ALWAYS run in child processes (the synthetic stimuli are
                exactly what makes some C-extension trackers SIGSEGV), except custom
                classes, which cannot exist in a fresh interpreter and run in-process.
   speed        always overwrites (timing depends on machine state; a stale cached number is
@@ -67,9 +67,20 @@ from tqdm import tqdm
 
 import metrics
 import note_benchmark
-import ood_benchmark
-import pitch_benchmark
+import synthetic_benchmark
+import frame_benchmark
 import speed_benchmark
+# The scoring layer, re-exported: evaluate is the ONE import surface for consumers.
+from metrics import (  # noqa: F401
+    FRAME_REDUCERS,
+    PITCH_TOLERANCES,
+    T_MAX,
+    factorization,
+    overall,
+    pitch_prf_from_cells,
+    theta_star,
+    track_scores,
+)
 from algorithms import PitchAlgorithm, get_algorithm, get_available_algorithms
 from datasets import (
     Augment,
@@ -94,7 +105,7 @@ from datasets.augment import REGISTRY as CONDITION_REGISTRY
 # Everything below this section is execution machinery, not definition.
 # ---------------------------------------------------------------------------- #
 CONDITIONS = tuple(CONDITION_REGISTRY)
-TRACKS = ("frame", "note", "ood", "speed")
+TRACKS = ("frame", "note", "synthetic", "speed")
 
 
 # Data that ships committed inside this repo (no download, no user path needed).
@@ -172,9 +183,9 @@ def note_cell_filename(algo, dataset, condition, seed=42):
     return f"notes_{algo}_{dataset}_{condition}_seed{seed}.json"
 
 
-def ood_cell_filename(algo, family, device):
-    return (f"ood_{algo}_{family}_{device}_"
-            f"sr{ood_benchmark.SR // 1000}k_hop{ood_benchmark.HOP}.json")
+def synthetic_cell_filename(algo, family, device):
+    return (f"synthetic_{algo}_{family}_{device}_"
+            f"sr{synthetic_benchmark.SR // 1000}k_hop{synthetic_benchmark.HOP}.json")
 
 
 def speed_cell_filename(algo, sample_rate, hop_length, signal_length_sec, n_runs):
@@ -189,7 +200,8 @@ def write_cell(result_path, metadata, parameters, results):
     obj = {"metadata": metadata, "parameters": parameters, "results": results}
     tmp_path = f"{result_path}.{os.getpid()}.tmp"    # per-process: concurrent writers cannot collide
     with open(tmp_path, "w") as f:
-        json.dump(metrics.to_json_safe(obj), f, indent=4)
+        # compact: per-threshold per-clip stats make cells big; indented arrays would 4x them
+        json.dump(metrics.to_json_safe(obj), f, separators=(",", ":"))
     os.replace(tmp_path, result_path)
 
 
@@ -210,10 +222,10 @@ def enumerate_cells(algos, *, datasets=None, conditions=None, tracks=TRACKS,
     unknown = set(conds) - set(CONDITION_REGISTRY)
     if unknown:
         raise ValueError(f"unknown conditions: {sorted(unknown)}")
-    fams = tuple(families or ood_benchmark.ALL_FAMILIES)
-    unknown = set(fams) - set(ood_benchmark.ALL_FAMILIES)
+    fams = tuple(families or synthetic_benchmark.ALL_FAMILIES)
+    unknown = set(fams) - set(synthetic_benchmark.ALL_FAMILIES)
     if unknown:
-        raise ValueError(f"unknown ood families: {sorted(unknown)}")
+        raise ValueError(f"unknown synthetic families: {sorted(unknown)}")
     cells = []
     if "frame" in tracks:
         for c in conds:                                  # clean first (never capped)
@@ -227,10 +239,10 @@ def enumerate_cells(algos, *, datasets=None, conditions=None, tracks=TRACKS,
                 continue
             for a in algos:
                 cells.append(dict(track="note", dataset=d, condition="clean", algo=a))
-    if "ood" in tracks:
+    if "synthetic" in tracks:
         for f in fams:
             for a in algos:
-                cells.append(dict(track="ood", dataset=f, condition=None, algo=a))
+                cells.append(dict(track="synthetic", dataset=f, condition=None, algo=a))
     if "speed" in tracks:
         for a in algos:
             cells.append(dict(track="speed", dataset=None, condition=None, algo=a))
@@ -288,9 +300,9 @@ def run_and_write_frame_cell(eval_dataset, cls, *, out_dir, dataset, condition, 
         return path
     t0 = time.time()
     if cls is None:
-        result, crashed = pitch_benchmark._failure_dict(0), True
+        result, crashed = frame_benchmark._failure_dict(0), True
     else:
-        result, crashed = pitch_benchmark.run_single_evaluation(
+        result, crashed = frame_benchmark.run_single_evaluation(
             dataset=eval_dataset, algorithm_class=cls,
             thresholds=metrics.DEFAULT_THRESHOLDS, device=device)
     write_cell(
@@ -308,9 +320,10 @@ def run_and_write_frame_cell(eval_dataset, cls, *, out_dir, dataset, condition, 
         },
         results=result,
     )
-    score, thr = result.get("combined_score"), result.get("optimal_threshold")
+    sweep = result.get("sweep") or []
+    peak = max((e["pitch_f"]["f50"] for e in sweep if e.get("pitch_f")), default=None)
     status = "CRASHED" if crashed else (
-        f"score={score:.4f} @ thr={thr:.2f}" if score is not None and thr is not None else "empty")
+        f"F@50(peak)={peak:.4f}" if peak is not None else "empty")
     print(f"[frame] {dataset}/{condition} {algo_name}: {status} "
           f"({time.time() - t0:.1f}s) -> {os.path.basename(path)}")
     return path
@@ -424,9 +437,9 @@ def _run_note_cell(eval_dataset, algo_name, cls, dataset, cond, thresholds, out_
           f"({time.time() - t0:.1f}s) -> {os.path.basename(path)}")
 
 
-def _write_ood_cell(out_dir, algo, family, ftype, device, results, crashed=False, error=None):
+def _write_synthetic_cell(out_dir, algo, family, ftype, device, results, crashed=False, error=None):
     meta = {
-        "benchmark_type": "ood", "algorithm_name": algo, "family": family,
+        "benchmark_type": "synthetic", "algorithm_name": algo, "family": family,
         "family_type": ftype, "device": device,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -434,59 +447,59 @@ def _write_ood_cell(out_dir, algo, family, ftype, device, results, crashed=False
         meta["crashed"] = True
         meta["error"] = error
     write_cell(
-        os.path.join(out_dir, ood_cell_filename(algo, family, device)),
+        os.path.join(out_dir, synthetic_cell_filename(algo, family, device)),
         metadata=meta,
         parameters={
-            "sample_rate": ood_benchmark.SR, "hop_size": ood_benchmark.HOP,
-            "fmin": ood_benchmark.FMIN, "fmax": ood_benchmark.FMAX,
-            "n_seconds": ood_benchmark.N / ood_benchmark.SR,
-            "f0s": ood_benchmark.FAMILIES.get(family, (None, None))[1],
+            "sample_rate": synthetic_benchmark.SR, "hop_size": synthetic_benchmark.HOP,
+            "fmin": synthetic_benchmark.FMIN, "fmax": synthetic_benchmark.FMAX,
+            "n_seconds": synthetic_benchmark.N / synthetic_benchmark.SR,
+            "f0s": synthetic_benchmark.FAMILIES.get(family, (None, None))[1],
         },
         results=results,
     )
 
 
-def _run_one_ood_cell(cell, *, out_dir, device, in_process, cls_map):
-    """One ood cell: 'skip' | None (done) | a crash kind (recorded)."""
+def _run_one_synthetic_cell(cell, *, out_dir, device, in_process, cls_map):
+    """One synthetic cell: 'skip' | None (done) | a crash kind (recorded)."""
     cls = cls_map[cell["algo"]]
     algo, family = cell["algo"], cell["dataset"]
     eff = cls.resolve_effective_device(device) if cls is not None else device
-    ftype = ood_benchmark.family_type(family)
-    path = os.path.join(out_dir, ood_cell_filename(algo, family, eff))
+    ftype = synthetic_benchmark.family_type(family)
+    path = os.path.join(out_dir, synthetic_cell_filename(algo, family, eff))
     if os.path.exists(path):     # cache-as-done
         return "skip"
     if in_process:
         try:
             if cls is None:
                 raise RuntimeError(f"algorithm {algo} is not installed")
-            _write_ood_cell(out_dir, algo, family, ftype, eff,
-                            ood_benchmark.run_ood_cell(cls, family, device))
+            _write_synthetic_cell(out_dir, algo, family, ftype, eff,
+                            synthetic_benchmark.run_synthetic_cell(cls, family, device))
             return None
         except Exception as e:
-            _write_ood_cell(out_dir, algo, family, ftype, eff, {}, crashed=True, error=str(e))
+            _write_synthetic_cell(out_dir, algo, family, ftype, eff, {}, crashed=True, error=str(e))
             return str(e)
     # ood needs no data paths, and its stimuli are seed-frozen by design (item_rng with fixed
     # family ids), the child's --seed is unused, so any value works here.
     return _spawn_cell(cell, paths=None, root=None, out_dir=out_dir, device=device, seed=42,
                        cap={}, expected=path,
                        on_crash=lambda k, _a=algo, _f=family, _t=ftype, _e=eff:
-                           _write_ood_cell(out_dir, _a, _f, _t, _e, {},
+                           _write_synthetic_cell(out_dir, _a, _f, _t, _e, {},
                                            crashed=True, error=k))
 
 
-def _run_ood_cells(cells, *, out_dir, device, in_process, cls_map):
+def _run_synthetic_cells(cells, *, out_dir, device, in_process, cls_map):
     if not cells:
         return
     counts = {"done": 0, "skip": 0, "crash": 0}
-    bar = tqdm(cells, desc="[ood] cells", unit="cell")
+    bar = tqdm(cells, desc="[synthetic] cells", unit="cell")
     for cell in bar:
-        kind = _run_one_ood_cell(cell, out_dir=out_dir, device=device,
+        kind = _run_one_synthetic_cell(cell, out_dir=out_dir, device=device,
                                  in_process=in_process, cls_map=cls_map)
         if kind == "skip":
             counts["skip"] += 1
         elif kind:
             counts["crash"] += 1
-            bar.write(f"[ood] CRASH {cell['algo']}/{cell['dataset']} ({kind})")
+            bar.write(f"[synthetic] CRASH {cell['algo']}/{cell['dataset']} ({kind})")
         else:
             counts["done"] += 1
         bar.set_postfix(**counts)
@@ -558,12 +571,12 @@ def _spawn_cell(cell, *, paths, root, out_dir, device, seed, cap, expected, on_c
         cmd += ["--data", *specs]
         if cell["track"] == "frame":
             cmd += ["--conditions", cell["condition"]]
-    elif cell["track"] == "ood":
+    elif cell["track"] == "synthetic":
         cmd += ["--families", cell["dataset"]]
     # Only ood cells get a timeout: their runtime is known and bounded (fixed 2-s synthetic
     # clips) AND their stimuli are what makes fragile C-extension trackers hang. Frame/note
     # runtimes are data x algorithm dependent; any fixed bound would kill honest work.
-    timeout = 300 if cell["track"] == "ood" else None
+    timeout = 300 if cell["track"] == "synthetic" else None
     kind = None
     try:
         r = subprocess.run(cmd, env=env, cwd=REPO, timeout=timeout)
@@ -587,7 +600,7 @@ def _expected_path(cell, out_dir, device, seed, cap, cls):
     if cell["track"] == "note":
         return os.path.join(out_dir, note_cell_filename(
             cell["algo"], cell["dataset"], cell["condition"], seed))
-    return os.path.join(out_dir, ood_cell_filename(cell["algo"], cell["dataset"], eff))
+    return os.path.join(out_dir, synthetic_cell_filename(cell["algo"], cell["dataset"], eff))
 
 
 def _crash_writer(cell, out_dir, device, seed, cap, cls):
@@ -603,7 +616,7 @@ def _crash_writer(cell, out_dir, device, seed, cap, cls):
                           "timestamp_utc": datetime.now(timezone.utc).isoformat()},
                 parameters={"max_samples": cap.get("max_samples"),
                             "max_seconds": cap.get("max_seconds")},
-                results=pitch_benchmark._failure_dict(0))
+                results=frame_benchmark._failure_dict(0))
         elif cell["track"] == "note":
             write_cell(
                 _expected_path(cell, out_dir, device, seed, cap, cls),
@@ -635,7 +648,7 @@ def run_cells(algos, *, paths=None, root=None, max_samples=30, max_seconds=10.0,
     os.makedirs(out_dir, exist_ok=True)
     frame_cells = [c for c in cells if c["track"] == "frame"]
     note_cells = [c for c in cells if c["track"] == "note"]
-    ood_cells = [c for c in cells if c["track"] == "ood"]
+    synthetic_cells = [c for c in cells if c["track"] == "synthetic"]
     speed_cells = [c for c in cells if c["track"] == "speed"]
     if cap and frame_cells and any(c["condition"] == "clean" for c in frame_cells):
         print("[frame] note: clean cells always run FULL (plus one probe-sized clean baseline "
@@ -652,20 +665,20 @@ def run_cells(algos, *, paths=None, root=None, max_samples=30, max_seconds=10.0,
             cell_cap = _cell_cap(cell, cap)
             expected = _expected_path(cell, out_dir, device, seed, cell_cap,
                                       cls_map[cell["algo"]])
-            if cell["track"] != "ood" and os.path.exists(expected):
+            if cell["track"] != "synthetic" and os.path.exists(expected):
                 return
-            if cell["track"] == "ood":
-                kind = _run_one_ood_cell(cell, out_dir=out_dir, device=device,
+            if cell["track"] == "synthetic":
+                kind = _run_one_synthetic_cell(cell, out_dir=out_dir, device=device,
                                          in_process=False, cls_map=cls_map)
                 if kind and kind != "skip":
-                    print(f"[ood] CRASH {cell['algo']}/{cell['dataset']} ({kind})")
+                    print(f"[synthetic] CRASH {cell['algo']}/{cell['dataset']} ({kind})")
                 return
             _spawn_cell(cell, paths=paths, root=root, out_dir=out_dir, device=device,
                         seed=seed, cap=cell_cap, expected=expected,
                         on_crash=_crash_writer(cell, out_dir, device, seed, cell_cap,
                                                cls_map[cell["algo"]]))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(_child, frame_cells + note_cells + ood_cells))
+            list(pool.map(_child, frame_cells + note_cells + synthetic_cells))
         _run_probe_clean_baselines(frame_cells, paths=paths, root=root, out_dir=out_dir,
                                    device=device, seed=seed, run_cap=cap, cls_map=cls_map)
     else:
@@ -676,7 +689,7 @@ def run_cells(algos, *, paths=None, root=None, max_samples=30, max_seconds=10.0,
                                    _inproc=_inproc)
         _run_note_cells(note_cells, paths=paths, root=root, out_dir=out_dir,
                         device=device, seed=seed, cls_map=cls_map)
-        _run_ood_cells(ood_cells, out_dir=out_dir, device=device,
+        _run_synthetic_cells(synthetic_cells, out_dir=out_dir, device=device,
                        in_process=(custom or _inproc), cls_map=cls_map)
     _run_speed_cells(speed_cells, out_dir=out_dir, device=device, cls_map=cls_map)
     return load_cells(out_dir, algos=names)
@@ -701,24 +714,28 @@ def load_cells(results_dir, algos=None):
             continue
         if m.get("track") == "notes":
             key = ("note", m.get("dataset_name"), m.get("condition", "clean"), algo)
-        elif m.get("benchmark_type") == "ood":
-            key = ("ood", m.get("family"), None, algo)
+        elif m.get("benchmark_type") == "synthetic":
+            key = ("synthetic", m.get("family"), None, algo)
         elif m.get("benchmark_type") == "speed":
             key = ("speed", None, None, algo)
         elif m.get("dataset_name"):
             key = ("frame", m.get("dataset_name"), m.get("condition"), algo)
-            # The clean-probe BASELINE (report-only, for Delta-from-clean pairing) shares this
-            # key with the full clean leaderboard cell: the full cell always wins, explicitly --
-            # not by glob order.
-            if key in cells and m.get("probe") and not cells[key]["metadata"].get("probe"):
-                continue
+            # The clean-probe BASELINE keeps its own key (the Noise track pairs it with the
+            # equally probe-sized degraded cells); the full clean cell owns the "clean" key.
+            if m.get("condition") == "clean" and m.get("probe"):
+                other = cells.get(key)
+                if other is not None and not other["metadata"].get("probe"):
+                    key = ("frame", m.get("dataset_name"), "clean_probe", algo)
+            elif m.get("condition") == "clean" and key in cells \
+                    and cells[key]["metadata"].get("probe"):
+                cells[("frame", m.get("dataset_name"), "clean_probe", algo)] = cells[key]
         else:
             continue
         cells[key] = d
     return cells
 
 
-def assert_full(cells, algos, *, datasets=None, conditions=None, tracks=("frame", "note"),
+def assert_full(cells, algos, *, datasets=None, conditions=None, tracks=("frame", "note", "synthetic"),
                 skip_datasets=()):
     """Certify that `cells` IS the full benchmark for `algos`: every expected cell present and
     no probe-sized cell anywhere. A subset cannot masquerade as the full benchmark."""
@@ -726,7 +743,7 @@ def assert_full(cells, algos, *, datasets=None, conditions=None, tracks=("frame"
     missing, probed = [], []
     for cell in enumerate_cells(names, datasets=datasets, conditions=conditions,
                                 tracks=tracks, skip_datasets=skip_datasets):
-        if cell["track"] not in ("frame", "note"):
+        if cell["track"] not in ("frame", "note", "synthetic"):
             continue
         key = (cell["track"], cell["dataset"], cell["condition"], cell["algo"])
         got = cells.get(key)
@@ -742,22 +759,34 @@ def assert_full(cells, algos, *, datasets=None, conditions=None, tracks=("frame"
         )
 
 
-def compare(cells, algo_a, algo_b, metric="voicing_f1", *, datasets=None, conditions=None):
+def compare(cells, algo_a, algo_b, metric="pitch_f", *, theta="star", datasets=None,
+            conditions=None):
     """Paired cluster-bootstrap comparison of two algorithms POOLED over every frame cell both
-    completed (optionally narrowed). Clusters are (dataset, condition, group), so correlated
-    clips stay together and shared clip difficulty cancels. Returns (delta, lo, hi) of A - B."""
+    completed (optionally narrowed), each read at its own operating point (theta="star" =
+    each algorithm's frozen theta*; a float pins both to one shared threshold). Clusters are
+    (dataset, condition, group), so correlated clips stay together and shared clip difficulty
+    cancels. Returns (delta, lo, hi) of A - B."""
+    idxs = {}
+    for algo in (algo_a, algo_b):
+        if theta == "star":
+            idxs[algo] = metrics.theta_star(cells, algo, datasets=datasets)["idx"]
+        else:
+            grid = list(metrics.DEFAULT_THRESHOLDS)
+            idxs[algo] = int(np.argmin(np.abs(np.asarray(grid) - float(theta))))
+        if idxs[algo] is None:
+            return float("nan"), float("nan"), float("nan")
     keyed = {algo_a: {}, algo_b: {}}
     for (track, ds, cond, algo), cell in cells.items():
-        if track != "frame" or algo not in keyed:
+        if track != "frame" or algo not in keyed or cond == "clean_probe":
             continue
         if (datasets and ds not in datasets) or (conditions and cond not in conditions):
             continue
         if cell.get("metadata", {}).get("crashed"):
             continue
         pc = cell.get("results", {}).get("per_clip")
-        if not pc or not pc.get("rows"):
+        if not pc or not pc.get("stats"):
             continue
-        k, _n = metrics.frame_keyed(pc)
+        k, _n = metrics.frame_keyed(pc, idxs[algo])
         for g, sums in k.items():
             keyed[algo][(ds, cond, g)] = sums
     return metrics.compare_keyed(keyed[algo_a], keyed[algo_b], metric)
@@ -791,7 +820,7 @@ def main():
     p.add_argument("--datasets", nargs="+", default=None)
     p.add_argument("--conditions", nargs="+", default=None, choices=CONDITIONS)
     p.add_argument("--families", nargs="+", default=None,
-                   choices=ood_benchmark.ALL_FAMILIES)
+                   choices=synthetic_benchmark.ALL_FAMILIES)
     p.add_argument("--skip-datasets", nargs="+", default=[])
     p.add_argument("--report", action="store_true",
                    help="Generate the markdown report from --output-dir after the run")

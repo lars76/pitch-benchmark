@@ -15,6 +15,7 @@ Also prints a ready-to-paste `corpus_stats` Python block for generate_report.py 
 hardcoded copy so it never needs the raw datasets at report time); paste it over the existing list.
 """
 import argparse
+import json
 import os
 import sys
 
@@ -107,6 +108,9 @@ def measure(name, data_dir):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="dataset_stats.md")
+    ap.add_argument("--json", default=None,
+                    help="also write machine-readable stats (generate_report.py reads "
+                         "dataset_stats.json from the repo root)")
     args = ap.parse_args()
 
     band_ranges = {name: band_label(lo, hi) for name, lo, hi in PITCH_BANDS}
@@ -137,6 +141,11 @@ def main():
     with open(args.out, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"\nwrote {args.out}")
+    if args.json:
+        payload = [{"name": name, "domain": domain, **s} for name, domain, s in rows]
+        with open(args.json, "w") as f:
+            json.dump(payload, f, indent=1)
+        print(f"wrote {args.json}")
     print("\n".join(lines))
 
     # Ready-to-paste block for generate_report.py:corpus_stats (its schema, its column order), so

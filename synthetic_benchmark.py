@@ -26,7 +26,7 @@ from metrics import (
 )
 from metrics import (
     MetricAccumulator,
-    summarize_threshold_sweep,
+    sweep_summary,
 )
 
 SR, HOP = 16000, 256
@@ -48,6 +48,8 @@ LEVEL_F0 = 160.0     # a MECH_F0 member: every tracker is competent here at nomi
                      # drop under attenuation isolates LEVEL, not pitch range
 INTERF_DB = (-20.0, -10.0, -5.0)   # interfering-source level RELATIVE to the dominant source
 INTERF_F0 = 50.0                   # the interfering source's f0 (a 50 Hz tone + 2nd harmonic)
+VIB_F0 = 220.0                     # trajectory-family carrier for the vibrato dynamics probes
+VIB_RATE_HZ = 6.0                  # vibrato rate (typical vocal/instrumental FM)
 CONTROL_KINDS = ("noise", "whisper", "silence")
 FAMILIES = {
     "missing_f0":   ("missing_f0", MECH_F0),
@@ -75,9 +77,19 @@ FAMILIES = {
     "harm_level":   ("level_harm", None),             # absolute-level sweep (harmonic tone)
     "interference": ("interference", None),           # two periodic sources; follow the dominant
     "silence":      ("silence", None),                # near-silence FP control
+    # Trajectory families (the Dynamics track; the two axes the pilot showed discriminate).
+    # Scored by response readouts (jitter/bias, depth retention), not accuracy.
+    "steady_sine":  ("steady_sine", (110.0, 220.0, 440.0)),
+    "steady_harm":  ("steady_harm", (110.0, 220.0, 440.0)),
+    "vib_half":     ("vib", 0.5),                     # semitone vibrato depth @ 6 Hz
+    "vib_one":      ("vib", 1.0),
+    "vib_two":      ("vib", 2.0),
 }
-VOICED_FAMILIES = [n for n, (k, _) in FAMILIES.items() if k not in CONTROL_KINDS]
+TRAJECTORY_KINDS = ("steady_sine", "steady_harm", "vib")
+VOICED_FAMILIES = [n for n, (k, _) in FAMILIES.items()
+                   if k not in CONTROL_KINDS and k not in TRAJECTORY_KINDS]
 CONTROL_FAMILIES = [n for n, (k, _) in FAMILIES.items() if k in CONTROL_KINDS]
+TRAJECTORY_FAMILIES = [n for n, (k, _) in FAMILIES.items() if k in TRAJECTORY_KINDS]
 ALL_FAMILIES = list(FAMILIES)
 
 
@@ -197,12 +209,19 @@ _FAMILY_IDS = {
     "vibrato_fast": 17, "whisper": 18,
     "glide": 19,
     "harm_bass": 20, "sine_level": 21, "harm_level": 22, "interference": 23, "silence": 24,
+    "steady_sine": 25, "steady_harm": 26, "vib_half": 27, "vib_one": 28, "vib_two": 29,
 }
 
 
 def family_type(name):
-    """The one routing rule: control (FP-rate) or voiced (coverage-aware RPA)."""
-    return "control" if FAMILIES[name][0] in CONTROL_KINDS else "voiced"
+    """The one routing rule: control (FP-rate), trajectory (response readouts), or
+    stationary (coverage-aware pitch recall)."""
+    kind = FAMILIES[name][0]
+    if kind in CONTROL_KINDS:
+        return "control"
+    if kind in TRAJECTORY_KINDS:
+        return "trajectory"
+    return "stationary"
 
 
 def _family_id(family):
@@ -224,6 +243,20 @@ def make_clips(family):
     if kind == "vibrato":
         t = np.arange(N) / SR
         ft = 220.0 * 2 ** (1.0 / 12 * np.sin(2 * np.pi * 6 * t))     # +-1 semitone at 6 Hz
+        return [_voiced_clip(ft, _harm_parts(ft, lambda k: 1.0 / k))]
+
+    if kind in ("steady_sine", "steady_harm"):
+        amp = (lambda k: 1.0 if k == 1 else 0.0) if kind == "steady_sine" else (lambda k: 1.0 / k)
+        clips = []
+        for f0 in f0_list:
+            ft = np.full(N, float(f0))
+            clips.append(_voiced_clip(ft, _harm_parts(ft, amp)))
+        return clips
+
+    if kind == "vib":
+        t = np.arange(N) / SR
+        depth = float(f0_list)                                        # semitones @ VIB_RATE_HZ
+        ft = VIB_F0 * 2 ** (depth / 12 * np.sin(2 * np.pi * VIB_RATE_HZ * t))
         return [_voiced_clip(ft, _harm_parts(ft, lambda k: 1.0 / k))]
 
     if kind == "glide":
@@ -289,8 +322,10 @@ def make_clips(family):
 # --------------------------------------------------------------------------- #
 # Scoring (reuses metrics.MetricAccumulator + the 11-threshold sweep)
 # --------------------------------------------------------------------------- #
-def _score_voiced(algo, clips):
-    """Sweep 11 voicing thresholds, pick the best combined score; emit pitch_benchmark-shaped metrics."""
+def _score_stationary(algo, clips):
+    """Per-threshold sweep block; the family's accuracy IS pitch_f.r50 (correct frames over
+    ALL ground-truth-voiced frames, coverage-aware: it drops when a tracker copes with a hard
+    signal by refusing to voice it). No per-cell threshold selection."""
     accs = [MetricAccumulator() for _ in THRESHOLDS]
     for x, f0f, vf in clips:
         results = algo.extract_pitch(x, thresholds=list(THRESHOLDS), compute_notes=False)
@@ -299,21 +334,63 @@ def _score_voiced(algo, clips):
             pv = np.asarray(pv, dtype=bool)
             L = min(len(pp), len(f0f))                # trackers differ by a frame; align by min length
             acc.update(pp[:L], pv[:L], f0f[:L], vf[:L])
+    return {"thresholds": [float(t) for t in THRESHOLDS],
+            "sweep": sweep_summary(accs, THRESHOLDS)}
 
-    best_idx, best_metrics = summarize_threshold_sweep(accs, THRESHOLDS)
-    if best_idx < 0:
-        return {"ood_accuracy": float("nan")}
-    # Coverage-aware accuracy: correct frames / ALL ground-truth-voiced frames (tp + fn). Unlike the
-    # conditional pitch_accuracy.rpa (only over frames the tracker chose to voice), this DROPS when a
-    # tracker copes with a hard signal by refusing to voice it, the OOD failure we care about. GT is
-    # all-voiced here, so it is "fraction of frames voiced AND within 50 cents of f0".
-    best = accs[best_idx]
-    p = best.pitch_metrics()
-    gt_voiced = best.tp + best.fn
-    rpa = p["rpa"]
-    n_correct = 0.0 if (rpa is None or np.isnan(rpa)) else rpa * p["valid_frames"]
-    best_metrics["ood_accuracy"] = float(n_correct / gt_voiced) if gt_voiced > 0 else float("nan")
-    return best_metrics
+
+def _score_trajectory(algo, family, clips):
+    """Response readouts per threshold. Steady families: jitter (cents std around the mean
+    error) and bias (mean cents error). Vibrato families: modulation-depth retention (the
+    predicted contour's 6 Hz component over the true depth) times voiced coverage."""
+    kind, param = FAMILIES[family]
+    sweep = [{"threshold": float(t)} for t in THRESHOLDS]
+    per_thr = [[] for _ in THRESHOLDS]                # per-clip readout dicts
+    for x, f0f, _vf in clips:
+        results = algo.extract_pitch(x, thresholds=list(THRESHOLDS), compute_notes=False)
+        for ti, (pp, pv, _) in enumerate(results):
+            pp = np.asarray(pp, dtype=float)
+            L = min(len(pp), len(f0f))
+            pred, true = pp[:L], np.asarray(f0f[:L], float)
+            v = np.asarray(pv[:L], bool) & (pred > 0)
+            interior = np.zeros(L, bool)
+            interior[8:-8] = True
+            m = v & interior
+            cov = float(v[interior].mean()) if interior.any() else 0.0
+            with np.errstate(divide="ignore", invalid="ignore"):
+                err = 1200.0 * np.log2(pred / true)
+            if kind in ("steady_sine", "steady_harm"):
+                e = err[m & np.isfinite(err)]
+                if e.size >= 8:
+                    per_thr[ti].append({"jitter": float(np.std(e - e.mean())),
+                                        "bias": float(e.mean()), "cov": cov})
+                else:
+                    per_thr[ti].append({"jitter": None, "bias": None, "cov": cov})
+            else:                                     # vib: project onto the known-rate sinusoid
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ec = 1200.0 * np.log2(pred / VIB_F0)
+                mm = m & np.isfinite(ec)
+                if mm.sum() >= 30:
+                    tt = np.arange(L) * HOP / SR
+                    A = np.column_stack([np.sin(2 * np.pi * VIB_RATE_HZ * tt[mm]),
+                                         np.cos(2 * np.pi * VIB_RATE_HZ * tt[mm]),
+                                         np.ones(int(mm.sum()))])
+                    coef, *_ = np.linalg.lstsq(A, ec[mm], rcond=None)
+                    amp = float(np.hypot(coef[0], coef[1]))
+                    per_thr[ti].append({"retention": amp / (float(param) * 100.0), "cov": cov})
+                else:
+                    per_thr[ti].append({"retention": None, "cov": cov})
+    for ti, entries in enumerate(per_thr):
+        covs = [e["cov"] for e in entries]
+        sweep[ti]["coverage"] = float(np.mean(covs)) if covs else 0.0
+        if kind in ("steady_sine", "steady_harm"):
+            js = [e["jitter"] for e in entries if e["jitter"] is not None]
+            bs = [e["bias"] for e in entries if e["bias"] is not None]
+            sweep[ti]["jitter_cents"] = float(np.mean(js)) if js else None
+            sweep[ti]["bias_cents"] = float(np.mean(bs)) if bs else None
+        else:
+            rs = [e["retention"] for e in entries if e["retention"] is not None]
+            sweep[ti]["depth_retention"] = float(np.mean(rs)) if rs else 0.0
+    return {"thresholds": [float(t) for t in THRESHOLDS], "sweep": sweep}
 
 
 def _score_control(algo, clips):
@@ -329,15 +406,19 @@ def _score_control(algo, clips):
 # --------------------------------------------------------------------------- #
 # The per-cell measurement (pure: no writing, no processes; evaluate.py owns those)
 # --------------------------------------------------------------------------- #
-def run_ood_cell(algorithm_class, family, device="auto"):
+def run_synthetic_cell(algorithm_class, family, device="auto"):
     """Score one (tracker, family) cell. Same shape as the other tracks: takes the algorithm
-    CLASS, returns the results dict, touches nothing else."""
+    CLASS, returns the results dict (tagged with the family's kind), touches nothing else."""
     algo_obj = build_algorithm(algorithm_class, SR, HOP, FMIN, FMAX, device=device)
     clips = make_clips(family)
-    if family_type(family) == "control":
+    kind = family_type(family)
+    if kind == "control":
         results = _score_control(algo_obj, clips)
+    elif kind == "trajectory":
+        results = _score_trajectory(algo_obj, family, clips)
     else:
-        results = _score_voiced(algo_obj, clips)
+        results = _score_stationary(algo_obj, clips)
+    results["kind"] = kind
     del algo_obj
     gc.collect()
     return results

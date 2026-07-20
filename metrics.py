@@ -114,21 +114,18 @@ def evaluate_pitch_smoothness(
     }
 
 
-def calculate_combined_score(voicing_metrics: dict, pitch_metrics: dict) -> float:
-    """Harmonic mean of six [0,1] components; zero/NaN floored to ~0 so a failed axis sinks it."""
-    cents_err = pitch_metrics.get("cents_error")
-    octave = pitch_metrics.get("octave_error_rate")
-    gross = pitch_metrics.get("gross_error_rate")
-    components = [
-        pitch_metrics.get("rpa", 0.0),
-        np.exp(-(500.0 if cents_err is None else cents_err) / 500.0),
-        voicing_metrics.get("recall", 0.0),
-        voicing_metrics.get("precision", 0.0),
-        np.exp(-(1.0 if octave is None else octave) * 10.0),
-        np.exp(-(1.0 if gross is None else gross) * 5.0),
-    ]
-    floored = [c if (c is not None and not np.isnan(c) and c > 1e-6) else 1e-6 for c in components]
-    return len(floored) / sum(1.0 / c for c in floored)
+def pitch_prf(n_ok, tp, fp, fn) -> tuple[float, float, float]:
+    """The pitch F-score family: precision/recall/F of the event "truly voiced frame,
+    voiced with pitch output, within tolerance". n_ok = count of tp frames within tolerance; the
+    denominators are the voicing sets, so every voicing mistake is charged and abstention
+    can never inflate the score. Harmonic mean of P and R collapses to the Dice ratio
+    2*n_ok/((tp+fp)+(tp+fn)) because both share the numerator. T->inf (n_ok == tp)
+    recovers classic voicing F1."""
+    r = n_ok / (tp + fn) if (tp + fn) > 0 else 0.0
+    p = n_ok / (tp + fp) if (tp + fp) > 0 else 0.0
+    denom = (tp + fp) + (tp + fn)
+    f = 2.0 * n_ok / denom if denom > 0 else 0.0
+    return p, r, f
 
 
 # --------------------------------------------------------------------------- #
@@ -138,19 +135,22 @@ def calculate_combined_score(voicing_metrics: dict, pitch_metrics: dict) -> floa
 # fold in one at a time into running sufficient statistics, never holding the whole dataset's
 # contours in memory. Results are identical to running evaluate_*() on the fully-concatenated
 # arrays (same finite-frame rule, same octave/gross definitions). Memory is O(#bands).
-RPA_TOLERANCE_CENTS = 50.0
+PITCH_TOLERANCES = (10.0, 25.0, 50.0)  # cents tolerances for the pitch F-score family
+T_MAX = 100.0                          # tolerance-AUC truncation: AUC = 1 - truncMAE/T_MAX
 GROSS_ERROR_CENTS = 200.0
 
 
 class _PitchBin:
     """Running pitch-accuracy sufficient statistics over a subset of frames (overall or a band)."""
 
-    __slots__ = ("n_gross", "n_octave", "n_rca", "n_rpa", "sum_cents", "sum_sq", "valid")
+    __slots__ = ("n_gross", "n_octave", "n_ok10", "n_ok25", "n_ok50", "n_rca",
+                 "sum_cents", "sum_sq", "sum_trunc", "valid")
 
     def __init__(self):
         self.valid = 0
-        self.n_rpa = self.n_rca = self.n_gross = self.n_octave = 0
-        self.sum_cents = self.sum_sq = 0.0
+        self.n_ok10 = self.n_ok25 = self.n_ok50 = 0
+        self.n_rca = self.n_gross = self.n_octave = 0
+        self.sum_cents = self.sum_sq = self.sum_trunc = 0.0
 
     def add(self, pitch_pred: np.ndarray, pitch_true: np.ndarray, mask: np.ndarray) -> None:
         if not np.any(mask):
@@ -165,10 +165,13 @@ class _PitchBin:
         self.valid += int(abs_cents.size)
         self.sum_cents += float(abs_cents.sum())
         self.sum_sq += float(np.sum((pred - true) ** 2))
-        self.n_rpa += int(np.sum(abs_cents < RPA_TOLERANCE_CENTS))
+        self.sum_trunc += float(np.minimum(abs_cents, T_MAX).sum())
+        self.n_ok10 += int(np.sum(abs_cents < 10.0))
+        self.n_ok25 += int(np.sum(abs_cents < 25.0))
+        self.n_ok50 += int(np.sum(abs_cents < 50.0))
         wrapped = abs_cents % 1200
         chroma = np.minimum(wrapped, 1200 - wrapped)
-        self.n_rca += int(np.sum(chroma < RPA_TOLERANCE_CENTS))
+        self.n_rca += int(np.sum(chroma < 50.0))
         self.n_gross += int(np.sum(abs_cents > GROSS_ERROR_CENTS))
         nearest_octave = np.round(abs_cents / 1200.0)
         self.n_octave += int(
@@ -185,7 +188,7 @@ class _PitchBin:
         return {
             "rmse": float(np.sqrt(self.sum_sq / v)),
             "cents_error": self.sum_cents / v,
-            "rpa": self.n_rpa / v,
+            "rpa": self.n_ok50 / v,
             "rca": self.n_rca / v,
             "octave_error_rate": self.n_octave / v,
             "gross_error_rate": self.n_gross / v,
@@ -257,11 +260,13 @@ class MetricAccumulator:
     def suff_stats(self) -> dict:
         """The additive sufficient statistics behind every scalar metric (overall pitch bin + voicing
         counts). Summing these across clips reproduces the full-dataset accumulator EXACTLY, so a
-        cluster bootstrap can resample clips, sum, and RECOMPUTE any aggregate (RPA/coverage/F1/cents/
-        combined) frame-weighted: the honest way to CI a nonlinear aggregate like combined_score."""
+        cluster bootstrap can resample clips, sum, and RECOMPUTE any aggregate (pitch F / voicing F1 /
+        coverage / cents / AUC) frame-weighted: the honest way to CI a nonlinear aggregate."""
         o = self._overall
-        return {"valid": int(o.valid), "n_rpa": int(o.n_rpa), "sum_cents": float(o.sum_cents),
-                "n_octave": int(o.n_octave), "n_gross": int(o.n_gross),
+        return {"valid": int(o.valid), "n_ok10": int(o.n_ok10), "n_ok25": int(o.n_ok25),
+                "n_ok50": int(o.n_ok50), "sum_trunc_cents": float(o.sum_trunc),
+                "sum_cents": float(o.sum_cents), "n_octave": int(o.n_octave),
+                "n_gross": int(o.n_gross),
                 "tp": int(self.tp), "fp": int(self.fp), "fn": int(self.fn)}
 
     def per_band(self) -> dict:
@@ -282,8 +287,19 @@ class MetricAccumulator:
             for k in ("relative_smoothness", "continuity_breaks")
         }
 
-    def combined_score(self) -> float:
-        return calculate_combined_score(self.voicing_metrics(), self.pitch_metrics())
+    def pitch_f_metrics(self) -> dict:
+        """The pitch F-score family at every tolerance + the tolerance AUC."""
+        o = self._overall
+        out = {}
+        for tol, n_ok in (("10", o.n_ok10), ("25", o.n_ok25), ("50", o.n_ok50)):
+            p, r, f = pitch_prf(n_ok, self.tp, self.fp, self.fn)
+            out[f"f{tol}"] = f
+            if tol == "50":
+                out["r50"], out["p50"] = r, p
+        denom = (self.tp + self.fp) + (self.tp + self.fn)
+        out["auc"] = (2.0 * (o.valid * T_MAX - o.sum_trunc) / (denom * T_MAX)
+                      if denom > 0 else 0.0)
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -343,38 +359,21 @@ def voicing_boundary_latency(pred_voiced, true_voiced, frame_period, min_frames=
     return on, off
 
 
-def summarize_threshold_sweep(accumulators, thresholds):
-    """Pick the best-combined-score threshold and assemble the shared metrics dict.
-
-    Returns ``(best_idx, best_metrics)``; ``best_idx`` is -1 (and metrics None) only if no threshold
-    scored finite. ``best_metrics`` omits the caller-specific ``coverage`` / ``ood_accuracy`` fields,
-    which each runner adds. The ``threshold_sweep`` logs every threshold's scalars.
-    """
-    threshold_sweep, best_idx, best_score = [], -1, -1.0
-    for i, (threshold, acc) in enumerate(zip(thresholds, accumulators)):
+def sweep_summary(accumulators, thresholds):
+    """The per-threshold aggregate block: one entry per threshold, NO selection. Threshold
+    choice is a report-time decision (a global per-algorithm theta*), never a per-cell one."""
+    out = []
+    for threshold, acc in zip(thresholds, accumulators):
         v, p = acc.voicing_metrics(), acc.pitch_metrics()
-        score = calculate_combined_score(v, p)
-        threshold_sweep.append({
-            "threshold": float(threshold), "combined_score": score,
-            "rpa": p["rpa"], "rca": p["rca"], "cents_error": p["cents_error"],
-            "octave_error_rate": p["octave_error_rate"], "gross_error_rate": p["gross_error_rate"],
-            "voicing_precision": v["precision"], "voicing_recall": v["recall"], "voicing_f1": v["f1"],
+        out.append({
+            "threshold": float(threshold),
+            "voicing": v,
+            "pitch_f": acc.pitch_f_metrics(),
+            "pitch": {**p, "coverage": acc.pitch_coverage()},
+            "per_band": acc.per_band(),
+            "smoothness": acc.smoothness_metrics(),
         })
-        if not np.isnan(score) and score > best_score:
-            best_idx, best_score = i, score
-    if best_idx < 0:
-        return -1, None
-    best = accumulators[best_idx]
-    best_metrics = {
-        "voicing_detection": best.voicing_metrics(),
-        "pitch_accuracy": {**best.pitch_metrics(), "coverage": best.pitch_coverage()},
-        "per_band": best.per_band(),
-        "smoothness_metrics": best.smoothness_metrics(),
-        "combined_score": best_score,
-        "optimal_threshold": float(thresholds[best_idx]),
-        "threshold_sweep": threshold_sweep,
-    }
-    return best_idx, best_metrics
+    return out
 
 # --------------------------------------------------------------------------- #
 # Cluster-bootstrap statistics over per-clip sufficient stats (the ONE bootstrap, shared by the
@@ -451,18 +450,19 @@ def paired_tied(keyed_a, keyed_b, reduce_fn, n_boot=2000, seed=0):
     return bool(lo <= 0.0 <= hi)
 
 
-def paired_delta_ci(pairs, n_boot=2000):
-    """95% CI of the mean-over-datasets PAIRED combined-score delta (clean - degraded), in
+def paired_delta_ci(pairs, reduce_fn=None, n_boot=2000):
+    """95% CI of the mean-over-datasets PAIRED metric delta (clean - degraded), in
     percentage points. `pairs` = per dataset (keyed_clean, keyed_degraded) cluster sums over the
     SAME probe clips; each bootstrap draw resamples clusters within each dataset (stratified) and
     applies the same picks to both sides, so shared clip difficulty cancels. Datasets with < 2
     common clusters cannot be resampled and are skipped. Returns (lo, hi, n_datasets_used)."""
+    reduce_fn = reduce_fn or FRAME_REDUCERS["pitch_f"]
     per_ds = []
     for k, (kc, kd) in enumerate(pairs):
         common = sorted(set(kc) & set(kd))
         if len(common) < 2:
             continue
-        per_ds.append(boot_vals([kc[g] for g in common], FRAME_REDUCERS["combined"],
+        per_ds.append(boot_vals([kc[g] for g in common], reduce_fn,
                                 n_boot, seed=k, per_group_b=[kd[g] for g in common]))
     if not per_ds:
         return float("nan"), float("nan"), 0
@@ -475,11 +475,11 @@ def sum_col(dicts, k):
 
 
 # Frame reducers: recompute the FRAME-weighted aggregate from summed sufficient stats (so CIs match
-# the reported pitch_accuracy.* / combined_score exactly).
+# the reported per-threshold sweep values exactly).
 def agg_from_sums(dicts):
     v = sum_col(dicts, "valid")
     tp, fp, fn = sum_col(dicts, "tp"), sum_col(dicts, "fp"), sum_col(dicts, "fn")
-    pm = {"rpa": sum_col(dicts, "n_rpa") / v if v else 0.0,
+    pm = {"rpa": sum_col(dicts, "n_ok50") / v if v else 0.0,
           "cents_error": sum_col(dicts, "sum_cents") / v if v else 0.0,
           "octave_error_rate": sum_col(dicts, "n_octave") / v if v else 0.0,
           "gross_error_rate": sum_col(dicts, "n_gross") / v if v else 0.0}
@@ -491,25 +491,41 @@ def agg_from_sums(dicts):
     return pm, vm, coverage
 
 
-def reduce_combined(ds):
-    pm, vm, _ = agg_from_sums(ds)
-    return calculate_combined_score(vm, pm)
+def _prf_from_sums(ds, tol):
+    tp, fp, fn = sum_col(ds, "tp"), sum_col(ds, "fp"), sum_col(ds, "fn")
+    return pitch_prf(sum_col(ds, f"n_ok{tol}"), tp, fp, fn)
 
 
-FRAME_STAT_COLS = ("valid", "n_rpa", "sum_cents", "n_octave", "n_gross", "tp", "fp", "fn")
+def _auc_from_sums(ds):
+    v, trunc = sum_col(ds, "valid"), sum_col(ds, "sum_trunc_cents")
+    denom = (sum_col(ds, "tp") + sum_col(ds, "fp")) + (sum_col(ds, "tp") + sum_col(ds, "fn"))
+    return 2.0 * (v * T_MAX - trunc) / (denom * T_MAX) if denom > 0 else 0.0
+
+
+FRAME_STAT_COLS = ("valid", "n_ok10", "n_ok25", "n_ok50", "sum_trunc_cents",
+                   "sum_cents", "n_octave", "n_gross", "tp", "fp", "fn")
 FRAME_REDUCERS = {
-    "combined": reduce_combined,
-    "rpa": lambda ds: agg_from_sums(ds)[0]["rpa"],
+    "pitch_f": lambda ds: _prf_from_sums(ds, 50)[2],
+    "pitch_f25": lambda ds: _prf_from_sums(ds, 25)[2],
+    "pitch_f10": lambda ds: _prf_from_sums(ds, 10)[2],
+    "pitch_recall": lambda ds: _prf_from_sums(ds, 50)[1],
+    "pitch_precision": lambda ds: _prf_from_sums(ds, 50)[0],
+    "tol_auc": _auc_from_sums,
+    "rpa": lambda ds: agg_from_sums(ds)[0]["rpa"],       # accuracy on detected frames
     "voicing_f1": lambda ds: agg_from_sums(ds)[1]["f1"],
     "coverage": lambda ds: agg_from_sums(ds)[2],
     "cents_mae": lambda ds: agg_from_sums(ds)[0]["cents_error"],
 }
 
 
-def frame_keyed(pc):
-    """Keyed cluster sums (+ #clips) for one per_clip block's suff-stat columns."""
-    idx = [(c, pc["schema"].index(c)) for c in FRAME_STAT_COLS]
-    return keyed_group_sums(pc["rows"], idx), len(pc["rows"])
+def frame_keyed(pc, theta_idx):
+    """Keyed cluster sums (+ #clips) for one per_clip block at ONE threshold index. The v2
+    per_clip block stores, per clip, the suff-stat row for every threshold; theta_idx picks
+    the operating point (a report-time decision, typically the algorithm's theta*)."""
+    rows = [list(meta[:2]) + list(stats[theta_idx])
+            for meta, stats in zip(pc["clips"], pc["stats"])]
+    idx = [(c, 2 + i) for i, c in enumerate(FRAME_STAT_COLS)]
+    return keyed_group_sums(rows, idx), len(rows)
 
 
 def ci_cell(value, lo, hi, fmt="{:.3f}"):
@@ -520,7 +536,7 @@ def ci_cell(value, lo, hi, fmt="{:.3f}"):
     return f"{fmt.format(value)} [{fmt.format(lo)}, {fmt.format(hi)}]"
 
 
-def compare_keyed(keyed_a, keyed_b, metric="voicing_f1", n_boot=2000, seed=0):
+def compare_keyed(keyed_a, keyed_b, metric="pitch_f", n_boot=2000, seed=0):
     """Paired comparison of two keyed-cluster-sum dicts on their COMMON clusters.
     Returns (delta, ci_lo, ci_hi): point delta = reduce(A) - reduce(B) over all common clusters,
     CI from the paired cluster bootstrap. (delta, nan, nan) with < 2 common clusters."""
@@ -534,8 +550,273 @@ def compare_keyed(keyed_a, keyed_b, metric="voicing_f1", n_boot=2000, seed=0):
     return delta, lo, hi
 
 
-def compare(per_clip_a, per_clip_b, metric="voicing_f1", n_boot=2000, seed=0):
-    """Paired comparison of two algorithms from their per_clip blocks (same cell, both scored the
-    same clips). Returns (delta, ci_lo, ci_hi) of A - B on the chosen frame metric."""
-    return compare_keyed(frame_keyed(per_clip_a)[0], frame_keyed(per_clip_b)[0],
-                         metric, n_boot, seed)
+def compare(per_clip_a, per_clip_b, theta_idx_a, theta_idx_b, metric="pitch_f",
+            n_boot=2000, seed=0):
+    """Paired comparison of two algorithms from their per_clip blocks (same cell, both scored
+    the same clips), each read at its own operating point. Returns (delta, ci_lo, ci_hi) of
+    A - B on the chosen frame metric."""
+    return compare_keyed(frame_keyed(per_clip_a, theta_idx_a)[0],
+                         frame_keyed(per_clip_b, theta_idx_b)[0], metric, n_boot, seed)
+
+
+# --------------------------------------------------------------------------- #
+# Track scoring (the v2 question layer): pure functions over a load_cells dict.
+# Tracks are SITUATIONS of use, never decomposition axes, so nothing is scored twice;
+# every decomposition (voicing P/R, accuracy-on-voiced, octave, cents...) is a
+# diagnostic rendered beneath its track. Threshold selection happens HERE (one global
+# theta* per algorithm), never per cell.
+# --------------------------------------------------------------------------- #
+SIGMA0 = 10.0        # cents; steady-jitter normalizer s = SIGMA0/(SIGMA0+jitter)
+TRACKS_SCORED = ("accuracy", "noise", "signals", "stability", "dynamics", "notes", "speed")
+
+
+def _frame_cells(cells, algo, condition, datasets=None):
+    for (track, ds, cond, a), cell in cells.items():
+        if track != "frame" or a != algo or cond != condition:
+            continue
+        if datasets and ds not in datasets:
+            continue
+        if cell.get("metadata", {}).get("crashed"):
+            continue
+        if cell.get("results", {}).get("sweep"):
+            yield ds, cell
+
+
+def _sweep_f50(cell, idx):
+    return cell["results"]["sweep"][idx]["pitch_f"]["f50"]
+
+
+def theta_star(cells, algo, *, datasets=None):
+    """The algorithm's ONE frozen operating point: argmax over the threshold grid of the
+    equal-per-dataset mean pitch F@50 on clean frame cells. Full (uncapped) clean cells
+    are preferred; if only probe-sized clean baselines exist the fallback is used and
+    stamped in the provenance. Ties resolve to the lowest threshold.
+    Returns {"theta", "idx", "provenance", "n_datasets"}."""
+    full, probe = {}, {}
+    for ds, cell in _frame_cells(cells, algo, "clean", datasets):
+        (probe if cell.get("metadata", {}).get("probe") else full)[ds] = cell
+    pool, provenance = (full, "clean-full") if full else (probe, "clean-probe")
+    if not pool:
+        return {"theta": None, "idx": None, "provenance": "no-clean-cells", "n_datasets": 0}
+    n_thr = len(next(iter(pool.values()))["results"]["thresholds"])
+    means = [float(np.mean([_sweep_f50(c, i) for c in pool.values()])) for i in range(n_thr)]
+    idx = int(np.argmax(means))                       # argmax returns the FIRST max: lowest theta
+    theta = next(iter(pool.values()))["results"]["thresholds"][idx]
+    return {"theta": float(theta), "idx": idx, "provenance": provenance,
+            "n_datasets": len(pool)}
+
+
+def oracle_theta(cell):
+    """Per-cell F@50 argmax index (the oracle the stability track measures against)."""
+    sweep = cell["results"]["sweep"]
+    return int(np.argmax([e["pitch_f"]["f50"] for e in sweep]))
+
+
+def _pooled_sums(cells, algo, *, theta_idx, datasets=None, conditions=("clean",)):
+    """Summed suff stats over the selected frame cells at one threshold index."""
+    total = None
+    for cond in conditions:
+        for _ds, cell in _frame_cells(cells, algo, cond, datasets):
+            pc = cell["results"].get("per_clip")
+            if not pc:
+                continue
+            for stats in pc["stats"]:
+                row = dict(zip(FRAME_STAT_COLS, stats[theta_idx]))
+                total = row if total is None else {k: total[k] + row[k] for k in total}
+    return total
+
+
+def pitch_prf_from_cells(cells, algo, *, theta_idx, tolerance=50, datasets=None,
+                         conditions=("clean",)):
+    """Frame-pooled pitch P/R/F over the selected cells at one operating point."""
+    s = _pooled_sums(cells, algo, theta_idx=theta_idx, datasets=datasets,
+                     conditions=conditions)
+    if not s:
+        return None
+    p, r, f = pitch_prf(s[f"n_ok{int(tolerance)}"], s["tp"], s["fp"], s["fn"])
+    return {"precision": p, "recall": r, "f": f}
+
+
+def factorization(cells, algo, *, theta_idx, datasets=None, conditions=("clean",)):
+    """The identity pitch_recall = voicing_recall x accuracy_on_voiced, from pooled
+    counts (both classic RPA definitions as the factors of one product)."""
+    s = _pooled_sums(cells, algo, theta_idx=theta_idx, datasets=datasets,
+                     conditions=conditions)
+    if not s:
+        return None
+    p, r, f = pitch_prf(s["n_ok50"], s["tp"], s["fp"], s["fn"])
+    vrec = s["tp"] / (s["tp"] + s["fn"]) if (s["tp"] + s["fn"]) else 0.0
+    return {"pitch_f": f, "pitch_recall": r, "pitch_precision": p,
+            "voicing_recall": vrec,
+            "accuracy_on_voiced": s["n_ok50"] / s["tp"] if s["tp"] else 0.0}
+
+
+def track_accuracy(cells, algo, *, datasets=None):
+    """How correct is the output curve on clean real recordings?"""
+    star = theta_star(cells, algo, datasets=datasets)
+    if star["idx"] is None:
+        return {"score": None, **star}
+    per_ds = {}
+    for ds, cell in _frame_cells(cells, algo, "clean", datasets):
+        e = cell["results"]["sweep"][star["idx"]]
+        per_ds[ds] = {"f50": e["pitch_f"]["f50"], "auc": e["pitch_f"]["auc"],
+                      "probe": bool(cell.get("metadata", {}).get("probe"))}
+    if not per_ds:
+        return {"score": None, **star}
+    return {"score": float(np.mean([d["f50"] for d in per_ds.values()])),
+            "auc": float(np.mean([d["auc"] for d in per_ds.values()])),
+            "per_dataset": per_ds, **star}
+
+
+def track_noise(cells, algo, *, datasets=None):
+    """How much of the clean score survives real-world corruption? Ratio of pitch F@50
+    degraded/clean on the SAME probe clips, equal-per-dataset then mean over conditions."""
+    star = theta_star(cells, algo, datasets=datasets)
+    if star["idx"] is None:
+        return {"score": None, **star}
+    clean_probe = {}
+    for ds, cell in _frame_cells(cells, algo, "clean_probe", datasets):
+        clean_probe[ds] = cell
+    if not clean_probe:                       # store holds only one clean variant per ds
+        for ds, cell in _frame_cells(cells, algo, "clean", datasets):
+            if cell.get("metadata", {}).get("probe"):
+                clean_probe[ds] = cell
+    conds = sorted({k[2] for k in cells
+                    if k[0] == "frame" and k[3] == algo
+                    and k[2] not in ("clean", "clean_probe")})
+    per_cond = {}
+    for cond in conds:
+        ratios = []
+        for ds, cell in _frame_cells(cells, algo, cond, datasets):
+            if ds not in clean_probe:
+                continue
+            fc = _sweep_f50(clean_probe[ds], star["idx"])
+            if fc > 0:
+                ratios.append(min(_sweep_f50(cell, star["idx"]) / fc, 1.5))
+        if ratios:
+            per_cond[cond] = float(np.mean(ratios))
+    if not per_cond:
+        return {"score": None, **star}
+    return {"score": float(np.clip(np.mean(list(per_cond.values())), 0.0, 1.0)),
+            "per_condition": per_cond, **star}
+
+
+def track_signals(cells, algo):
+    """How much of the synthetic signal-class space does it handle? Mean over the
+    stationary families of pitch recall@50 (coverage-aware accuracy) at theta*; each
+    family is one probe question, equally weighted. The worst family is carried as the
+    named diagnostic (a min SCORE was measured to zero out most real trackers -- 6 of 7
+    surveyed have at least one dead family -- destroying all downstream ranking)."""
+    star = theta_star(cells, algo)
+    if star["idx"] is None:
+        return {"score": None, **star}
+    fams = {}
+    for (track, fam, _c, a), cell in cells.items():
+        if track != "synthetic" or a != algo or cell.get("metadata", {}).get("crashed"):
+            continue
+        res = cell.get("results", {})
+        if res.get("kind") == "stationary" and res.get("sweep"):
+            fams[fam] = res["sweep"][star["idx"]]["pitch_f"]["r50"]
+    if not fams:
+        return {"score": None, **star}
+    worst = min(fams, key=fams.get)
+    return {"score": float(np.mean(list(fams.values()))), "worst_family": worst,
+            "worst": float(fams[worst]), "per_family": fams, **star}
+
+
+def track_stability(cells, algo, *, datasets=None):
+    """Does one global threshold work everywhere? Mean over clean cells of
+    F(theta*)/F(per-cell oracle). Binary-confidence trackers are trivially 1.0."""
+    star = theta_star(cells, algo, datasets=datasets)
+    if star["idx"] is None:
+        return {"score": None, **star}
+    ratios = {}
+    for ds, cell in _frame_cells(cells, algo, "clean", datasets):
+        oracle = _sweep_f50(cell, oracle_theta(cell))
+        if oracle > 0:
+            ratios[ds] = _sweep_f50(cell, star["idx"]) / oracle
+    if not ratios:
+        return {"score": None, **star}
+    return {"score": float(np.clip(np.mean(list(ratios.values())), 0.0, 1.0)),
+            "per_dataset": ratios, **star}
+
+
+def track_dynamics(cells, algo):
+    """Is a moving pitch followed faithfully? Steady tones (jitter, bias) + vibrato
+    (depth retention x coverage); the two families the pilot showed discriminate."""
+    star = theta_star(cells, algo)
+    if star["idx"] is None:
+        return {"score": None, **star}
+    steady, vib = [], []
+    detail = {}
+    for (track, fam, _c, a), cell in cells.items():
+        if track != "synthetic" or a != algo or cell.get("metadata", {}).get("crashed"):
+            continue
+        res = cell.get("results", {})
+        if res.get("kind") != "trajectory" or not res.get("sweep"):
+            continue
+        e = res["sweep"][star["idx"]]
+        detail[fam] = e
+        if "jitter_cents" in e:
+            steady.append(SIGMA0 / (SIGMA0 + e["jitter_cents"]))
+        if "depth_retention" in e:
+            vib.append(np.clip(e["depth_retention"], 0.0, 1.0) * e.get("coverage", 1.0))
+    parts = [float(np.mean(x)) for x in (steady, vib) if x]
+    if not parts:
+        return {"score": None, **star}
+    return {"score": float(np.mean(parts)), "per_family": detail, **star}
+
+
+def track_notes(cells, algo):
+    """Is musical note structure recoverable? Mean COnP over note datasets (this track
+    selects its own threshold x segmentation-cost internally, documented)."""
+    vals = {}
+    for (track, ds, _c, a), cell in cells.items():
+        if track == "note" and a == algo and not cell.get("metadata", {}).get("crashed"):
+            v = cell.get("results", {}).get("conp")
+            if v is not None and np.isfinite(v):
+                vals[ds] = v
+    if not vals:
+        return {"score": None}
+    return {"score": float(np.mean(list(vals.values()))), "per_dataset": vals}
+
+
+def track_speed(cells, algo):
+    """Is it deployable? score = 1/(1+RTF_cpu)."""
+    for (track, _ds, _c, a), cell in cells.items():
+        if track == "speed" and a == algo:
+            dev = cell.get("results", {}).get("device_results", {}).get("cpu", {})
+            ms = dev.get("absolute_time_ms")
+            if ms is None:
+                return {"score": None}
+            sec = cell.get("parameters", {}).get("signal_length_sec", 1.0)
+            rtf = (ms / 1000.0) / sec
+            return {"score": 1.0 / (1.0 + rtf), "rtf_cpu": rtf}
+    return {"score": None}
+
+
+def track_scores(cells, algo, *, datasets=None):
+    """The seven track scores (None where a track has no cells)."""
+    return {
+        "accuracy": track_accuracy(cells, algo, datasets=datasets)["score"],
+        "noise": track_noise(cells, algo, datasets=datasets)["score"],
+        "signals": track_signals(cells, algo)["score"],
+        "stability": track_stability(cells, algo, datasets=datasets)["score"],
+        "dynamics": track_dynamics(cells, algo)["score"],
+        "notes": track_notes(cells, algo)["score"],
+        "speed": track_speed(cells, algo)["score"],
+    }
+
+
+def overall(cells, algo, *, datasets=None):
+    """Harmonic mean of the seven track scores, equal weights: the same mean family as
+    the F-scores inside the tracks, and the one that punishes a weak axis hardest (HM
+    is dominated by the smallest score). None if ANY track is missing (never a silent
+    partial mean); a zero track makes it 0 (a failed axis sinks it)."""
+    scores = track_scores(cells, algo, datasets=datasets)
+    vals = list(scores.values())
+    if any(v is None for v in vals):
+        return None
+    if any(v <= 0 for v in vals):
+        return 0.0
+    return float(len(vals) / np.sum(1.0 / np.asarray(vals)))
