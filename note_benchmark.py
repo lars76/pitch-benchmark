@@ -23,7 +23,6 @@ import torch
 from tqdm import tqdm
 
 from algorithms import build_algorithm
-from metrics import clip_and_group
 
 LAM_GRID = [250.0, 375.0, 500.0, 750.0]
 
@@ -35,16 +34,16 @@ def _notes_to_arrays(notes):
 
 
 def score_notes(est_notes, ref_notes):
-    """Returns (conp, conpoff, octave_errors) for one clip."""
+    """Returns (conp, conpoff) for one clip."""
     if not est_notes or not ref_notes:
-        return 0.0, 0.0, 0
+        return 0.0, 0.0
     ei, eh = _notes_to_arrays(est_notes)
     ri, rh = _notes_to_arrays(ref_notes)
     # mir_eval requires positive-length intervals
     ok = ei[:, 1] > ei[:, 0]
     ei, eh = ei[ok], eh[ok]
     if len(eh) == 0:
-        return 0.0, 0.0, 0
+        return 0.0, 0.0
     conp = mir_eval.transcription.precision_recall_f1_overlap(
         ri, rh, ei, eh, onset_tolerance=0.05, pitch_tolerance=50.0, offset_ratio=None
     )[2]
@@ -52,15 +51,7 @@ def score_notes(est_notes, ref_notes):
         ri, rh, ei, eh, onset_tolerance=0.05, pitch_tolerance=50.0,
         offset_ratio=0.2, offset_min_tolerance=0.05,
     )[2]
-    # octave errors: onset-matched (<=50 ms) est notes whose pitch is ~an octave off
-    oct_err = 0
-    for s, hz in zip(ei[:, 0], eh):
-        j = int(np.argmin(np.abs(ri[:, 0] - s)))
-        if abs(ri[j, 0] - s) <= 0.05:
-            cents = abs(1200.0 * np.log2(hz / rh[j]))
-            if 1150.0 <= cents <= 1250.0:
-                oct_err += 1
-    return float(conp), float(conpoff), int(oct_err)
+    return float(conp), float(conpoff)
 
 
 def run_note_evaluation(dataset, algorithm_class, thresholds, device="auto"):
@@ -75,7 +66,7 @@ def run_note_evaluation(dataset, algorithm_class, thresholds, device="auto"):
         tqdm.write(f"FATAL: {algo_name} failed to build ({e}). Recording as crashed.")
         return {"conp": np.nan, "conpoff": np.nan}, True
 
-    # scores[(ti, li)] -> list of (clip_id, group, n_ref, conp, conpoff, oct)
+    # scores[(ti, li)] -> list of (conp, conpoff)
     scores = {(ti, li): [] for ti in range(len(thresholds)) for li in range(len(LAM_GRID))}
     crashed = False
     pbar = tqdm(range(len(dataset)), desc=algo_name, leave=False, unit=" clips")
@@ -86,9 +77,6 @@ def run_note_evaluation(dataset, algorithm_class, thresholds, device="auto"):
             if not ref_notes:
                 continue
             audio = sample["audio"].numpy()
-            # group = the true speaker/singer/piece (get_group), NOT dirname, so the note-track
-            # cluster-bootstrap CIs cluster correctly (shared helper with the frame track).
-            clip_id, group = clip_and_group(dataset, sample.get("wav_path"), idx)
             contours = algo.extract_pitch(
                 audio, thresholds=list(thresholds), compute_notes=False
             )
@@ -97,10 +85,8 @@ def run_note_evaluation(dataset, algorithm_class, thresholds, device="auto"):
                     est = algo.notes_from_pitch_contour(
                         pitch, voicing, audio=audio, lam_per_s=lam
                     )
-                    conp, conpoff, oct_err = score_notes(est, ref_notes)
-                    scores[(ti, li)].append(
-                        (clip_id, group, len(ref_notes), conp, conpoff, oct_err)
-                    )
+                    conp, conpoff = score_notes(est, ref_notes)
+                    scores[(ti, li)].append((conp, conpoff))
         except Exception as e:
             tqdm.write(f"FATAL: {algo_name} failed on clip {idx}: {e}")
             crashed = True
@@ -122,20 +108,13 @@ def run_note_evaluation(dataset, algorithm_class, thresholds, device="auto"):
     if crashed or not any(scores.values()):
         return {"conp": np.nan, "conpoff": np.nan}, crashed
 
-    means = {k: float(np.mean([r[3] for r in v])) for k, v in scores.items() if v}
+    means = {k: float(np.mean([r[0] for r in v])) for k, v in scores.items() if v}
     (ti, li) = max(means, key=means.get)
     rows = scores[(ti, li)]
     return {
         "conp": means[(ti, li)],
-        "conpoff": float(np.mean([r[4] for r in rows])),
-        "octave_errors_total": int(sum(r[5] for r in rows)),
+        "conpoff": float(np.mean([r[1] for r in rows])),
         "optimal_threshold": float(thresholds[ti]),
         "optimal_lam_per_s": LAM_GRID[li],
         "clips_evaluated": len(rows),
-        "per_clip": {
-            "threshold": float(thresholds[ti]),
-            "lam_per_s": LAM_GRID[li],
-            "schema": ["clip_id", "group", "n_ref_notes", "conp", "conpoff", "octave_errors"],
-            "rows": [list(r) for r in rows],
-        },
     }, False

@@ -49,7 +49,7 @@ class REAPERPitchAlgorithm(ThresholdPitchAlgorithm):
     REAPER reports no f0 on frames it calls unvoiced).
 
     REAPER reports per-frame `f0_times`, but those mark frame STARTS, not the analysis center:
-    the timestamp calibration (tests/test_time_calibration.py) measures the content of frame m
+    the timestamp calibration measures the content of frame m
     exactly frame_period/2 after its stamp at both 16 kHz and 22.05 kHz, with the chirp and step
     probes agreeing to 0.1 ms. We therefore shift the stamps by +frame_period/2 to the centers and
     let the base class resample to the eval grid.

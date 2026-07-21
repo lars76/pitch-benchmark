@@ -212,7 +212,7 @@ class PitchAlgorithm(ABC):
         """The tracker's raw (times, pitch, periodicity) through the SAME path production uses
         (_extract_windowed) but BEFORE grid resampling: the quantity whose timestamp truthfulness
         the eval grid depends on. Parameter-based trackers run at their default threshold.
-        Diagnostic API shared by the timestamp calibration (tests/test_time_calibration.py) and the
+        Diagnostic API shared by the timestamp calibration and the
         dataset label-offset sweep (scripts/check_dataset_alignment.py)."""
         audio = self._validate_audio(audio)
         if self.supports_continuous_periodicity:

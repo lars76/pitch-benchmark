@@ -3,7 +3,7 @@
 
 Generates synthetic signal families with EXACT, non-circular labels (no pitch detector in the label
 loop) and measures per-family F0 accuracy, so we can say "signal type X breaks tracker Y". Complements
-pitch_benchmark.py (accuracy on real data + label-preserving degradations) and speed_benchmark.py
+frame_benchmark.py (real data + label-preserving degradations) and speed_benchmark.py
 (timing); generate_report.py merges all three.
 
 A pure per-cell measurement library; evaluate.py orchestrates. NOTE: some C-extension trackers
@@ -26,6 +26,7 @@ from metrics import (
 )
 from metrics import (
     MetricAccumulator,
+    cents,
     sweep_summary,
 )
 
@@ -50,7 +51,7 @@ INTERF_DB = (-20.0, -10.0, -5.0)   # interfering-source level RELATIVE to the do
 INTERF_F0 = 50.0                   # the interfering source's f0 (a 50 Hz tone + 2nd harmonic)
 VIB_F0 = 220.0                     # trajectory-family carrier for the vibrato dynamics probes
 VIB_RATE_HZ = 6.0                  # vibrato rate (typical vocal/instrumental FM)
-CONTROL_KINDS = ("noise", "whisper", "silence")
+CONTROL_KINDS = ("broadband", "whisper", "silence")
 FAMILIES = {
     "missing_f0":   ("missing_f0", MECH_F0),
     "unresolved":   ("unresolved", MECH_F0),
@@ -70,7 +71,7 @@ FAMILIES = {
     "tilt_mid":     ("tilt", BANDS_F0["mid"]),
     "tilt_high":    ("tilt", BANDS_F0["high"]),
     "tilt_vhigh":   ("tilt", BANDS_F0["vhigh"]),
-    "noise":        ("noise", None),
+    "broadband":    ("broadband", None),             # flat-spectrum noise; FP control (vs the Noise TRACK)
     "whisper":      ("whisper", None),
     "harm_bass":    ("harmonic", BANDS_F0["bass"]),   # bass complexes (sine_bass is a pure sine)
     "sine_level":   ("level_sine", None),             # absolute-level sweep (pure tone)
@@ -180,14 +181,14 @@ def _irn(f0, rng, n_iter=8, gain=1.0):
     return _finalize(x), SR / d               # actual f0 for the integer-rounded delay
 
 
-def _control_signal(family, rng):
-    """Broadband noise (`noise`), formant-shaped noise (`whisper`), or near-silence
-    (`silence`): no periodicity, no f0."""
-    if family == "silence":
+def _control_signal(kind, rng):
+    """Flat-spectrum noise (`broadband`), formant-shaped noise (`whisper`), or near-silence
+    (`silence`): no periodicity, no f0. `kind` is the raw FAMILIES kind, not the group."""
+    if kind == "silence":
         # NOT _finalize'd: RMS-normalizing silence up to TARGET_RMS would defeat the probe.
         return (1e-6 * rng.standard_normal(N)).astype(np.float32)
     x = rng.standard_normal(N)
-    if family == "whisper":
+    if kind == "whisper":
         spec = np.fft.rfft(x)
         f = np.fft.rfftfreq(N, 1.0 / SR)
         env = np.zeros_like(f)
@@ -197,14 +198,14 @@ def _control_signal(family, rng):
     return _finalize(x)
 
 
-# FROZEN per-family ids for stochastic-clip seeding (noise/whisper/irn). The values are
+# FROZEN per-family ids for stochastic-clip seeding (broadband/whisper/irn). The values are
 # arbitrary; what matters is that they NEVER change: a sorted-rank lookup would silently
 # renumber families whenever one is added, re-rolling every stochastic clip and invalidating
 # existing result comparisons. Give a new family the next unused id, at the end; never
-# renumber. test_ood.py locks the table against FAMILIES drift.
+# renumber, and a rename keeps its id.
 _FAMILY_IDS = {
     "harm_high": 0, "harm_low": 1, "harm_mid": 2, "harm_vhigh": 3, "irn": 4, "missing_f0": 5,
-    "noise": 6, "sine_bass": 7, "sine_high": 8, "sine_low": 9, "sine_mid": 10, "sine_vhigh": 11,
+    "broadband": 6, "sine_bass": 7, "sine_high": 8, "sine_low": 9, "sine_mid": 10, "sine_vhigh": 11,
     "tilt_high": 12, "tilt_low": 13, "tilt_mid": 14, "tilt_vhigh": 15, "unresolved": 16,
     "vibrato_fast": 17, "whisper": 18,
     "glide": 19,
@@ -215,7 +216,7 @@ _FAMILY_IDS = {
 
 def family_type(name):
     """The one routing rule: control (FP-rate), trajectory (response readouts), or
-    stationary (coverage-aware pitch recall)."""
+    stationary (unconditional pitch recall)."""
     kind = FAMILIES[name][0]
     if kind in CONTROL_KINDS:
         return "control"
@@ -232,7 +233,7 @@ def _family_id(family):
 def make_clips(family):
     """Return a list of (audio, f0_per_frame, voiced_per_frame) clips with exact labels.
 
-    Stochastic clips (noise/whisper/IRN) are seeded by item_rng over the frozen family ids."""
+    Stochastic clips (broadband/whisper/IRN) are seeded by item_rng over the frozen family ids."""
     kind, f0_list = FAMILIES[family]
 
     if kind in CONTROL_KINDS:
@@ -323,9 +324,9 @@ def make_clips(family):
 # Scoring (reuses metrics.MetricAccumulator + the 11-threshold sweep)
 # --------------------------------------------------------------------------- #
 def _score_stationary(algo, clips):
-    """Per-threshold sweep block; the family's accuracy IS pitch_f.r50 (correct frames over
-    ALL ground-truth-voiced frames, coverage-aware: it drops when a tracker copes with a hard
-    signal by refusing to voice it). No per-cell threshold selection."""
+    """Per-threshold sweep block; the family's accuracy IS the pitch RECALL (correct frames
+    over ALL ground-truth-voiced frames -- it drops when a tracker copes with a hard signal
+    by refusing to voice it). No per-cell threshold selection."""
     accs = [MetricAccumulator() for _ in THRESHOLDS]
     for x, f0f, vf in clips:
         results = algo.extract_pitch(x, thresholds=list(THRESHOLDS), compute_notes=False)
@@ -341,7 +342,7 @@ def _score_stationary(algo, clips):
 def _score_trajectory(algo, family, clips):
     """Response readouts per threshold. Steady families: jitter (cents std around the mean
     error) and bias (mean cents error). Vibrato families: modulation-depth retention (the
-    predicted contour's 6 Hz component over the true depth) times voiced coverage."""
+    predicted contour's 6 Hz component over the true depth) times the voiced fraction."""
     kind, param = FAMILIES[family]
     sweep = [{"threshold": float(t)} for t in THRESHOLDS]
     per_thr = [[] for _ in THRESHOLDS]                # per-clip readout dicts
@@ -355,41 +356,43 @@ def _score_trajectory(algo, family, clips):
             interior = np.zeros(L, bool)
             interior[8:-8] = True
             m = v & interior
-            cov = float(v[interior].mean()) if interior.any() else 0.0
+            voiced_fraction = float(v[interior].mean()) if interior.any() else 0.0
             with np.errstate(divide="ignore", invalid="ignore"):
-                err = 1200.0 * np.log2(pred / true)
+                err = cents(pred, true)
             if kind in ("steady_sine", "steady_harm"):
                 e = err[m & np.isfinite(err)]
-                if e.size >= 8:
-                    per_thr[ti].append({"jitter": float(np.std(e - e.mean())),
-                                        "bias": float(e.mean()), "cov": cov})
-                else:
-                    per_thr[ti].append({"jitter": None, "bias": None, "cov": cov})
+                ok = e.size >= 8
+                per_thr[ti].append({
+                    "jitter_cents": float(np.std(e - e.mean())) if ok else None,
+                    "bias_cents": float(e.mean()) if ok else None,
+                    "voiced_fraction": voiced_fraction})
             else:                                     # vib: project onto the known-rate sinusoid
                 with np.errstate(divide="ignore", invalid="ignore"):
-                    ec = 1200.0 * np.log2(pred / VIB_F0)
+                    ec = cents(pred, VIB_F0)
                 mm = m & np.isfinite(ec)
+                ratio = None
                 if mm.sum() >= 30:
                     tt = np.arange(L) * HOP / SR
                     A = np.column_stack([np.sin(2 * np.pi * VIB_RATE_HZ * tt[mm]),
                                          np.cos(2 * np.pi * VIB_RATE_HZ * tt[mm]),
                                          np.ones(int(mm.sum()))])
                     coef, *_ = np.linalg.lstsq(A, ec[mm], rcond=None)
-                    amp = float(np.hypot(coef[0], coef[1]))
-                    per_thr[ti].append({"retention": amp / (float(param) * 100.0), "cov": cov})
-                else:
-                    per_thr[ti].append({"retention": None, "cov": cov})
+                    ratio = float(np.hypot(coef[0], coef[1])) / (float(param) * 100.0)
+                per_thr[ti].append({"depth_ratio": ratio,
+                                    "voiced_fraction": voiced_fraction})
     for ti, entries in enumerate(per_thr):
-        covs = [e["cov"] for e in entries]
-        sweep[ti]["coverage"] = float(np.mean(covs)) if covs else 0.0
+        vfs = [e["voiced_fraction"] for e in entries]
+        sweep[ti]["voiced_fraction"] = float(np.mean(vfs)) if vfs else 0.0
         if kind in ("steady_sine", "steady_harm"):
-            js = [e["jitter"] for e in entries if e["jitter"] is not None]
-            bs = [e["bias"] for e in entries if e["bias"] is not None]
-            sweep[ti]["jitter_cents"] = float(np.mean(js)) if js else None
-            sweep[ti]["bias_cents"] = float(np.mean(bs)) if bs else None
+            # jitter and bias describe the SAME clips: filter jointly so the two means can
+            # never be taken over different subsets
+            pairs = [(e["jitter_cents"], e["bias_cents"]) for e in entries
+                     if e["jitter_cents"] is not None]
+            sweep[ti]["jitter_cents"] = float(np.mean([j for j, _ in pairs])) if pairs else None
+            sweep[ti]["bias_cents"] = float(np.mean([b for _, b in pairs])) if pairs else None
         else:
-            rs = [e["retention"] for e in entries if e["retention"] is not None]
-            sweep[ti]["depth_retention"] = float(np.mean(rs)) if rs else 0.0
+            rs = [e["depth_ratio"] for e in entries if e["depth_ratio"] is not None]
+            sweep[ti]["depth_ratio"] = float(np.mean(rs)) if rs else 0.0
     return {"thresholds": [float(t) for t in THRESHOLDS], "sweep": sweep}
 
 

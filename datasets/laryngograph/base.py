@@ -45,7 +45,7 @@ def energy_voicing_gate(
     """Zero periodicity on frames whose mic RMS (normalized to the per-file peak) is below `thr`.
     Frame i's window is CENTERED on sample i*hop, matching the grid contract (frame i is the audio
     centered at i*hop); the previous forward window [i*hop, (i+1)*hop) evaluated the gate half a hop
-    late, shifting every voicing boundary ~8 ms (review finding A14; see TIMING.md). Shares the
+    late, shifting every voicing boundary ~8 ms (review finding A14). Shares the
     per-frame RMS primitive (base.frame_rms) with NSynth's voicing detector and the offline
     consensus silence gate (scripts/build_consensus_labels.py); the linear cutoff here is the policy."""
     n = periodicity.shape[-1]
@@ -76,7 +76,7 @@ class LaryngographSpeechDataset(PitchDataset):
     REFERENCE_LABEL_HOP_SECONDS: float = None
     # Constant timing correction (seconds) ADDED to the reference label times: the time of the
     # analysis content RELATIVE to the label's nominal stamp (the reference tracker's intra-window
-    # offset). Measured per corpus by scripts/check_dataset_alignment.py; see TIMING.md.
+    # offset). Measured per corpus by scripts/check_dataset_alignment.py.
     REFERENCE_LABEL_OFFSET_SECONDS: float = 0.0
 
     def __init__(

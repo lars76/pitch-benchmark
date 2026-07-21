@@ -29,9 +29,8 @@ The two arrays have different natures and use different strategies:
 Target times outside the source span are unvoiced (pitch 0, voicing 0). Pure numpy (no torch), so
 it imports cleanly into the runtime, loaders and generation scripts alike.
 
-Field-standard scheme: reproduces mir_eval.melody.resample_melody_series (asserted in
-tests/test_resample.py and tests/test_gt_resample.py). Exact (a no-op) for on-grid trackers whose
-native frame times equal the target grid, so only off-grid trackers (e.g. YAAPT) are affected.
+Field-standard scheme: reproduces mir_eval.melody.resample_melody_series exactly. A no-op
+for on-grid trackers whose native frame times equal the target grid, so only off-grid trackers (e.g. YAAPT) are affected.
 """
 import numpy as np
 
@@ -101,7 +100,7 @@ def model_hop_length(hop_size: int, sample_rate: int, model_sr: int) -> int:
     code in the wrappers and in upstream libraries (e.g. torchcrepe.core.preprocess). What matters
     is that the SAME integer drives both the striding and the timestamps (frame_times): stamping
     with the nominal float hop instead drifts ~0.4%/frame at 22.05 kHz -> hop 256
-    (tests/test_time_calibration.py catches this class)."""
+    (the timestamp calibration catches this class)."""
     return max(1, int(hop_size * model_sr / sample_rate))
 
 

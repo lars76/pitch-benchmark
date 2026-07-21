@@ -1,18 +1,20 @@
 """Pure-numpy evaluation core: pitch bands + frame-level metric functions.
 
-Torch-free so it imports (and tests) without torch/torchaudio. Used by the runner
-(pitch_benchmark.py) and the report (generate_report.py).
+Torch-free so it imports (and tests) without torch/torchaudio. Used by the measurement
+libraries (frame/note/synthetic_benchmark) and the report (generate_report.py).
 """
+import hashlib
 import math
 import os
+from dataclasses import dataclass
+from enum import Enum
 
 import numpy as np
-from scipy.ndimage import find_objects, label
 
 
 def clip_and_group(dataset, wav_path, idx):
-    """(clip_id, group) for a per-clip row: the ONE place both runners (pitch_benchmark.py,
-    note_benchmark.py) derive them, so their cluster-bootstrap CIs share the same grouping.
+    """(clip_id, group) for a per-clip row: the ONE place the frame runner derives them, so
+    its cluster-bootstrap CIs cluster correctly.
 
     group = the dataset's leakage-safe get_group (speaker / singer / piece), forwarded through the
     Augment/Truncate/Subset wrappers; NOT basename(dirname(wav)) (a logging path that collapses many
@@ -74,57 +76,29 @@ def band_label(lo, hi):
 # --------------------------------------------------------------------------- #
 # Frame-level metrics
 # --------------------------------------------------------------------------- #
-def evaluate_pitch_smoothness(
-    pitch_pred: np.ndarray, pred_voicing: np.ndarray, true_voicing: np.ndarray
-) -> dict[str, float]:
-    relative_smoothness, continuity_breaks = np.nan, np.nan
-    voiced_idx = np.where(pred_voicing)[0]
-    if len(voiced_idx) >= 2:
-        consecutive_mask = np.diff(voiced_idx) == 1
-        starts_idx = voiced_idx[:-1][consecutive_mask]
-        ends_idx = voiced_idx[1:][consecutive_mask]
-        if starts_idx.size > 0:
-            pitch_starts = pitch_pred[starts_idx]
-            pitch_ends = pitch_pred[ends_idx]
-            valid_pairs_mask = (pitch_starts > 0) & (pitch_ends > 0)
-            if np.any(valid_pairs_mask):
-                pitch_starts = pitch_starts[valid_pairs_mask]
-                pitch_ends = pitch_ends[valid_pairs_mask]
-                rel_changes = np.abs(pitch_ends - pitch_starts) / (pitch_starts + 1e-8)
-                mean_chg, std_chg = np.mean(rel_changes), np.std(rel_changes)
-                relative_smoothness = std_chg / mean_chg if mean_chg > 1e-09 else 0.0 if std_chg < 1e-08 else np.nan
+def pitch_prf(n_correct, tp, fp, fn) -> tuple[float, float, float]:
+    """THE metric family -- one definition, parameterised only by the cents tolerance.
 
-    labeled_segments, num_segments = label(true_voicing)
-    if num_segments > 0:
-        gt_segments = find_objects(labeled_segments)
-        break_count = 0
-        total_relevant_segments = 0
-        for seg_slice_tuple in gt_segments:
-            seg_slice = seg_slice_tuple[0]
-            if seg_slice.stop - seg_slice.start > 1:
-                total_relevant_segments += 1
-                if not np.all(pred_voicing[seg_slice]):
-                    break_count += 1
-        if total_relevant_segments > 0:
-            continuity_breaks = break_count / total_relevant_segments
+    `n_correct` counts frames that are truly voiced AND given a pitch by the tracker AND
+    within tolerance. The denominators are the voicing sets, so every voicing mistake is
+    charged and abstention can never inflate the score:
 
-    return {
-        "relative_smoothness": float(relative_smoothness),
-        "continuity_breaks": float(continuity_breaks),
-    }
+        pitch precision = n_correct / (tp + fp)     of what it output, how much was right
+        pitch recall    = n_correct / (tp + fn)     of the pitch that exists, how much it got
+        pitch F1        = 2 n_correct / ((tp+fp) + (tp+fn))
 
+    P and R share a numerator, so their harmonic mean collapses to that Dice ratio --
+    which is why F1 here is DERIVED, not chosen.
 
-def pitch_prf(n_ok, tp, fp, fn) -> tuple[float, float, float]:
-    """The pitch F-score family: precision/recall/F of the event "truly voiced frame,
-    voiced with pitch output, within tolerance". n_ok = count of tp frames within tolerance; the
-    denominators are the voicing sets, so every voicing mistake is charged and abstention
-    can never inflate the score. Harmonic mean of P and R collapses to the Dice ratio
-    2*n_ok/((tp+fp)+(tp+fn)) because both share the numerator. T->inf (n_ok == tp)
-    recovers classic voicing F1."""
-    r = n_ok / (tp + fn) if (tp + fn) > 0 else 0.0
-    p = n_ok / (tp + fp) if (tp + fp) > 0 else 0.0
+    Voicing precision / recall / F1 are the SAME formulas with the pitch test removed
+    (a tolerance wide enough to accept any pitch, which is finite: the largest possible
+    error is 1200*log2(fmax/fmin), about 6600 cents over a 46-2094 Hz range). So the
+    benchmark has one metric family, not two.
+    """
+    r = n_correct / (tp + fn) if (tp + fn) > 0 else 0.0
+    p = n_correct / (tp + fp) if (tp + fp) > 0 else 0.0
     denom = (tp + fp) + (tp + fn)
-    f = 2.0 * n_ok / denom if denom > 0 else 0.0
+    f = 2.0 * n_correct / denom if denom > 0 else 0.0
     return p, r, f
 
 
@@ -133,84 +107,108 @@ def pitch_prf(n_ok, tp, fp, fn) -> tuple[float, float, float]:
 # --------------------------------------------------------------------------- #
 # Every frame-level metric above is a count or mean over evaluated frames, hence additive: clips
 # fold in one at a time into running sufficient statistics, never holding the whole dataset's
-# contours in memory. Results are identical to running evaluate_*() on the fully-concatenated
-# arrays (same finite-frame rule, same octave/gross definitions). Memory is O(#bands).
-PITCH_TOLERANCES = (10.0, 25.0, 50.0)  # cents tolerances for the pitch F-score family
-T_MAX = 100.0                          # tolerance-AUC truncation: AUC = 1 - truncMAE/T_MAX
-GROSS_ERROR_CENTS = 200.0
+# contours in memory. Folding clips in one at a time is identical to scoring the fully
+# concatenated arrays (same finite-frame rule, same error-class definitions). O(#bands) memory.
+# The two scored tolerances. An intermediate rung was dropped as redundant with its
+# neighbours; EXACT and CORRECT are what the error classes need.
+EXACT_CENTS = 10.0     # below the pitch JND: an inaudible error
+CORRECT_CENTS = 50.0   # half a semitone: the melody-extraction convention
+WRONG_CENTS = 200.0    # two semitones: a different pitch entirely
+
+
+def error_rates(counts) -> dict:
+    """The conditional diagnostics over the frames that were scored for pitch, from the
+    sufficient statistics. ONE implementation, so the streaming accumulator and a
+    bootstrap resample of summed per-clip rows cannot drift apart.
+
+    `correct_rate` is exact+close, the literature's RPA. `cents_bias` is the mean SIGNED
+    error over the IN-TOLERANCE frames only: 0 means symmetric scatter, non-zero means the
+    tracker sits systematically sharp (+) or flat (-) and can be corrected by subtracting
+    it. Its denominator is n_correct, NOT frames, so it is not comparable to cents_mae."""
+    v = counts["frames"]
+    if not v:
+        return {"cents_mae": np.nan, "cents_bias": np.nan, "correct_rate": np.nan,
+                "octave_rate": np.nan, "wrong_rate": np.nan, "frames": 0}
+    ok = counts["n_correct"]
+    return {"cents_mae": counts["sum_cents"] / v,
+            "cents_bias": (counts.get("sum_signed_cents_correct", 0.0) / ok
+                           if ok else np.nan),
+            "correct_rate": counts["n_correct"] / v,
+            "octave_rate": counts["n_octave"] / v,
+            "wrong_rate": counts["n_wrong"] / v,
+            "frames": v}
 
 
 class _PitchBin:
-    """Running pitch-accuracy sufficient statistics over a subset of frames (overall or a band)."""
+    """Running pitch sufficient statistics over a subset of frames (overall or a band).
 
-    __slots__ = ("n_gross", "n_octave", "n_ok10", "n_ok25", "n_ok50", "n_rca",
-                 "sum_cents", "sum_sq", "sum_trunc", "valid")
+    Counts only; every reported rate is derived from these by division, so summing bins
+    across clips reproduces the aggregate exactly (the property the bootstrap relies on).
+    """
+
+    __slots__ = ("n_correct", "n_exact", "n_octave", "n_wrong",
+                 "sum_cents", "sum_signed", "valid")
 
     def __init__(self):
         self.valid = 0
-        self.n_ok10 = self.n_ok25 = self.n_ok50 = 0
-        self.n_rca = self.n_gross = self.n_octave = 0
-        self.sum_cents = self.sum_sq = self.sum_trunc = 0.0
+        self.n_exact = self.n_correct = self.n_wrong = self.n_octave = 0
+        self.sum_cents = self.sum_signed = 0.0
 
     def add(self, pitch_pred: np.ndarray, pitch_true: np.ndarray, mask: np.ndarray) -> None:
         if not np.any(mask):
             return
         pred, true = pitch_pred[mask], pitch_true[mask]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            abs_cents = np.abs(1200 * np.log2(pred / true))
-        finite = np.isfinite(abs_cents)  # drop degenerate frames (pred/true <= 0 -> non-finite cents)
-        abs_cents, pred, true = abs_cents[finite], pred[finite], true[finite]
+        signed = cents(pred, true)
+        finite = np.isfinite(signed)  # drop degenerate frames (pred/true <= 0 -> non-finite cents)
+        signed = signed[finite]
+        abs_cents = np.abs(signed)
         if abs_cents.size == 0:
             return
         self.valid += int(abs_cents.size)
         self.sum_cents += float(abs_cents.sum())
-        self.sum_sq += float(np.sum((pred - true) ** 2))
-        self.sum_trunc += float(np.minimum(abs_cents, T_MAX).sum())
-        self.n_ok10 += int(np.sum(abs_cents < 10.0))
-        self.n_ok25 += int(np.sum(abs_cents < 25.0))
-        self.n_ok50 += int(np.sum(abs_cents < 50.0))
-        wrapped = abs_cents % 1200
-        chroma = np.minimum(wrapped, 1200 - wrapped)
-        self.n_rca += int(np.sum(chroma < 50.0))
-        self.n_gross += int(np.sum(abs_cents > GROSS_ERROR_CENTS))
+        self.n_exact += int(np.sum(abs_cents < EXACT_CENTS))
+        within = abs_cents < CORRECT_CENTS
+        self.n_correct += int(np.sum(within))
+        # SIGNED sum, over the IN-TOLERANCE frames only. |error| alone cannot distinguish a
+        # tracker running consistently sharp from one scattering symmetrically, and those
+        # are different defects. Restricting to in-tolerance frames is what makes it mean
+        # that: over ALL scored frames the mean signed error is dominated by the octave
+        # tail, so it reports a large spurious "offset" for a tracker whose typical error is
+        # small. A sum over a counted subset stays additive; a median, the other
+        # obvious fix, does not.
+        self.sum_signed += float(signed[within].sum())
+        self.n_wrong += int(np.sum(abs_cents > WRONG_CENTS))
+        # octave = within a semitone of a whole-octave multiple; a strict SUBSET of wrong
+        # (the smallest octave error is 1100c), so wrong - octave is the non-harmonic mass
         nearest_octave = np.round(abs_cents / 1200.0)
         self.n_octave += int(
             np.sum((nearest_octave >= 1) & (np.abs(abs_cents - nearest_octave * 1200.0) < 100.0))
         )
 
+    def counts(self) -> dict:
+        """This bin's additive sufficient statistics, under the canonical column names."""
+        return {"frames": int(self.valid), "n_exact": int(self.n_exact),
+                "n_correct": int(self.n_correct), "n_wrong": int(self.n_wrong),
+                "n_octave": int(self.n_octave), "sum_cents": float(self.sum_cents),
+                "sum_signed_cents_correct": float(self.sum_signed)}
+
     def result(self) -> dict:
-        if self.valid == 0:
-            return {
-                "rmse": np.nan, "cents_error": np.nan, "rpa": np.nan, "rca": np.nan,
-                "octave_error_rate": np.nan, "gross_error_rate": np.nan, "valid_frames": 0,
-            }
-        v = self.valid
-        return {
-            "rmse": float(np.sqrt(self.sum_sq / v)),
-            "cents_error": self.sum_cents / v,
-            "rpa": self.n_ok50 / v,
-            "rca": self.n_rca / v,
-            "octave_error_rate": self.n_octave / v,
-            "gross_error_rate": self.n_gross / v,
-            "valid_frames": v,
-        }
+        return error_rates(self.counts())
 
 
 class MetricAccumulator:
     """Streaming metrics for ONE voicing threshold; fold clips in with update(), read at the end.
 
-    Equivalent to concatenating every clip and scoring voicing P/R/F1, pitch accuracy, and
-    evaluate_pitch_smoothness on the full arrays, but with O(#bands) memory.
+    Equivalent to concatenating every clip and scoring the whole array at once, but with
+    O(#bands) memory.
     """
 
-    def __init__(self, bands=PITCH_BANDS, tau=0.5):
-        self.bands = bands
-        self.tau = tau                      # pitch_conf threshold for scoring RPA (when provided)
+    def __init__(self):
+        self.bands = PITCH_BANDS
+        self.tau = VOICED_THRESHOLD         # pitch_conf threshold for scoring, when provided
         self.tp = self.fp = self.fn = 0
         self._overall = _PitchBin()
-        self._band = {name: _PitchBin() for name, _, _ in bands}
-        self._sm_sum = {"relative_smoothness": 0.0, "continuity_breaks": 0.0}
-        self._sm_cnt = {"relative_smoothness": 0, "continuity_breaks": 0}
+        self._band = {name: _PitchBin() for name, _, _ in PITCH_BANDS}
 
     def update(self, pred_pitch, pred_voicing, true_pitch, true_voicing, pitch_conf=None) -> None:
         # A frame the tracker calls voiced but assigns no pitch (pred_pitch <= 0) is a VOICING miss,
@@ -233,77 +231,38 @@ class MetricAccumulator:
             self._band[name].add(
                 pred_pitch, true_pitch, mask & (true_pitch >= lo) & (true_pitch < hi)
             )
-        sm = evaluate_pitch_smoothness(pred_pitch, pred_voicing, tv)
-        for key, val in sm.items():
-            if val is not None and np.isfinite(val):
-                self._sm_sum[key] += val
-                self._sm_cnt[key] += 1
 
     def voicing_metrics(self) -> dict:
-        tp, fp, fn = self.tp, self.fp, self.fn
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 0.0 if (precision + recall) == 0 else 2 * precision * recall / (precision + recall)
-        return {"precision": precision, "recall": recall, "f1": f1}
+        """The same family with the pitch test removed: every voiced frame counts as
+        correct, which is pitch_prf's n_correct = tp."""
+        p, r, f1 = pitch_prf(self.tp, self.tp, self.fp, self.fn)
+        return {"precision": p, "recall": r, "f1": f1}
 
-    def pitch_metrics(self) -> dict:
+    def error_metrics(self) -> dict:
+        """CONDITIONAL diagnostics over the frames scored for pitch (both sides voiced)."""
         return self._overall.result()
 
-    def pitch_coverage(self) -> float:
-        """Fraction of ground-truth-voiced frames that entered pitch scoring (valid_frames /
-        (TP+FN)). Pitch metrics are computed only where BOTH sides are voiced, so a
-        conservative tracker scores RPA on an easier, self-selected subset; coverage is the
-        column that makes RPA comparable across algorithms (low coverage = survivor-biased RPA)."""
-        gt_voiced = self.tp + self.fn
-        return self._overall.result()["valid_frames"] / gt_voiced if gt_voiced > 0 else 0.0
-
     def suff_stats(self) -> dict:
-        """The additive sufficient statistics behind every scalar metric (overall pitch bin + voicing
-        counts). Summing these across clips reproduces the full-dataset accumulator EXACTLY, so a
-        cluster bootstrap can resample clips, sum, and RECOMPUTE any aggregate (pitch F / voicing F1 /
-        coverage / cents / AUC) frame-weighted: the honest way to CI a nonlinear aggregate."""
-        o = self._overall
-        return {"valid": int(o.valid), "n_ok10": int(o.n_ok10), "n_ok25": int(o.n_ok25),
-                "n_ok50": int(o.n_ok50), "sum_trunc_cents": float(o.sum_trunc),
-                "sum_cents": float(o.sum_cents), "n_octave": int(o.n_octave),
-                "n_gross": int(o.n_gross),
+        """The additive sufficient statistics behind every scalar metric (overall pitch bin +
+        voicing counts). Summing these across clips reproduces the full-dataset accumulator
+        EXACTLY, so a cluster bootstrap can resample clips, sum, and RECOMPUTE any aggregate
+        frame-weighted: the honest way to CI a nonlinear aggregate."""
+        return {**self._overall.counts(),
                 "tp": int(self.tp), "fp": int(self.fp), "fn": int(self.fn)}
 
     def per_band(self) -> dict:
-        out = {}
-        for name, _, _ in self.bands:
-            r = self._band[name].result()
-            out[name] = {
-                "rpa": r["rpa"],
-                "octave": r["octave_error_rate"],
-                "gross": r["gross_error_rate"],
-                "valid_frames": r["valid_frames"],
-            }
-        return out
+        """Same conditional diagnostics, split by ground-truth pitch band."""
+        return {name: self._band[name].result() for name, _, _ in self.bands}
 
-    def smoothness_metrics(self) -> dict:
-        return {
-            k: (self._sm_sum[k] / self._sm_cnt[k] if self._sm_cnt[k] else np.nan)
-            for k in ("relative_smoothness", "continuity_breaks")
-        }
-
-    def pitch_f_metrics(self) -> dict:
-        """The pitch F-score family at every tolerance + the tolerance AUC."""
-        o = self._overall
-        out = {}
-        for tol, n_ok in (("10", o.n_ok10), ("25", o.n_ok25), ("50", o.n_ok50)):
-            p, r, f = pitch_prf(n_ok, self.tp, self.fp, self.fn)
-            out[f"f{tol}"] = f
-            if tol == "50":
-                out["r50"], out["p50"] = r, p
-        denom = (self.tp + self.fp) + (self.tp + self.fn)
-        out["auc"] = (2.0 * (o.valid * T_MAX - o.sum_trunc) / (denom * T_MAX)
-                      if denom > 0 else 0.0)
-        return out
+    def pitch_metrics(self) -> dict:
+        """The UNCONDITIONAL pitch family at this threshold: precision / recall / F1 of the
+        event "truly voiced AND given a pitch AND within CORRECT_CENTS"."""
+        p, r, f1 = pitch_prf(self._overall.n_correct, self.tp, self.fp, self.fn)
+        return {"f1": f1, "recall": r, "precision": p}
 
 
 # --------------------------------------------------------------------------- #
-# Shared evaluation helpers (used by both pitch_benchmark.py and ood_benchmark.py)
+# Shared evaluation helpers (used by the frame and synthetic runners)
 # --------------------------------------------------------------------------- #
 DEFAULT_THRESHOLDS = np.linspace(0.0, 1.0, 11)  # voicing operating-point sweep, one source of truth
 
@@ -327,51 +286,17 @@ def to_json_safe(obj):
     return str(obj)  # last-resort for exotic types (set, Path, datetime, ...) -> string
 
 
-def voicing_boundary_latency(pred_voiced, true_voiced, frame_period, min_frames=8):
-    """Onset/offset truncation of ground-truth voiced regions, in ms.
-
-    For each GT voiced region of >= min_frames, onset latency = time from the region's first
-    frame to the tracker's first voiced frame inside it (region length if never voiced);
-    offset latency symmetric. Aggregate voicing F1 is position-blind: a tracker that
-    systematically eats the first 30 ms of every region (e.g. the low start of a rising tone)
-    can share an F1 with one that scatters its misses; this is the metric that separates them.
-    Returns (onset_ms_list, offset_ms_list), one entry per qualifying region."""
-    pred_voiced = np.asarray(pred_voiced).astype(bool)
-    true_voiced = np.asarray(true_voiced).astype(bool)
-    on, off = [], []
-    i, n = 0, min(len(pred_voiced), len(true_voiced))
-    while i < n:
-        if true_voiced[i]:
-            j = i
-            while j < n and true_voiced[j]:
-                j += 1
-            if j - i >= min_frames:
-                hit = np.where(pred_voiced[i:j])[0]
-                if len(hit) == 0:
-                    on.append((j - i) * frame_period * 1000.0)
-                    off.append((j - i) * frame_period * 1000.0)
-                else:
-                    on.append(hit[0] * frame_period * 1000.0)
-                    off.append((j - i - 1 - hit[-1]) * frame_period * 1000.0)
-            i = j
-        else:
-            i += 1
-    return on, off
-
-
 def sweep_summary(accumulators, thresholds):
     """The per-threshold aggregate block: one entry per threshold, NO selection. Threshold
     choice is a report-time decision (a global per-algorithm theta*), never a per-cell one."""
     out = []
     for threshold, acc in zip(thresholds, accumulators):
-        v, p = acc.voicing_metrics(), acc.pitch_metrics()
         out.append({
             "threshold": float(threshold),
-            "voicing": v,
-            "pitch_f": acc.pitch_f_metrics(),
-            "pitch": {**p, "coverage": acc.pitch_coverage()},
+            "pitch": acc.pitch_metrics(),        # unconditional family: f1 / recall / precision
+            "voicing": acc.voicing_metrics(),    # the same family with the pitch test removed
+            "errors": acc.error_metrics(),       # conditional diagnostics on scored frames
             "per_band": acc.per_band(),
-            "smoothness": acc.smoothness_metrics(),
         })
     return out
 
@@ -380,12 +305,12 @@ def sweep_summary(accumulators, thresholds):
 # report tables and evaluate.compare). Always cluster by the per-clip `group` (speaker/singer/
 # piece via get_group), never by clip; correlated clips would give false precision. We pre-SUM
 # each cluster's columns once (metrics are additive), resample cluster INDICES vectorized, and a
-# reducer turns the summed picks into the frame-weighted aggregate (RPA/coverage/F1/cents/
-# combined) or a clip-mean (note COnP). Because every reducer consumes only column SUMS,
+# reducer turns the summed picks into the frame-weighted aggregate (pitch F1 / voicing F1 /
+# frame-weighted aggregate. Because every reducer consumes only column SUMS,
 # evaluating it on one pre-summed dict is exactly equivalent to handing it the picked dicts --
 # the scalar reducers stay the single, verified formula implementation.
 # --------------------------------------------------------------------------- #
-def keyed_group_sums(rows, cols, group_col=1):
+def keyed_group_sums(rows, cols):
     """Per cluster {name: Σcolumn, ..., '_n': #clips} KEYED by the cluster id (so two algorithms
     scored on the same clips can be paired cluster-by-cluster). `cols` = [(name, col_index)].
     Deliberately NO clip-level fallback for a single-group result: between-source variance is
@@ -395,7 +320,7 @@ def keyed_group_sums(rows, cols, group_col=1):
     practice; it exists for degenerate inputs (e.g. a custom dataset that is one source)."""
     groups = {}
     for r in rows:
-        groups.setdefault(r[group_col], []).append(r)
+        groups.setdefault(r[1], []).append(r)          # column 1 is the cluster key
     out = {}
     for g, rs in groups.items():
         d = {"_n": len(rs)}
@@ -450,13 +375,13 @@ def paired_tied(keyed_a, keyed_b, reduce_fn, n_boot=2000, seed=0):
     return bool(lo <= 0.0 <= hi)
 
 
-def paired_delta_ci(pairs, reduce_fn=None, n_boot=2000):
+def paired_delta_ci(pairs, n_boot=2000):
     """95% CI of the mean-over-datasets PAIRED metric delta (clean - degraded), in
     percentage points. `pairs` = per dataset (keyed_clean, keyed_degraded) cluster sums over the
     SAME probe clips; each bootstrap draw resamples clusters within each dataset (stratified) and
     applies the same picks to both sides, so shared clip difficulty cancels. Datasets with < 2
     common clusters cannot be resampled and are skipped. Returns (lo, hi, n_datasets_used)."""
-    reduce_fn = reduce_fn or FRAME_REDUCERS["pitch_f"]
+    reduce_fn = FRAME_REDUCERS["pitch_f1"]
     per_ds = []
     for k, (kc, kd) in enumerate(pairs):
         common = sorted(set(kc) & set(kd))
@@ -477,66 +402,84 @@ def sum_col(dicts, k):
 # Frame reducers: recompute the FRAME-weighted aggregate from summed sufficient stats (so CIs match
 # the reported per-threshold sweep values exactly).
 def agg_from_sums(dicts):
-    v = sum_col(dicts, "valid")
+    """(errors, voicing) recomputed from summed sufficient statistics -- the same
+    formulas the accumulator uses, so a bootstrap resample reproduces the reported
+    value exactly."""
     tp, fp, fn = sum_col(dicts, "tp"), sum_col(dicts, "fp"), sum_col(dicts, "fn")
-    pm = {"rpa": sum_col(dicts, "n_ok50") / v if v else 0.0,
-          "cents_error": sum_col(dicts, "sum_cents") / v if v else 0.0,
-          "octave_error_rate": sum_col(dicts, "n_octave") / v if v else 0.0,
-          "gross_error_rate": sum_col(dicts, "n_gross") / v if v else 0.0}
-    vm = {"precision": tp / (tp + fp) if (tp + fp) else 0.0,
-          "recall": tp / (tp + fn) if (tp + fn) else 0.0}
-    vm["f1"] = 0.0 if (vm["precision"] + vm["recall"]) == 0 else \
-        2 * vm["precision"] * vm["recall"] / (vm["precision"] + vm["recall"])
-    coverage = v / (tp + fn) if (tp + fn) else 0.0
-    return pm, vm, coverage
+    errors = error_rates({c: sum_col(dicts, c) for c in FRAME_STAT_COLS})
+    p, r, f1 = pitch_prf(tp, tp, fp, fn)
+    return errors, {"precision": p, "recall": r, "f1": f1}
 
 
-def _prf_from_sums(ds, tol):
-    tp, fp, fn = sum_col(ds, "tp"), sum_col(ds, "fp"), sum_col(ds, "fn")
-    return pitch_prf(sum_col(ds, f"n_ok{tol}"), tp, fp, fn)
+def _prf_from_sums(ds):
+    return pitch_prf(sum_col(ds, "n_correct"), sum_col(ds, "tp"),
+                     sum_col(ds, "fp"), sum_col(ds, "fn"))
 
 
-def _auc_from_sums(ds):
-    v, trunc = sum_col(ds, "valid"), sum_col(ds, "sum_trunc_cents")
-    denom = (sum_col(ds, "tp") + sum_col(ds, "fp")) + (sum_col(ds, "tp") + sum_col(ds, "fn"))
-    return 2.0 * (v * T_MAX - trunc) / (denom * T_MAX) if denom > 0 else 0.0
-
-
-FRAME_STAT_COLS = ("valid", "n_ok10", "n_ok25", "n_ok50", "sum_trunc_cents",
-                   "sum_cents", "n_octave", "n_gross", "tp", "fp", "fn")
+# The stored per-clip sufficient statistics. Every one is a COUNT (or a sum of cents),
+# so they are additive across clips; every reported rate is a ratio of these.
+FRAME_STAT_COLS = ("frames", "n_exact", "n_correct", "n_wrong", "n_octave",
+                   "sum_cents", "sum_signed_cents_correct", "tp", "fp", "fn")
 FRAME_REDUCERS = {
-    "pitch_f": lambda ds: _prf_from_sums(ds, 50)[2],
-    "pitch_f25": lambda ds: _prf_from_sums(ds, 25)[2],
-    "pitch_f10": lambda ds: _prf_from_sums(ds, 10)[2],
-    "pitch_recall": lambda ds: _prf_from_sums(ds, 50)[1],
-    "pitch_precision": lambda ds: _prf_from_sums(ds, 50)[0],
-    "tol_auc": _auc_from_sums,
-    "rpa": lambda ds: agg_from_sums(ds)[0]["rpa"],       # accuracy on detected frames
+    # unconditional pitch family (the headline)
+    "pitch_f1": lambda ds: _prf_from_sums(ds)[2],
+    "pitch_recall": lambda ds: _prf_from_sums(ds)[1],
+    "pitch_precision": lambda ds: _prf_from_sums(ds)[0],
+    # the same family with the pitch test removed
     "voicing_f1": lambda ds: agg_from_sums(ds)[1]["f1"],
-    "coverage": lambda ds: agg_from_sums(ds)[2],
-    "cents_mae": lambda ds: agg_from_sums(ds)[0]["cents_error"],
+    "voicing_recall": lambda ds: agg_from_sums(ds)[1]["recall"],
+    # conditional diagnostics
+    "correct_rate": lambda ds: agg_from_sums(ds)[0]["correct_rate"],
+    "cents_mae": lambda ds: agg_from_sums(ds)[0]["cents_mae"],
 }
+
+
+# The metadata fields load_cells REQUIRES to route a cell to its key. Part of the stored
+# format: renaming one is exactly as breaking as renaming a stat column, and the reader would
+# otherwise accept the cell and then fail (or mis-route it) one layer down.
+CELL_ENVELOPE = ("suite", "algorithm_name", "format")
+
+
+def format_id():
+    """A short id for the STORED cell format: the metadata fields the reader routes on, the
+    per-clip columns, and the actual key structure a sweep entry carries. Stamped on every
+    cell at write time and compared at read time, so a cell written under a different layout
+    is refused rather than silently misread.
+
+    One comparison, derived from the real objects, replaces two hand-maintained guards that
+    between them covered the stat columns and one sweep key -- a renamed `errors.cents_mae`
+    or `per_band.correct_rate` passed both, and every reader of those uses `.get()`, so the
+    field simply vanished from the report with no error."""
+    entry = sweep_summary([MetricAccumulator()], [0.5])[0]
+    shape = (CELL_ENVELOPE, FRAME_STAT_COLS,
+             tuple(sorted(entry["pitch"])), tuple(sorted(entry["voicing"])),
+             tuple(sorted(entry["errors"])), tuple(sorted(next(iter(entry["per_band"].values())))))
+    return hashlib.sha1(repr(shape).encode()).hexdigest()[:8]
+
+
+def check_format(cell):
+    """Refuse a cell whose stored format is not the current one."""
+    got = (cell.get("metadata") or {}).get("format")
+    if got != format_id():
+        raise ValueError(
+            f"cell format {got!r} is not the current {format_id()!r}: it was written under "
+            "different metric definitions and must be regenerated "
+            "(rm the cells and re-run)")
 
 
 def frame_keyed(pc, theta_idx):
     """Keyed cluster sums (+ #clips) for one per_clip block at ONE threshold index. The v2
     per_clip block stores, per clip, the suff-stat row for every threshold; theta_idx picks
     the operating point (a report-time decision, typically the algorithm's theta*)."""
+    # strict: clips and stats are stored as two independent lists, so a truncated write
+    # would silently drop the tail clips from every bootstrap rather than fail
     rows = [list(meta[:2]) + list(stats[theta_idx])
-            for meta, stats in zip(pc["clips"], pc["stats"])]
+            for meta, stats in zip(pc["clips"], pc["stats"], strict=True)]
     idx = [(c, 2 + i) for i, c in enumerate(FRAME_STAT_COLS)]
     return keyed_group_sums(rows, idx), len(rows)
 
 
-def ci_cell(value, lo, hi, fmt="{:.3f}"):
-    """A 'value [lo, hi]' markdown cell (shared by the frame + note CI tables). No interval
-    (single cluster, see cluster_bootstrap) renders as '[n/a]'."""
-    if not (np.isfinite(lo) and np.isfinite(hi)):
-        return f"{fmt.format(value)} [n/a]"
-    return f"{fmt.format(value)} [{fmt.format(lo)}, {fmt.format(hi)}]"
-
-
-def compare_keyed(keyed_a, keyed_b, metric="pitch_f", n_boot=2000, seed=0):
+def compare_keyed(keyed_a, keyed_b, metric="pitch_f1", n_boot=2000, seed=0):
     """Paired comparison of two keyed-cluster-sum dicts on their COMMON clusters.
     Returns (delta, ci_lo, ci_hi): point delta = reduce(A) - reduce(B) over all common clusters,
     CI from the paired cluster bootstrap. (delta, nan, nan) with < 2 common clusters."""
@@ -550,15 +493,6 @@ def compare_keyed(keyed_a, keyed_b, metric="pitch_f", n_boot=2000, seed=0):
     return delta, lo, hi
 
 
-def compare(per_clip_a, per_clip_b, theta_idx_a, theta_idx_b, metric="pitch_f",
-            n_boot=2000, seed=0):
-    """Paired comparison of two algorithms from their per_clip blocks (same cell, both scored
-    the same clips), each read at its own operating point. Returns (delta, ci_lo, ci_hi) of
-    A - B on the chosen frame metric."""
-    return compare_keyed(frame_keyed(per_clip_a, theta_idx_a)[0],
-                         frame_keyed(per_clip_b, theta_idx_b)[0], metric, n_boot, seed)
-
-
 # --------------------------------------------------------------------------- #
 # Track scoring (the v2 question layer): pure functions over a load_cells dict.
 # Tracks are SITUATIONS of use, never decomposition axes, so nothing is scored twice;
@@ -566,257 +500,741 @@ def compare(per_clip_a, per_clip_b, theta_idx_a, theta_idx_b, metric="pitch_f",
 # diagnostic rendered beneath its track. Threshold selection happens HERE (one global
 # theta* per algorithm), never per cell.
 # --------------------------------------------------------------------------- #
+class StrEnum(str, Enum):
+    """enum.StrEnum, which arrived in 3.11 and the algorithm matrix pins us below.
+
+    The `__str__` is the whole point: without it a (str, Enum) member formats as its VALUE
+    under an f-string but as `Class.MEMBER` under str() and %s, so the same member produces
+    two different strings depending on how it is written out -- and a filename or an argv
+    token built the wrong way is silently wrong rather than an error."""
+
+    def __str__(self):
+        return self.value
+
+
+class Suite(StrEnum):
+    """The four measurement libraries a run can invoke. Deliberately NOT called tracks:
+    a TRACK is one of the six scored questions in the report. These four are independent
+    and order-free -- any subset, in any order.
+
+    THE declaration of the set: `evaluate.SUITES` is derived from it, so there is one place
+    to add a fifth. str-valued so a value read from JSON compares and hashes equal to the
+    member, which is what lets cells on disk key a dict of CellKeys."""
+
+    FRAME = "frame"
+    NOTE = "note"
+    SYNTHETIC = "synthetic"
+    SPEED = "speed"
+
+
+@dataclass(frozen=True)
+class Score:
+    """A track score with its interval. `lo`/`hi` are None where the resampling unit is
+    unsound (families, or a single measurement) -- absent rather than manufactured."""
+
+    value: float | None
+    lo: float | None = None
+    hi: float | None = None
+
+
+@dataclass(frozen=True)
+class Delta:
+    """A paired A - B comparison. `significant` is derived here so no consumer has to
+    re-derive the rule (and get it subtly different)."""
+
+    value: float
+    lo: float
+    hi: float
+
+    @property
+    def significant(self) -> bool:
+        return self.lo > 0 or self.hi < 0
+
+
+TRACK_ORDER = ("correctness", "noise", "signal_types", "tracking", "notes", "speed")
+
+
+@dataclass(frozen=True)
+class Tracks:
+    """The six scored questions. ATTRIBUTES, not string keys: the set is closed, so a
+    typo should fail at once instead of returning a KeyError or a silent .get() miss."""
+
+    correctness: Score
+    noise: Score
+    signal_types: Score
+    tracking: Score
+    notes: Score
+    speed: Score
+
+    def items(self):
+        """(name, Score) in report order."""
+        return [(f, getattr(self, f)) for f in TRACK_ORDER]
+
+    def values(self):
+        return [s.value for _n, s in self.items()]
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class CellKey:
+    """What identifies a measurement.
+
+    Keyword-only on purpose: `subject` and `condition` are adjacent `str | None` fields, so a
+    positional swap would build a key that matches no cell and read back as "no data" rather
+    than as an error. Not a tuple, so it cannot be indexed, sliced, unpacked, or compared
+    equal to one -- a key is a set of named parts, and any code treating it as a sequence is
+    relying on field ORDER, which is not something this type promises.
+
+    `cap` is a field because it distinguishes MEASUREMENTS, not just files: a 30-clip and a
+    50-clip probe of the same (dataset, condition, algo) are two different measurements.
+    It is also what keeps the clean baseline distinct without a pseudo-condition: the full
+    clean cell is cap=None and a capped baseline is its own cap.
+    """
+
+    suite: "Suite"
+    subject: str | None           # dataset name, or synthetic family; None for speed
+    condition: str | None
+    algo: str
+    cap: tuple | None = None      # (max_clips, max_seconds); None = uncapped
+
+
+def cap_of(cell):
+    """The cap a cell was measured under, or None if uncapped. Read from the recorded
+    parameters, never from the filename."""
+    p = cell.get("parameters") or {}
+    n, s = p.get("max_clips"), p.get("max_seconds")
+    return (n, s) if (n or s) else None
+
+
 SIGMA0 = 10.0        # cents; steady-jitter normalizer s = SIGMA0/(SIGMA0+jitter)
-TRACKS_SCORED = ("accuracy", "noise", "signals", "stability", "dynamics", "notes", "speed")
+
+# Datasets whose PITCH ground truth is score-grade (the notated note, not the performed
+# f0). Their voicing labels are sound, but a pitch score against them measures the
+# annotation convention rather than the tracker, so they are excluded from every pitch
+# number INCLUDING theta* selection -- a threshold tuned partly against an annotation
+# artifact would then govern all the other tables. The policy lives here, at the scoring
+# layer, so the report and the training repo cannot disagree with it.
+PITCH_INELIGIBLE = frozenset({"M4Singer"})
 
 
-def _frame_cells(cells, algo, condition, datasets=None):
-    for (track, ds, cond, a), cell in cells.items():
-        if track != "frame" or a != algo or cond != condition:
-            continue
-        if datasets and ds not in datasets:
+def _eligible(key, algo, datasets):
+    """Shared row filter: right algorithm, scoreable dataset, inside any narrowing."""
+    return (key.algo == algo and key.subject not in PITCH_INELIGIBLE
+            and not (datasets and key.subject not in datasets))
+
+
+def _readable(cell):
+    """A cell that ran to completion and has something to score."""
+    return (not cell.get("metadata", {}).get("crashed")
+            and bool(cell.get("results", {}).get("sweep")))
+
+
+def frame_cells(cells, algo, condition, datasets=None, *, any_cap=False):
+    """(dataset, cap, cell) per dataset for this condition, preferring the UNCAPPED cell.
+
+    A capped and an uncapped run of the same (dataset, condition) are different
+    measurements and both live in `cells` under their own cap. The cap is yielded because
+    every caller needs to know what a score was measured on; deriving it separately meant
+    two copies of this preference rule that could disagree.
+
+    If the UNCAPPED cell exists and crashed, the dataset yields NOTHING: a 30-clip probe
+    must not silently stand in for the full run that segfaulted. `crashed_datasets` reports
+    it and the track scores it 0. `any_cap=True` relaxes exactly that, for theta*, which
+    needs an operating point even on a dataset the algorithm failed -- the crash still
+    costs that dataset its score, only the threshold is recovered.
+    """
+    best, uncapped_crashed = {}, set()
+    for key, cell in cells.items():
+        if key.suite != Suite.FRAME or key.condition != condition or not _eligible(key, algo, datasets):
             continue
         if cell.get("metadata", {}).get("crashed"):
+            if key.cap is None:
+                uncapped_crashed.add(key.subject)
             continue
-        if cell.get("results", {}).get("sweep"):
-            yield ds, cell
+        if not _readable(cell):
+            continue
+        prev = best.get(key.subject)
+        if prev is None or (prev[0] is not None and key.cap is None):
+            best[key.subject] = (key.cap, cell)
+    for ds, (cap, cell) in best.items():
+        if ds in uncapped_crashed and not any_cap:
+            continue
+        yield ds, cap, cell
 
 
-def _sweep_f50(cell, idx):
-    return cell["results"]["sweep"][idx]["pitch_f"]["f50"]
+def frame_cell_at(cells, algo, dataset, condition, cap):
+    """The completed cell for exactly this cap, or None. Distinct from frame_cells: an
+    exact lookup, not a preference (the Noise track pairs against the clean baseline at
+    the SAME cap)."""
+    cell = cells.get(CellKey(suite="frame", subject=dataset, condition=condition,
+                             algo=algo, cap=cap))
+    return cell if cell is not None and _readable(cell) else None
+
+
+def crashed_datasets(cells, algo, *, conditions=None, datasets=None):
+    """Datasets whose cell RAN AND DIED, for the given conditions.
+
+    These score 0 in their track's own domain. Skipping them instead would grade a tracker
+    that segfaults on a corpus only on the corpora it survived, so two trackers covering
+    different numbers of datasets would be printed side by side as if comparable.
+
+    A cell that never RAN (an uninstalled backend writes no cell at all) is absent from
+    `cells` entirely and stays missing, so the two cases remain distinguishable:
+    metadata.crash_kind records `exit -N` / `timeout > Ns`, both attributable to the
+    algorithm."""
+    out = set()
+    for key, cell in cells.items():
+        if key.suite != Suite.FRAME or not cell.get("metadata", {}).get("crashed"):
+            continue
+        if conditions is not None and key.condition not in conditions:
+            continue
+        if not _eligible(key, algo, datasets):
+            continue
+        out.add(key.subject)
+    return out
+
+
+def _crashed_synthetic(cells, algo, kind):
+    """Crashed synthetic families of ONE type, so a crash is charged to the track that
+    owns that family and to no other. `metadata.family_type` is written from the family
+    name BEFORE the run, so it survives the crash that empties `results`; the fallback
+    re-derives it for cells written without it."""
+    out = set()
+    for key, cell in cells.items():
+        if key.suite != Suite.SYNTHETIC or key.algo != algo \
+                or not cell.get("metadata", {}).get("crashed"):
+            continue
+        fam = key.subject
+        ftype = cell.get("metadata", {}).get("family_type")
+        if ftype is None:
+            from synthetic_benchmark import FAMILIES, family_type
+            ftype = family_type(fam) if fam in FAMILIES else None
+        if ftype == kind:
+            out.add(fam)
+    return out
+
+
+def _trajectory_group(fam):
+    """Which of the two capabilities the Tracking track weighs equally a family probes:
+    holding a steady tone, or following a moving one."""
+    from synthetic_benchmark import FAMILIES
+    return "vib" if FAMILIES.get(fam, (None,))[0] == "vib" else "steady"
+
+
+def _dead_score(dead, star=None):
+    """The result a track returns when it has NO readable cell. Cells that were attempted
+    and died score 0 -- a tracker that dies everywhere must not outrank one that merely
+    scores badly. Nothing attempted at all stays missing (None)."""
+    return {"score": 0.0 if dead else None, "n_completed": 0, "n_crashed": len(dead),
+            **(star or {})}
+
+
+def _with_zeros(values, n_crashed):
+    """Mean over completed cells plus one 0 per crashed cell."""
+    vals = list(values) + [0.0] * n_crashed
+    return float(np.mean(vals)) if vals else None
+
+
+def _sweep_f(cell, idx):
+    """The cell's unconditional pitch F1 at one threshold index."""
+    return cell["results"]["sweep"][idx]["pitch"]["f1"]
 
 
 def theta_star(cells, algo, *, datasets=None):
     """The algorithm's ONE frozen operating point: argmax over the threshold grid of the
-    equal-per-dataset mean pitch F@50 on clean frame cells. Full (uncapped) clean cells
+    equal-per-dataset mean pitch F1 on clean frame cells. Full (uncapped) clean cells
     are preferred; if only probe-sized clean baselines exist the fallback is used and
     stamped in the provenance. Ties resolve to the lowest threshold.
     Returns {"theta", "idx", "provenance", "n_datasets"}."""
-    full, probe = {}, {}
-    for ds, cell in _frame_cells(cells, algo, "clean", datasets):
-        (probe if cell.get("metadata", {}).get("probe") else full)[ds] = cell
-    pool, provenance = (full, "clean-full") if full else (probe, "clean-probe")
+    # frame_cells already prefers the uncapped cell per dataset; the caps tell us which
+    # kind of measurement the pool actually is. A crashed full cell no longer hides the
+    # capped baseline, because they are separate keys rather than competitors.
+    # Pool-level, not per-dataset: an equal-per-dataset mean must not average a full
+    # measurement against a 30-clip probe. Full cells win outright where any exist.
+    everything, full = {}, {}
+    for ds, cap, cell in frame_cells(cells, algo, "clean", datasets, any_cap=True):
+        everything[ds] = cell
+        if cap is None:
+            full[ds] = cell
+    pool, provenance = (full, "clean-full") if full else (everything, "clean-probe")
     if not pool:
         return {"theta": None, "idx": None, "provenance": "no-clean-cells", "n_datasets": 0}
-    n_thr = len(next(iter(pool.values()))["results"]["thresholds"])
-    means = [float(np.mean([_sweep_f50(c, i) for c in pool.values()])) for i in range(n_thr)]
+    # the shortest grid in the pool: cells swept over different grids would otherwise
+    # make the argmax depend on which cell happened to be iterated first
+    n_thr = min(len(c["results"]["thresholds"]) for c in pool.values())
+    means = [float(np.mean([_sweep_f(c, i) for c in pool.values()])) for i in range(n_thr)]
     idx = int(np.argmax(means))                       # argmax returns the FIRST max: lowest theta
     theta = next(iter(pool.values()))["results"]["thresholds"][idx]
     return {"theta": float(theta), "idx": idx, "provenance": provenance,
             "n_datasets": len(pool)}
 
 
-def oracle_theta(cell):
-    """Per-cell F@50 argmax index (the oracle the stability track measures against)."""
-    sweep = cell["results"]["sweep"]
-    return int(np.argmax([e["pitch_f"]["f50"] for e in sweep]))
-
-
 def _pooled_sums(cells, algo, *, theta_idx, datasets=None, conditions=("clean",)):
-    """Summed suff stats over the selected frame cells at one threshold index."""
+    """Summed suff stats over the selected frame cells at one threshold index.
+    conditions=None pools EVERY condition except the probe baseline."""
+    if conditions is None:
+        conditions = sorted({k.condition for k in cells
+                             if k.suite == Suite.FRAME and k.algo == algo})
     total = None
     for cond in conditions:
-        for _ds, cell in _frame_cells(cells, algo, cond, datasets):
+        for _ds, _cap, cell in frame_cells(cells, algo, cond, datasets):
             pc = cell["results"].get("per_clip")
             if not pc:
                 continue
             for stats in pc["stats"]:
-                row = dict(zip(FRAME_STAT_COLS, stats[theta_idx]))
+                # strict: a row that does not match the schema would otherwise
+                # zip-truncate and silently shift every field past the difference
+                row = dict(zip(FRAME_STAT_COLS, stats[theta_idx], strict=True))
                 total = row if total is None else {k: total[k] + row[k] for k in total}
     return total
 
 
-def pitch_prf_from_cells(cells, algo, *, theta_idx, tolerance=50, datasets=None,
-                         conditions=("clean",)):
-    """Frame-pooled pitch P/R/F over the selected cells at one operating point."""
-    s = _pooled_sums(cells, algo, theta_idx=theta_idx, datasets=datasets,
-                     conditions=conditions)
-    if not s:
-        return None
-    p, r, f = pitch_prf(s[f"n_ok{int(tolerance)}"], s["tp"], s["fp"], s["fn"])
-    return {"precision": p, "recall": r, "f": f}
-
-
 def factorization(cells, algo, *, theta_idx, datasets=None, conditions=("clean",)):
-    """The identity pitch_recall = voicing_recall x accuracy_on_voiced, from pooled
-    counts (both classic RPA definitions as the factors of one product)."""
+    """Pooled pitch precision / recall / F1 plus voicing recall, so a report can show
+    where a tracker's recall comes from: pitch recall = voicing recall x (the
+    conditional correct rate, which the error table already reports as exact+close)."""
     s = _pooled_sums(cells, algo, theta_idx=theta_idx, datasets=datasets,
                      conditions=conditions)
     if not s:
         return None
-    p, r, f = pitch_prf(s["n_ok50"], s["tp"], s["fp"], s["fn"])
+    p, r, f = pitch_prf(s["n_correct"], s["tp"], s["fp"], s["fn"])
     vrec = s["tp"] / (s["tp"] + s["fn"]) if (s["tp"] + s["fn"]) else 0.0
-    return {"pitch_f": f, "pitch_recall": r, "pitch_precision": p,
-            "voicing_recall": vrec,
-            "accuracy_on_voiced": s["n_ok50"] / s["tp"] if s["tp"] else 0.0}
+    return {"pitch_f1": f, "pitch_recall": r, "pitch_precision": p,
+            "voicing_recall": vrec}
 
 
-def track_accuracy(cells, algo, *, datasets=None):
-    """How correct is the output curve on clean real recordings?"""
+def track_correctness(cells, algo, *, datasets=None):
+    """How correct is the output curve on clean real recordings? (pitch F1)"""
     star = theta_star(cells, algo, datasets=datasets)
     if star["idx"] is None:
-        return {"score": None, **star}
+        return _dead_score(crashed_datasets(cells, algo, conditions={"clean"},
+                                    datasets=datasets), star)
     per_ds = {}
-    for ds, cell in _frame_cells(cells, algo, "clean", datasets):
+    for ds, cap, cell in frame_cells(cells, algo, "clean", datasets):
         e = cell["results"]["sweep"][star["idx"]]
-        per_ds[ds] = {"f50": e["pitch_f"]["f50"], "auc": e["pitch_f"]["auc"],
-                      "probe": bool(cell.get("metadata", {}).get("probe"))}
-    if not per_ds:
+        # capped-ness comes from the KEY, not from a metadata flag: two recordings of one
+        # fact can disagree
+        per_ds[ds] = {"f1": e["pitch"]["f1"], "cap": cap}
+    crashed = crashed_datasets(cells, algo, conditions={"clean"}, datasets=datasets) - set(per_ds)
+    if not per_ds and not crashed:
         return {"score": None, **star}
-    return {"score": float(np.mean([d["f50"] for d in per_ds.values()])),
-            "auc": float(np.mean([d["auc"] for d in per_ds.values()])),
-            "per_dataset": per_ds, **star}
+    return {"score": _with_zeros([d["f1"] for d in per_ds.values()], len(crashed)),
+            "per_dataset": per_ds, "n_completed": len(per_ds),
+            "n_crashed": len(crashed), **star}
 
 
 def track_noise(cells, algo, *, datasets=None):
-    """How much of the clean score survives real-world corruption? Ratio of pitch F@50
-    degraded/clean on the SAME probe clips, equal-per-dataset then mean over conditions."""
+    """How well does it work UNDER real-world corruption? The equal-per-dataset mean
+    pitch F1 over the degraded conditions -- an ABSOLUTE score, same construction as
+    track_correctness with a different condition set.
+
+    Deliberately NOT the retention ratio F_degraded/F_clean: that ratio rises when clean
+    performance falls, so sandbagging your own clean output raises the score at fixed
+    degraded performance, and it is floor-effect-prone. The ratio survives as
+    `per_condition_retention`, reported
+    and never scored, because "how much was lost" is still worth reading."""
     star = theta_star(cells, algo, datasets=datasets)
     if star["idx"] is None:
-        return {"score": None, **star}
-    clean_probe = {}
-    for ds, cell in _frame_cells(cells, algo, "clean_probe", datasets):
-        clean_probe[ds] = cell
-    if not clean_probe:                       # store holds only one clean variant per ds
-        for ds, cell in _frame_cells(cells, algo, "clean", datasets):
-            if cell.get("metadata", {}).get("probe"):
-                clean_probe[ds] = cell
-    conds = sorted({k[2] for k in cells
-                    if k[0] == "frame" and k[3] == algo
-                    and k[2] not in ("clean", "clean_probe")})
-    per_cond = {}
+        return _dead_score(crashed_datasets(cells, algo, datasets=datasets), star)
+    conds = sorted({k.condition for k in cells
+                    if k.suite == Suite.FRAME and k.algo == algo and k.condition != "clean"})
+    per_cond, retention = {}, {}
     for cond in conds:
-        ratios = []
-        for ds, cell in _frame_cells(cells, algo, cond, datasets):
-            if ds not in clean_probe:
-                continue
-            fc = _sweep_f50(clean_probe[ds], star["idx"])
-            if fc > 0:
-                ratios.append(min(_sweep_f50(cell, star["idx"]) / fc, 1.5))
+        fs, ratios = [], []
+        seen = set()
+        for ds, cap, cell in frame_cells(cells, algo, cond, datasets):
+            seen.add(ds)
+            f = _sweep_f(cell, star["idx"])
+            fs.append(f)
+            # the retention ratio must divide by clean measured on the SAME clips, so
+            # match the degraded cell's cap before falling back to the full clean cell
+            base = (frame_cell_at(cells, algo, ds, "clean", cap)
+                    or frame_cell_at(cells, algo, ds, "clean", None))
+            if base is not None:
+                fc = _sweep_f(base, star["idx"])
+                if fc > 0:
+                    ratios.append(f / fc)
+        n_dead = len(crashed_datasets(cells, algo, conditions={cond}, datasets=datasets) - seen)
+        s = _with_zeros(fs, n_dead)
+        if s is not None:
+            per_cond[cond] = s
         if ratios:
-            per_cond[cond] = float(np.mean(ratios))
+            retention[cond] = float(np.mean(ratios))
     if not per_cond:
         return {"score": None, **star}
-    return {"score": float(np.clip(np.mean(list(per_cond.values())), 0.0, 1.0)),
-            "per_condition": per_cond, **star}
+    return {"score": float(np.mean(list(per_cond.values()))),
+            "per_condition": per_cond,
+            "per_condition_retention": retention,   # diagnostic only, never scored
+            # the denominator, so two algorithms averaged over different numbers of
+            # conditions are not read as if they were comparable
+            "n_conditions": len(per_cond),
+            **star}
 
 
-def track_signals(cells, algo):
-    """How much of the synthetic signal-class space does it handle? Mean over the
-    stationary families of pitch recall@50 (coverage-aware accuracy) at theta*; each
-    family is one probe question, equally weighted. The worst family is carried as the
-    named diagnostic (a min SCORE was measured to zero out most real trackers -- 6 of 7
-    surveyed have at least one dead family -- destroying all downstream ranking)."""
-    star = theta_star(cells, algo)
-    if star["idx"] is None:
-        return {"score": None, **star}
-    fams = {}
-    for (track, fam, _c, a), cell in cells.items():
-        if track != "synthetic" or a != algo or cell.get("metadata", {}).get("crashed"):
+def synthetic_cells(cells, algo, kind):
+    """Completed synthetic cells of one family kind, as (family, sweep-entry-getter).
+
+    The ONE place the synthetic result envelope is opened. Everything else asks by family
+    kind and gets values, so a change to the stored shape lands here and nowhere else.
+    """
+    for key, cell in cells.items():
+        if key.suite != Suite.SYNTHETIC or key.algo != algo \
+                or cell.get("metadata", {}).get("crashed"):
             continue
         res = cell.get("results", {})
-        if res.get("kind") == "stationary" and res.get("sweep"):
-            fams[fam] = res["sweep"][star["idx"]]["pitch_f"]["r50"]
-    if not fams:
-        return {"score": None, **star}
-    worst = min(fams, key=fams.get)
-    return {"score": float(np.mean(list(fams.values()))), "worst_family": worst,
-            "worst": float(fams[worst]), "per_family": fams, **star}
+        if res.get("kind") == kind and res.get("sweep"):
+            yield key.subject, res["sweep"]
 
 
-def track_stability(cells, algo, *, datasets=None):
-    """Does one global threshold work everywhere? Mean over clean cells of
-    F(theta*)/F(per-cell oracle). Binary-confidence trackers are trivially 1.0."""
+def stationary_families(cells, algo):
+    """The synthetic stationary families this algorithm has completed cells for."""
+    return sorted(fam for fam, _sweep in synthetic_cells(cells, algo, "stationary"))
+
+
+def synthetic_recall(cells, algo, family, theta_idx):
+    """Unconditional pitch recall for one stationary family at a threshold index, or None
+    if the algorithm has no completed cell for it."""
+    if theta_idx is None:
+        return None
+    for fam, sweep in synthetic_cells(cells, algo, "stationary"):
+        if fam == family:
+            return sweep[theta_idx]["pitch"]["recall"]
+    return None
+
+
+def cost_summary(cells, algo):
+    """Reliability facts about running one algorithm: how many cells finished and how the
+    rest failed. Speed is measured separately and comparably by the controlled Speed track;
+    a timing taken during the accuracy runs is neither controlled nor device-uniform (cells
+    auto-resolve to cpu/mps/cuda and run concurrently), so it is not reported here."""
+    attempted = completed = 0
+    kinds = {}
+    for key, cell in cells.items():
+        if key.algo != algo:
+            continue
+        attempted += 1
+        m = cell.get("metadata", {})
+        if m.get("crashed"):
+            k = m.get("crash_kind", "unknown")
+            kinds[k] = kinds.get(k, 0) + 1
+            continue
+        completed += 1
+    return {"attempted": attempted, "completed": completed, "crash_kinds": kinds}
+
+
+def track_ci(cells, algo, track, *, datasets=None, n_boot=2000):
+    """95% interval for a track score, or None where the resampling unit is unsound.
+
+    Only `correctness` and `noise` have one: their unit is the CLIP, resampled within each
+    dataset and averaged across datasets per replicate -- the same equal-per-dataset
+    weighting the score itself uses. Signal types (~24 families), Tracking (5) and Notes
+    (3 datasets) would be resampling a handful of units; Speed is a single measurement.
+    An absent interval is honest; a wide unstable one invites false confidence.
+
+    A crashed dataset contributes 0 to EVERY draw, because it contributes 0 to the score.
+    Without that the interval would bracket a number the score never reports: a low
+    absolute score paired with a completed-only interval sitting far above it.
+    """
+    if track not in ("correctness", "noise"):
+        return None
     star = theta_star(cells, algo, datasets=datasets)
     if star["idx"] is None:
-        return {"score": None, **star}
-    ratios = {}
-    for ds, cell in _frame_cells(cells, algo, "clean", datasets):
-        oracle = _sweep_f50(cell, oracle_theta(cell))
-        if oracle > 0:
-            ratios[ds] = _sweep_f50(cell, star["idx"]) / oracle
-    if not ratios:
-        return {"score": None, **star}
-    return {"score": float(np.clip(np.mean(list(ratios.values())), 0.0, 1.0)),
-            "per_dataset": ratios, **star}
+        return None
+    conditions = ("clean",) if track == "correctness" else tuple(
+        sorted({k.condition for k in cells if k.suite == Suite.FRAME and k.algo == algo
+                and k.condition != "clean"}))
+    # Mean WITHIN each condition, then across conditions -- exactly how track_noise
+    # weights its score. A flat mean over all (condition, dataset) cells silently
+    # reweights by how many datasets each condition happens to have, and produced an
+    # interval that did not contain the score it was bracketing.
+    by_cond, n_seen = {}, 0
+    for cond in conditions:
+        draws, seen = [], set()
+        for ds, _cap, cell in frame_cells(cells, algo, cond, datasets):
+            pc = cell["results"].get("per_clip")
+            if not (pc and pc.get("stats")):
+                continue
+            seen.add(ds)
+            keyed, _n = frame_keyed(pc, star["idx"])
+            draws.append(boot_vals(list(keyed.values()), FRAME_REDUCERS["pitch_f1"],
+                                   n_boot, seed=n_seen + len(draws)))
+        dead = crashed_datasets(cells, algo, conditions={cond}, datasets=datasets) - seen
+        draws += [np.zeros(n_boot)] * len(dead)
+        if draws:
+            n_seen += len(draws)
+            by_cond[cond] = np.mean(draws, axis=0)
+    if not by_cond:
+        return None
+    per_replicate = np.mean(list(by_cond.values()), axis=0)
+    return float(np.percentile(per_replicate, 2.5)), float(np.percentile(per_replicate, 97.5))
 
 
-def track_dynamics(cells, algo):
-    """Is a moving pitch followed faithfully? Steady tones (jitter, bias) + vibrato
-    (depth retention x coverage); the two families the pilot showed discriminate."""
-    star = theta_star(cells, algo)
+def track_signal_types(cells, algo, *, datasets=None):
+    """How much of the synthetic signal-class space does it handle? Mean over the
+    stationary families of pitch RECALL at theta* (unconditional, so refusing to
+    voice a family scores low rather than vanishing); each
+    family is one probe question, equally weighted. The worst family is carried as the
+    named diagnostic rather than scored as a min, because most real trackers have at least
+    one dead family and a min would zero them all out, destroying downstream ranking."""
+    star = theta_star(cells, algo, datasets=datasets)
+    dead = _crashed_synthetic(cells, algo, "stationary")
     if star["idx"] is None:
+        return _dead_score(dead, star)
+    fams = {fam: sweep[star["idx"]]["pitch"]["recall"]
+            for fam, sweep in synthetic_cells(cells, algo, "stationary")}
+    dead -= set(fams)
+    if not fams and not dead:
         return {"score": None, **star}
+    scored = dict(fams, **{f: 0.0 for f in dead})     # a crash IS a failed family
+    worst = min(scored, key=scored.get)
+    return {"score": float(np.mean(list(scored.values()))), "worst_family": worst,
+            "worst": float(scored[worst]), "per_family": scored,
+            "n_completed": len(fams), "n_crashed": len(dead), **star}
+
+
+def track_tracking(cells, algo, *, datasets=None):
+    """Is a moving pitch followed faithfully? Steady tones (jitter, bias) + vibrato
+    (depth retention x voiced fraction); the two families the pilot showed discriminate."""
+    star = theta_star(cells, algo, datasets=datasets)
+    dead = _crashed_synthetic(cells, algo, "trajectory")
+    if star["idx"] is None:
+        return _dead_score(dead, star)
     steady, vib = [], []
     detail = {}
-    for (track, fam, _c, a), cell in cells.items():
-        if track != "synthetic" or a != algo or cell.get("metadata", {}).get("crashed"):
+    for key, cell in cells.items():
+        fam = key.subject
+        if key.suite != Suite.SYNTHETIC or key.algo != algo \
+                or cell.get("metadata", {}).get("crashed"):
             continue
         res = cell.get("results", {})
         if res.get("kind") != "trajectory" or not res.get("sweep"):
             continue
         e = res["sweep"][star["idx"]]
         detail[fam] = e
+        # A readout is None when the tracker voiced too few frames of that stimulus to
+        # measure it. That is a FAILURE on this track, not missing data: score it 0
+        # rather than skipping, or a tracker that declines the hard stimuli would be
+        # rewarded with a higher mean over the ones it did attempt.
         if "jitter_cents" in e:
-            steady.append(SIGMA0 / (SIGMA0 + e["jitter_cents"]))
-        if "depth_retention" in e:
-            vib.append(np.clip(e["depth_retention"], 0.0, 1.0) * e.get("coverage", 1.0))
+            j, b = e["jitter_cents"], e.get("bias_cents")
+            # TOTAL error, not de-biased jitter: scoring jitter alone lets a tracker that
+            # emits a CONSTANT (even an octave wrong) score perfectly, beating an honest
+            # tracker with a little noise. Bias is folded in (hypot), not discarded.
+            err = None if j is None else float(np.hypot(j, b or 0.0))
+            steady.append(SIGMA0 / (SIGMA0 + err) if err is not None else 0.0)
+        if "depth_ratio" in e:
+            d = e["depth_ratio"]
+            vf = e.get("voiced_fraction") or 0.0
+            vib.append(np.clip(d, 0.0, 1.0) * vf if d is not None else 0.0)
+    # A crashed family is a 0 inside ITS OWN group, not a 0 alongside the group means:
+    # `parts` holds at most two entries, so charging a dead family there would give one
+    # stimulus the weight of an entire capability.
+    dead -= set(detail)
+    for fam in dead:
+        (vib if _trajectory_group(fam) == "vib" else steady).append(0.0)
     parts = [float(np.mean(x)) for x in (steady, vib) if x]
     if not parts:
-        return {"score": None, **star}
-    return {"score": float(np.mean(parts)), "per_family": detail, **star}
+        return _dead_score(dead, star)
+    return {"score": float(np.mean(parts)), "per_family": detail,
+            "n_completed": len(detail), "n_crashed": len(dead), **star}
 
 
 def track_notes(cells, algo):
     """Is musical note structure recoverable? Mean COnP over note datasets (this track
     selects its own threshold x segmentation-cost internally, documented)."""
-    vals = {}
-    for (track, ds, _c, a), cell in cells.items():
-        if track == "note" and a == algo and not cell.get("metadata", {}).get("crashed"):
-            v = cell.get("results", {}).get("conp")
-            if v is not None and np.isfinite(v):
-                vals[ds] = v
-    if not vals:
+    vals, dead = {}, set()
+    for key, cell in cells.items():
+        ds = key.subject
+        if key.suite != Suite.NOTE or key.algo != algo or ds in PITCH_INELIGIBLE:
+            continue        # COnP is a 50-cent PITCH test, so the same exclusion applies
+        if cell.get("metadata", {}).get("crashed"):
+            dead.add(ds)                       # a crash is a failed dataset, not a skip
+            continue
+        v = cell.get("results", {}).get("conp")
+        if v is not None and np.isfinite(v):
+            vals[ds] = v
+    dead -= set(vals)
+    if not vals and not dead:
         return {"score": None}
-    return {"score": float(np.mean(list(vals.values()))), "per_dataset": vals}
+    return {"score": _with_zeros(list(vals.values()), len(dead)),
+            "per_dataset": vals, "n_completed": len(vals), "n_crashed": len(dead)}
 
 
 def track_speed(cells, algo):
     """Is it deployable? score = 1/(1+RTF_cpu)."""
-    for (track, _ds, _c, a), cell in cells.items():
-        if track == "speed" and a == algo:
-            dev = cell.get("results", {}).get("device_results", {}).get("cpu", {})
-            ms = dev.get("absolute_time_ms")
-            if ms is None:
-                return {"score": None}
-            sec = cell.get("parameters", {}).get("signal_length_sec", 1.0)
-            rtf = (ms / 1000.0) / sec
-            return {"score": 1.0 / (1.0 + rtf), "rtf_cpu": rtf}
+    crashed = False
+    for key, cell in cells.items():
+        if key.suite != Suite.SPEED or key.algo != algo:
+            continue
+        if cell.get("metadata", {}).get("crashed"):
+            crashed = True                 # keep looking: a good cell outranks a dead one
+            continue
+        dev = cell.get("results", {}).get("device_results", {}).get("cpu", {})
+        ms = dev.get("absolute_time_ms")
+        if ms is None:
+            return {"score": None}
+        sec = cell.get("parameters", {}).get("signal_length_seconds") or 1.0
+        rtf = (ms / 1000.0) / sec
+        return {"score": 1.0 / (1.0 + rtf), "rtf_cpu": rtf}
+    if crashed:
+        return {"score": 0.0, "n_completed": 0, "n_crashed": 1}
     return {"score": None}
 
 
-def track_scores(cells, algo, *, datasets=None):
-    """The seven track scores (None where a track has no cells)."""
-    return {
-        "accuracy": track_accuracy(cells, algo, datasets=datasets)["score"],
+def track_scores(cells, algo, *, datasets=None, intervals=True):
+    """The six track scores as a `Tracks`, each a `Score` carrying its interval where one
+    is sound. `intervals=False` skips the bootstrap when only the point estimates are
+    wanted (the report renders many algorithms)."""
+    raw = {
+        "correctness": track_correctness(cells, algo, datasets=datasets)["score"],
         "noise": track_noise(cells, algo, datasets=datasets)["score"],
-        "signals": track_signals(cells, algo)["score"],
-        "stability": track_stability(cells, algo, datasets=datasets)["score"],
-        "dynamics": track_dynamics(cells, algo)["score"],
+        "signal_types": track_signal_types(cells, algo, datasets=datasets)["score"],
+        "tracking": track_tracking(cells, algo, datasets=datasets)["score"],
         "notes": track_notes(cells, algo)["score"],
         "speed": track_speed(cells, algo)["score"],
     }
+    out = {}
+    for name, value in raw.items():
+        ci = track_ci(cells, algo, name, datasets=datasets) if (
+            intervals and value is not None) else None
+        out[name] = Score(value, *(ci or (None, None)))
+    return Tracks(**out)
+
+
+def harmonic_mean(values):
+    """The one mean used for the Overall. Zero-propagating: a zero anywhere makes it 0,
+    which is what "the weakest axis dominates" has to mean. Dropping zeros instead would
+    make the mean ANTI-monotone in failure, since what survives the drop are exactly the
+    tracker's best axes."""
+    v = np.asarray(list(values), dtype=float)
+    if v.size == 0 or (v <= 0).any():
+        return 0.0
+    return float(v.size / np.sum(1.0 / v))
+
+
+def rank_key(overall_value, track_values):
+    """The one ordering for every leaderboard: measured before unmeasured, Overall
+    descending, then -- among the trackers a failed axis has pinned to 0 -- the harmonic
+    mean of the tracks that did NOT fail, so failing one axis outranks failing everywhere."""
+    survivors = [x for x in track_values if x]
+    return (overall_value is None, -(overall_value or 0.0),
+            -harmonic_mean(survivors) if survivors else 0.0)
 
 
 def overall(cells, algo, *, datasets=None):
-    """Harmonic mean of the seven track scores, equal weights: the same mean family as
+    """Harmonic mean of the six track scores, equal weights: the same mean family as
     the F-scores inside the tracks, and the one that punishes a weak axis hardest (HM
     is dominated by the smallest score). None if ANY track is missing (never a silent
     partial mean); a zero track makes it 0 (a failed axis sinks it)."""
-    scores = track_scores(cells, algo, datasets=datasets)
-    vals = list(scores.values())
+    scores = track_scores(cells, algo, datasets=datasets, intervals=False)
+    vals = scores.values()
     if any(v is None for v in vals):
         return None
     if any(v <= 0 for v in vals):
         return 0.0
-    return float(len(vals) / np.sum(1.0 / np.asarray(vals)))
+    return harmonic_mean(vals)
+
+
+# --------------------------------------------------------------------------- #
+# Derived read-outs the report renders. They compute NUMBERS, so they live here
+# (testable, and reachable by anything that imports the scoring layer) rather than
+# inside the presentation layer.
+# --------------------------------------------------------------------------- #
+def error_classes(cells, algo, *, theta_idx, datasets=None):
+    """The four disjoint magnitude classes over every scored frame, pooled across all
+    conditions, plus the two cents summaries. exact+close+off+wrong == 1 by construction."""
+    t = _pooled_sums(cells, algo, theta_idx=theta_idx, datasets=datasets, conditions=None)
+    if not t or not t["frames"]:
+        return None
+    v = t["frames"]
+    rates = error_rates(t)
+    return {"exact": t["n_exact"] / v,
+            "close": (t["n_correct"] - t["n_exact"]) / v,
+            "off": (v - t["n_correct"] - t["n_wrong"]) / v,
+            "wrong": t["n_wrong"] / v,
+            "cents_mae": rates["cents_mae"], "cents_bias": rates["cents_bias"],
+            "frames": v}
+
+
+def band_aggregate(cells, algo, *, theta_idx, datasets=None):
+    """Frame-weighted correct rate per ground-truth pitch band: catches a tracker that is
+    fine overall and broken in one register. Frame counts come with it, so an empty band
+    is distinguishable from a failed one."""
+    agg = {b: {"frames": 0.0, "correct": 0.0} for b, _, _ in PITCH_BANDS}
+    conds = sorted({k.condition for k in cells
+                    if k.suite == Suite.FRAME and k.algo == algo})
+    for cond in conds:
+        for _ds, _cap, cell in frame_cells(cells, algo, cond, datasets):
+            pb = (cell["results"]["sweep"][theta_idx] or {}).get("per_band") or {}
+            for b, _lo, _hi in PITCH_BANDS:
+                d = pb.get(b) or {}
+                n = d.get("frames") or 0
+                if n and d.get("correct_rate") is not None:
+                    agg[b]["frames"] += n
+                    agg[b]["correct"] += d["correct_rate"] * n
+    return {b: (d["correct"] / d["frames"], int(d["frames"])) if d["frames"] else (None, 0)
+            for b, d in agg.items()}
+
+
+def ties(cells, *, datasets=None):
+    """Per clean dataset: the best pitch F1 and every algorithm statistically tied with it.
+    A leaderboard prints 0.878 next to 0.862 as though the gap were real; a paired cluster
+    bootstrap over the clips both algorithms scored says whether it is."""
+    per_ds = {}
+    for algo in sorted({k.algo for k in cells}):
+        star = theta_star(cells, algo, datasets=datasets)
+        if star["idx"] is None:
+            continue
+        for ds, _cap, cell in frame_cells(cells, algo, "clean", datasets):
+            pc = cell["results"].get("per_clip")
+            if not (pc and pc.get("stats")):
+                continue
+            per_ds.setdefault(ds, {})[algo] = (
+                _sweep_f(cell, star["idx"]), frame_keyed(pc, star["idx"])[0])
+    out = {}
+    for ds, entry in per_ds.items():
+        if len(entry) < 2:
+            continue
+        best = max(entry, key=lambda a: entry[a][0])
+        out[ds] = {"best": best, "f1": entry[best][0],
+                   "tied": [a for a in sorted(entry) if a != best
+                            and paired_tied(entry[a][1], entry[best][1],
+                                            FRAME_REDUCERS["pitch_f1"])]}
+    return out
+
+
+def noise_drop_ci(cells, algo, *, datasets=None):
+    """Paired CI on how much pitch F1 the degradations cost, in percentage points. Each
+    (dataset, condition) contributes one clean/degraded pair over the clips both sides
+    scored, so shared clip difficulty cancels."""
+    star = theta_star(cells, algo, datasets=datasets)
+    if star["idx"] is None:
+        return float("nan"), float("nan"), 0
+    pairs = []
+    for key, cell in cells.items():
+        if key.suite != Suite.FRAME or key.condition == "clean" or not _eligible(key, algo, datasets):
+            continue
+        # pair against the clean baseline at the SAME cap: literally the same clips,
+        # which is what "paired" means. Fall back to the full cell only if there is none.
+        clean = (frame_cell_at(cells, algo, key.subject, "clean", key.cap)
+                 or frame_cell_at(cells, algo, key.subject, "clean", None))
+        pc_d = (cell.get("results") or {}).get("per_clip")
+        pc_c = ((clean or {}).get("results") or {}).get("per_clip")
+        if not (pc_d and pc_d.get("stats") and pc_c and pc_c.get("stats")):
+            continue
+        pairs.append((frame_keyed(pc_c, star["idx"])[0],
+                      frame_keyed(pc_d, star["idx"])[0]))
+    return paired_delta_ci(pairs) if pairs else (float("nan"), float("nan"), 0)
+
+
+def has_fixed_operating_point(cells, algo):
+    """True when the sweep is flat on every clean cell: the tracker exposes no usable
+    voicing confidence, so theta* is a formality rather than a tuned choice."""
+    seen = False
+    for _ds, _cap, cell in frame_cells(cells, algo, "clean"):
+        f = [e["pitch"]["f1"] for e in cell["results"]["sweep"]]
+        if not f:
+            continue
+        seen = True
+        if max(f) - min(f) > 1e-9:
+            return False
+    return seen

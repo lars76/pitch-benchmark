@@ -253,7 +253,7 @@ class PitchDatasetSpeechSynth(PitchDataset):
     waveform, never the other way, so the labels are true by construction (WORLD's DIO/Harvest
     estimators are NOT used; only its synthesizer is). Verified empirically against
     timestamp-calibrated trackers: 4-8 cents label floor and +0.95 ms label-offset consensus,
-    the same exactness class as MDB-stem-synth / Bach10Synth (see TIMING.md).
+    the same exactness class as MDB-stem-synth / Bach10Synth.
 
     Why the imposition step exists: the raw HiFi-GAN audio does NOT realize the conditioning
     contour faithfully (~25 cents median deviation; 42 cents residual even after a per-utterance

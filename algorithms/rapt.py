@@ -7,10 +7,11 @@ from .base import ThresholdPitchAlgorithm
 
 class RAPTPitchAlgorithm(ThresholdPitchAlgorithm):
     # RAPT computes frame m's f0 from a forward-looking NCCF starting at sample m*hop: the
-    # timestamp calibration (tests/test_time_calibration.py) measures the reported content a
+    # timestamp calibration measures the reported content a
     # constant 6.1 ms AFTER m*hop, invariant across sample rates (16 k / 22.05 k), hops (128-512)
     # and fmin (50-100), consistent with the centroid of RAPT's ~7.5 ms correlation window plus
-    # the f0-period lag. Stamped per the calibration policy in TIMING.md (measured constant;
+    # the f0-period lag. A constant measured offset is corrected in the wrapper so every
+    # tracker is compared on one shared grid (measured constant;
     # chirp +6.1 ms and step probe +8.0 ms agree in sign and magnitude).
     NCCF_CONTENT_DELAY = 0.0061  # seconds after the frame index time m*hop/sr
 

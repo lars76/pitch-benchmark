@@ -183,3 +183,7 @@ output.jpg
 
 # macOS
 .DS_Store
+
+# local-only: our own understanding, never shipped
+tests/
+TIMING.md

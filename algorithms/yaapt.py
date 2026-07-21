@@ -10,13 +10,15 @@ class YAAPTPitchAlgorithm(ThresholdPitchAlgorithm):
     """YAAPT pitch detection algorithm implementation.
 
     Timestamps: pYAAPT's `frames_pos` marks the CENTER of each frame_length window, but the
-    timestamp calibration (tests/test_time_calibration.py) shows the reported pitch content sits
+    timestamp calibration shows the reported pitch content sits
     at a fixed delay after the frame START, independent of frame_length (sweeping frame_length
     35 -> 45 ms moves the apparent offset by exactly -frame_length/2: -8.65 -> -13.48 ms), i.e.
     YAAPT's NCCF/spectral evidence is anchored to the front of the analysis window, not its
     center. We therefore stamp frame_start + NCCF_CONTENT_DELAY (measured 8.9 ms at 16 kHz and
     10.3 ms at 22.05 kHz; the 9.6 ms mean leaves <=0.8 ms residual at both rates). Applied per
-    the calibration policy in TIMING.md (chirp -8.65 / step -10.0 agree in sign and magnitude)."""
+    corrected here, since a constant measured offset is corrected in the wrapper so every
+    tracker is compared on one shared grid (chirp -8.65 / step -10.0 agree in sign and
+    magnitude)."""
 
     NCCF_CONTENT_DELAY = 0.0096  # seconds after the analysis-frame start
 

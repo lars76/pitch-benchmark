@@ -24,12 +24,9 @@ another. Read the track columns, not just the overall.
 
 ## Overall Results
 
-The overall score is the harmonic mean of the seven track scores (see the benchmark report for definitions and diagnostics).
+The overall score is the harmonic mean of the six track scores (see [METRICS.md](METRICS.md) for definitions).
 
-| **Algorithm** | **Overall** | **Accuracy** | **Noise** | **Signals** | **Stability** | **Dynamics** | **Notes** | **Speed** |
-|---|---|---|---|---|---|---|---|---|
-| Praat | 0.871 | 0.827 | 0.666 | 0.953 | 0.995 | 0.987 | 0.793 | 0.997 |
-| RMVPE | 0.784 | 0.845 | 0.895 | 0.471 | 0.993 | 0.949 | 0.785 | 0.853 |
+Reference cells are being regenerated against the current metric definitions; this table is rendered from them by `generate_report.py --readme README.md`.
 
 ## Running Your Own Benchmarks
 
@@ -123,18 +120,18 @@ reads whichever form is present for each.)
 
 **Noise sources** (only for the real-noise robustness conditions `--degradation chime|demand`):
 
-- [CHiME-Home](https://archive.org/details/chime-home) - Domestic background noise ([Foster et al., WASPAA 2015](https://ieeexplore.ieee.org/document/7314880)); found at `<root>/chime_home`
-- [DEMAND](https://zenodo.org/records/1227121) - Multi-environment acoustic noise ([Thiemann, Ito & Vincent, Proc. Mtgs. Acoust. 2013](https://hal.science/hal-00796707)); found at `<root>/DEMAND`
+- [CHiME-Home](https://archive.org/details/chime-home) - Domestic background noise ([Foster et al., WASPAA 2015](https://ieeexplore.ieee.org/document/7314880)); pass as `chime=<dir>` (the recorded-noise corpus for the chime condition)
+- [DEMAND](https://zenodo.org/records/1227121) - Multi-environment acoustic noise ([Thiemann, Ito & Vincent, Proc. Mtgs. Acoust. 2013](https://hal.science/hal-00796707)); pass as `demand=<dir>`
 
 **Dataset locations**: you tell the benchmark where each dataset's files start, explicitly —
 `--data "PTDB=/my/SPEECH DATA" KEELE=/my/KEELE/KEELE ...` (the loader reads its corpus's
-documented structure from exactly that directory; nothing is searched for). As a convenience,
-any dataset you do NOT give a path for falls back to `<root>/<Name>` when `--root` is passed —
-the convention layout below (registry name = folder name). Use whichever mix you like; explicit
-paths always win:
+documented structure from exactly that directory; nothing is searched for). There is one
+format and no fallback: every dataset you evaluate needs an entry, except the corpora
+bundled in this repo. A layout like the one below keeps the entries short, but the names are
+yours to choose:
 
 ```
-<root>/                              # your datasets directory (pass with --root)
+your-datasets/                       # each entry passed with --data NAME=DIR
 ├── PTDB/                            # PTDB raw (archive extracts as "SPEECH DATA", rename to PTDB)
 ├── KEELE/                           # Bechtold jbof: <stem>/signal.wav + laryngograph.wav + pitch.npy
 │                                    #   (archive nests KEELE/KEELE, flatten one level)
@@ -164,43 +161,66 @@ SpeechSynth needs no download, it renders at runtime from `datasets/speechsynth.
 python visualize_algorithms.py your_audio.wav --selected_algorithms SwiftF0 CREPE Praat
 ```
 
-**2. Run the whole benchmark**, `evaluate.py` is the ONE entry point for all four tracks
-(frame accuracy + robustness, note transcription, OOD, speed) and the report:
+**2. Run the whole benchmark**, `evaluate.py` is the ONE entry point for all four
+measurement suites (frame accuracy + robustness, note transcription, synthetic signals,
+speed) and the report:
 
 ```bash
-uv run python evaluate.py --root /path/to/your/datasets --workers 10 --report
-# or point at datasets wherever they already live (mixes freely with --root):
-uv run python evaluate.py --data "PTDB=/data/SPEECH DATA" KEELE=/data/KEELE/KEELE --datasets PTDB KEELE --tracks frame
+uv run python evaluate.py --data "PTDB=/data/SPEECH DATA" KEELE=/data/KEELE/KEELE --workers 10 --report
+# narrow to what you need:
+uv run python evaluate.py --data KEELE=/data/KEELE/KEELE --datasets KEELE --suites frame
 ```
-Robustness (non-clean) cells default to the leaderboard cap (`--max-samples 30 --max-seconds 10`,
-the only affordable mode across many trackers); pass `--max-samples 0 --max-seconds 0` to run
-them on the full datasets (the verdict mode, use it for 1-3 algorithms, never a whole
-leaderboard). Capped cells are always tagged (`_probe` in the filename, `metadata.probe`), so a
-capped run can never masquerade as the full benchmark. Resumable: finished
-result cells are skipped, so re-running after adding an algorithm is cheap. `--workers N` fans
-cells out over child processes (also giving crash isolation); `--skip-datasets AVID` drops the
-long poles.
+A run is **uncapped by default** — the full, certifiable measurement. A cap
+(`--max-clips 30 --max-seconds 10`) applies to *every* frame cell, clean included, and a
+capped run cannot certify: the cap is part of a cell's identity, so a capped and an uncapped
+measurement of the same thing are distinct cells and `assert_full()` rejects the capped one.
+Resumable: finished result cells are skipped, so re-running after adding an algorithm is cheap.
+`--workers N` fans cells out over child processes (also giving crash isolation);
+`--skip-datasets AVID` drops the long poles.
+
+**The standard leaderboard run**, two commands into one `results/`, because a full-corpus
+sweep of all 12 degradations across many trackers is not affordable — so degradations run on a
+30-clip probe while the headline (accuracy on clean) stays full-corpus:
+
+```bash
+# 1. every condition (clean included) on a 30-clip probe: the affordable robustness sweep
+uv run python evaluate.py --data ... --workers 10 --max-clips 30 --max-seconds 10
+# 2. clean only, full corpus: the headline + the frozen operating point theta*
+uv run python evaluate.py --data ... --workers 10 --conditions clean --report
+```
+The full clean cell (`cap=None`) is the one `theta*` and Correctness read; the 30-clip clean
+cell is the same-clips partner the Noise track's Δ-from-clean pairing needs; both coexist under
+their own keys. `assert_full()` deliberately refuses to certify this run — it is the affordable
+leaderboard, not the uncapped verdict.
 
 **3. Narrowed runs**, the same entry point, restricted:
 ```bash
-uv run python evaluate.py --root ... --algorithms Praat --datasets Vocadito --tracks frame
-uv run python evaluate.py --root ... --datasets Vocadito --conditions pink --tracks frame
-uv run python evaluate.py --root ... --tracks speed ood
+uv run python evaluate.py --data KEELE=/data/KEELE/KEELE --algorithms Praat --datasets Vocadito --suites frame
+uv run python evaluate.py --data KEELE=/data/KEELE/KEELE --datasets Vocadito --conditions pink --suites frame
+uv run python evaluate.py --data KEELE=/data/KEELE/KEELE --suites speed synthetic
 ```
-Conditions: `clean, white, pink, chime, demand, telephone, reverb, room` (chime/demand read their
-noise banks from `<root>/chime_home` / `<root>/DEMAND` automatically).
+Conditions (13): `clean, white, pink, chime, demand, telephone, codec, reverb, room,
+gain, fade, pink_snr+10, pink_snr-5`. The chime/demand noise banks are named like any
+a recorded-condition corpus in `--data` (`chime=<dir> demand=<dir>`); its presence enables that condition.
 
 **4. Programmatic use** (your own tracker class, no registry edits):
 ```python
 from evaluate import run_cells, compare
-cells = run_cells([MyTracker, "SwiftF0"], root="/data", datasets=["KEELE"],
-                  max_samples=None, max_seconds=None)   # uncapped = verdict mode
-delta, lo, hi = compare(cells, "MyTracker", "SwiftF0", metric="voicing_f1")
+# datasets is ONE {name: path|None} map -- keys are the matrix, values are locations
+# (None = the dataset's own default; only bundled corpora have one). Uncapped = verdict mode.
+cells = run_cells([MyTracker, "SwiftF0"], datasets={"KEELE": "/data/KEELE/KEELE"})
+d = compare(cells, "MyTracker", "SwiftF0", metric="voicing_f1")
+print(d.value, d.lo, d.hi, d.significant)
+
+# the six track scores, each with its interval where one is sound
+from evaluate import track_scores
+tracks = track_scores(cells, "MyTracker")
+print(tracks.correctness)        # Score(value=..., lo=..., hi=...)
 ```
 
 **5. Generate the report separately** (or just pass `--report` above):
 ```bash
-uv run python generate_report.py --results-dir results/ --output benchmark_report.md
+uv run python generate_report.py --results results/ --out benchmark_report.md
 ```
 
 ### Algorithm Implementations
@@ -231,9 +251,10 @@ Each entry links its implementation, followed by the paper it is based on.
 ### Frame timing fairness
 
 Predictions and labels are compared frame by frame on one shared grid, so every wrapper's
-timestamps are **measured** against synthetic signals with analytically known f0
-(`tests/test_time_calibration.py`), and the same correction policy is applied to all trackers.
-See [TIMING.md](TIMING.md) for the contract, the policy, and the per-tracker calibration table.
+timestamps are **measured** against synthetic signals with analytically known f0 -- a
+triangle chirp whose alternating slope separates a constant frequency bias from a timestamp
+offset -- and the same correction policy is applied to every tracker. Each wrapper documents
+its own measured offset in its source.
 
 ## 🤝 Contributing
 

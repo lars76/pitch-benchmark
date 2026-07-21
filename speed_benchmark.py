@@ -75,38 +75,19 @@ def benchmark_algorithm(
         return float("inf")
 
 
-def run_speed_cell(algorithm_class, *, devices, baseline_times, is_baseline,
-                   sample_rate=22050, hop_length=256, signal_length_sec=1.0, n_runs=10):
+def run_speed_cell(algorithm_class, *, devices, sample_rate=22050, hop_length=256,
+                   signal_length_sec=1.0, n_runs=10):
     """Time ONE algorithm on the synthetic harmonic signal across `devices` (pure measurement;
-    evaluate.py owns writing and the always-overwrite policy). `baseline_times` = {device:
-    seconds} of the baseline (None while timing the baseline itself; its relative speed is
-    forced to exactly 1.0). Returns {"supports_cuda", "device_results"}."""
+    evaluate.py owns writing and the always-overwrite policy). Returns {"device_results"}."""
     audio_signal = generate_harmonic_signal(sample_rate, signal_length_sec)
-    algo_data = {"device_results": {}, "supports_cuda": False}
+    algo_data = {"device_results": {}}
     for device in devices:
         latency = benchmark_algorithm(
             algorithm_class, audio_signal, sample_rate, hop_length, device, n_runs)
-        base = None if baseline_times is None else baseline_times.get(device, float("inf"))
-        baseline_ms = float(base * 1000) if base is not None and np.isfinite(base) else None
-        if latency == float("inf"):
-            algo_data["device_results"][device] = {
-                "supported": False, "absolute_time_ms": None,
-                "relative_speed": None, "baseline_time_ms": baseline_ms,
-            }
-            continue
-        if device == "cuda":
-            algo_data["supports_cuda"] = True
-        if is_baseline:
-            relative_speed = 1.0
-            baseline_ms = float(latency * 1000)
-        elif baseline_ms is None:
-            relative_speed = None
-        else:
-            relative_speed = base / latency
+        # absolute_time_ms is None exactly when the device is unsupported, so a separate
+        # "supported" flag would be a second encoding of the same fact
+        supported = latency != float("inf")
         algo_data["device_results"][device] = {
-            "supported": True,
-            "absolute_time_ms": float(latency * 1000),
-            "relative_speed": None if relative_speed is None else float(relative_speed),
-            "baseline_time_ms": baseline_ms,
+            "absolute_time_ms": float(latency * 1000) if supported else None,
         }
     return algo_data

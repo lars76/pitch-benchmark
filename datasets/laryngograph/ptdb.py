@@ -24,7 +24,7 @@ class PitchDatasetPTDB(LaryngographSpeechDataset):
     REFERENCE_LABEL_HOP_SECONDS = 0.01  # PTDB REF .f0 is a 10 ms-hop RAPT-on-laryngograph track
     # The REF track's frame i content sits ~21.7 ms AFTER the nominal i*10 ms stamp: half of RAPT's
     # 32 ms analysis window (16 ms) plus RAPT's forward NCCF offset (~6 ms, independently measured on
-    # our RAPT wrapper by tests/test_time_calibration.py). Measured by the label-offset sweep with
+    # our RAPT wrapper by the timestamp calibration). Measured by the label-offset sweep with
     # three calibrated reference trackers agreeing within 1 ms (scripts/check_dataset_alignment.py).
     REFERENCE_LABEL_OFFSET_SECONDS = 0.0217
 

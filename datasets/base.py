@@ -28,7 +28,7 @@ def frame_rms(
 
     `center` is REQUIRED (no default) because it decides which samples frame i's energy describes,
     and getting that silently wrong is exactly the half-hop timing-bug class the calibration work
-    eliminated (TIMING.md):
+    eliminated:
       - center=True:  frame i spans [i*hop - L//2, i*hop + L - L//2), centered on sample i*hop,
         matching the benchmark grid contract (frame i IS the audio centered at i*hop). Every
         voicing/silence gate in the repo uses this.

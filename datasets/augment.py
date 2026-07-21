@@ -7,12 +7,14 @@ Structure:
     (a list of transforms) to `audio`, deterministically per (seed, idx) -> worker-safe.
   - Truncate(base, max_seconds): trims audio + labels (the sampling concern; cap uses the
     built-in torch.utils.data.Subset).
-  - build_pipeline(name, ...): name -> pipeline, the condition registry.
+  - Condition subclasses: each .build(sr) -> a pipeline (list of transforms); CANONICAL is
+    the fixed axis, BY_NAME maps a condition's derived .name to its object.
 
 The real-noise conditions (chime, demand) are [AddNoise(SampleBank(non-pitched segments))], so the
 voiced-aware-SNR logic lives once (in AddNoise) and is shared with the colored-noise paths. The
 non-pitched segment banks are built by _nonpitched_{chime,demand}_segments (signal gate: _is_nonpitched).
 """
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -544,15 +546,6 @@ def _nonpitched_demand_segments(demand_dir, sample_rate, cap=BANK_CAP):
     return segs
 
 
-def _real_noise(scan, directory, name, sample_rate):
-    """Pipeline for a real-noise corpus: sample its non-pitched segments at AddNoise's default 0 dB
-    SNR. The two corpora (chime, demand) differ only in `scan`, the gated-segment scanner, so
-    they share this body. `name` names the required --<name>-dir."""
-    if not directory:
-        raise ValueError(f"{name} condition requires --{name}-dir")
-    return [AddNoise(SampleBank(scan(directory, sample_rate)))]
-
-
 class Codec:
     """G.711-style telephone codec, label-preserving: narrowband 8 kHz round-trip (linear-phase
     resample_poly, no group delay, honoring the same zero-phase contract as BandLimit) plus an
@@ -578,45 +571,154 @@ class Codec:
         return x.astype(np.float32)
 
 
-REGISTRY = {
-    "clean": lambda **k: [],
-    # additive-noise family at a common 0 dB voiced-aware SNR (AddNoise defaults to 0 dB;
-    # per-source provenance comparison at one level)
-    "white": lambda sample_rate=16000, **k: [AddNoise(ColoredNoise(0.0, sample_rate))],
-    "pink": lambda sample_rate=16000, **k: [AddNoise(ColoredNoise(1.0, sample_rate))],
-    "chime": lambda chime_dir=None, sample_rate=16000, **k: _real_noise(
-        _nonpitched_chime_segments, chime_dir, "chime", sample_rate),
-    "demand": lambda demand_dir=None, sample_rate=16000, **k: _real_noise(
-        _nonpitched_demand_segments, demand_dir, "demand", sample_rate),
-    # low-cut and convolutional axes
-    "telephone": lambda **k: [BandLimit(300.0, 3400.0)],
-    "codec": lambda **k: [Codec()],
-    "reverb": lambda **k: [Reverb(0.4)],
-    "room": lambda **k: [RoomReverb()],
-    # Absolute level + dynamics, and the pink SNR dose-response around the 0 dB point, where
-    # many trackers sit on a cliff, the knee location, not the single-point survival, is the
-    # actual robustness measurement.
-    "gain-40": lambda **k: [Gain(-40.0)],
-    "fade": lambda **k: [Fade(0.0, -40.0)],
-    "pink_snr+10": lambda sample_rate=16000, **k: [AddNoise(ColoredNoise(1.0, sample_rate), snr_db=10.0)],
-    "pink_snr-5": lambda sample_rate=16000, **k: [AddNoise(ColoredNoise(1.0, sample_rate), snr_db=-5.0)],
-}
+# --------------------------------------------------------------------------- #
+# Conditions: typed degradations. A condition is fully specified by its parameters (FIELDS, not
+# baked into a lambda or a name), and knows how to `build` its transform pipeline. `name` is a
+# DERIVED string -- the object is the source of truth; the string exists only to cross boundaries
+# an object cannot (cell filenames, subprocess argv, the CLI, cross-run comparability), and
+# BY_NAME maps it back. The recorded conditions carry their machine-specific corpus as a field,
+# so there is no separate location map -- a recorded condition is unrunnable without its corpus.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Condition:
+    """The base condition is `clean`: no transform."""
+    def build(self, sample_rate):
+        return []
 
-# Condition families: the single source of truth for how the degradations group. generate_report
-# consumes this to render per-family generalization aggregates (mean + worst-provenance drop). A
-# singleton family (filtering) needs no aggregate; the report renders one only when >= 2 members of a
-# family are present. Mirrors the DATASET_GROUPS pattern in generate_report.py.
-CONDITION_FAMILIES = {
-    "additive": ("white", "pink", "chime", "demand"),   # per-source + mean + worst-provenance
-    "convolutional": ("reverb", "room"),
-    "filtering": ("telephone", "codec"),
-    "dynamics": ("gain-40", "fade"),
-    "snr": ("pink_snr+10", "pink_snr-5"),
-}
+    @property
+    def name(self):
+        return "clean"
 
 
-def build_pipeline(name, chime_dir=None, demand_dir=None, sample_rate=16000):
-    """Return the transform pipeline for a condition name (see REGISTRY)."""
-    if name not in REGISTRY:
-        raise ValueError(f"Unknown condition: {name}")
-    return REGISTRY[name](chime_dir=chime_dir, demand_dir=demand_dir, sample_rate=sample_rate)
+@dataclass(frozen=True)
+class Noise(Condition):
+    """Additive colored noise at a voiced-aware SNR. alpha 0 = white, 1 = pink."""
+    alpha: float = 1.0
+    snr_db: float = 0.0
+
+    def build(self, sample_rate):
+        return [AddNoise(ColoredNoise(self.alpha, sample_rate), snr_db=self.snr_db)]
+
+    @property
+    def name(self):
+        base = "white" if self.alpha == 0.0 else "pink"
+        return base if self.snr_db == 0.0 else f"{base}_snr{self.snr_db:+g}"
+
+
+@dataclass(frozen=True)
+class Recorded(Condition):
+    """Additive real-world noise sampled from a recorded corpus (chime / demand) at 0 dB. The
+    corpus lives at a machine-specific `corpus_dir`, so this condition cannot run without it --
+    the dependency the type makes unwriteable."""
+    which: str = "chime"
+    corpus_dir: str | None = None
+
+    def build(self, sample_rate):
+        if not self.corpus_dir:
+            raise ValueError(f"the {self.which} condition needs its noise corpus (corpus_dir)")
+        return [AddNoise(SampleBank(_SCAN[self.which](self.corpus_dir, sample_rate)))]
+
+    @property
+    def name(self):
+        return self.which
+
+
+@dataclass(frozen=True)
+class Telephone(Condition):
+    """Narrowband band-limit, the pure passband of a phone line (no quantization -- see Codec)."""
+    low: float = 300.0
+    high: float = 3400.0
+
+    def build(self, sample_rate):
+        return [BandLimit(self.low, self.high)]
+
+    @property
+    def name(self):
+        return "telephone"
+
+
+@dataclass(frozen=True)
+class Coded(Condition):
+    """G.711-style narrowband + mu-law quantization (the nonlinear artifacts a phone chain adds)."""
+    mu: float = 255.0
+
+    def build(self, sample_rate):
+        return [Codec(self.mu)]
+
+    @property
+    def name(self):
+        return "codec"
+
+
+@dataclass(frozen=True)
+class Reverberation(Condition):
+    """Synthetic exponential reverb (discrete early reflections + colored diffuse decay)."""
+    rt60: float = 0.4
+
+    def build(self, sample_rate):
+        return [Reverb(self.rt60)]
+
+    @property
+    def name(self):
+        return "reverb"
+
+
+@dataclass(frozen=True)
+class Room(Condition):
+    """Physics-based room reverb via a pyroomacoustics image-source RIR."""
+    rt60: float = 0.5
+    room_dim: tuple = (6.0, 5.0, 3.0)
+
+    def build(self, sample_rate):
+        import importlib.util
+        if importlib.util.find_spec("pyroomacoustics") is None:
+            raise ValueError("the room condition requires pyroomacoustics (run `uv sync`)")
+        return [RoomReverb(self.room_dim, self.rt60)]
+
+    @property
+    def name(self):
+        return "room"
+
+
+@dataclass(frozen=True)
+class Gained(Condition):
+    """Absolute level attenuation."""
+    db: float = -40.0
+
+    def build(self, sample_rate):
+        return [Gain(self.db)]
+
+    @property
+    def name(self):
+        return "gain" if self.db == -40.0 else f"gain{self.db:g}"
+
+
+@dataclass(frozen=True)
+class Faded(Condition):
+    """A linear level ramp across the clip."""
+    db_start: float = 0.0
+    db_end: float = -40.0
+
+    def build(self, sample_rate):
+        return [Fade(self.db_start, self.db_end)]
+
+    @property
+    def name(self):
+        return "fade"
+
+
+# The recorded-corpus scanners, indexed by the recorded condition's `which`.
+_SCAN = {"chime": _nonpitched_chime_segments, "demand": _nonpitched_demand_segments}
+
+# THE fixed axis: the canonical 13 conditions, each fully specified by its explicit parameters.
+# Recorded ones carry no corpus here -- the run binds it (Recorded's copy with corpus_dir set).
+CANONICAL = (
+    Condition(),
+    Noise(alpha=0.0), Noise(alpha=1.0),                      # white, pink
+    Recorded("chime"), Recorded("demand"),
+    Telephone(), Coded(), Reverberation(), Room(),
+    Gained(db=-40.0), Faded(),
+    Noise(alpha=1.0, snr_db=10.0), Noise(alpha=1.0, snr_db=-5.0),   # pink_snr+10, pink_snr-5
+)
+BY_NAME = {c.name: c for c in CANONICAL}
+assert len(BY_NAME) == len(CANONICAL), "condition names must be unique"

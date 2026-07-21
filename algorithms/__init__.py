@@ -5,8 +5,8 @@ from .base import PitchAlgorithm
 # Algorithm metadata - maps registry name to (module_name, class_name). The module name doubles as
 # the pyproject optional-dependency extra (e.g. `uv sync --extra crepe`), so the packages each
 # backend needs are declared in exactly one place: pyproject.toml [project.optional-dependencies].
-# pYIN and RMVPE are covered by the core install and have no extra. tests/test_algorithm_extras.py
-# enforces this module-name == extra-name correspondence.
+# pYIN and RMVPE are covered by the core install and have no extra. The module-name ==
+# extra-name correspondence is enforced by a conformance check.
 _ALGORITHM_METADATA = {
     "CREPE": ("crepe", "CREPEPitchAlgorithm"),
     "PENN": ("penn", "PENNPitchAlgorithm"),
@@ -29,8 +29,8 @@ _ALGORITHM_METADATA = {
 # importance: RMVPE's model is implemented in-repo (algorithms/rmvpe.py, torch + librosa only,
 # weights downloaded at runtime) and pYIN is just librosa.pyin; both torch and librosa are core
 # dependencies. Everything else ships an external backend package and thus a pyproject extra.
-# Single source of truth for the "has an extra vs not" split; used by the install hint below and
-# the conformance test (tests/test_algorithm_extras.py).
+# Single source of truth for the "has an extra vs not" split; used by the install hint below
+# and by the conformance check.
 _NO_EXTRA_MODULES = frozenset({"pyin", "rmvpe"})
 
 # _REGISTRY caches lazily loaded algorithm classes.
@@ -147,10 +147,3 @@ def resolve_requested_algorithms(requested=None, *, report_skipped=False, on_emp
             "`uv sync --extra <name>`."
         )
     return available
-
-
-def register_algorithm(name: str, algorithm_class: type[PitchAlgorithm]):
-    """Register a custom algorithm."""
-    if not issubclass(algorithm_class, PitchAlgorithm):
-        raise TypeError("Algorithm must subclass PitchAlgorithm")
-    _REGISTRY[name] = algorithm_class

@@ -98,13 +98,14 @@ class BasicPitchPitchAlgorithm(ContinuousPitchAlgorithm):
 
         # Basic Pitch's posteriorgram runs at AUDIO_SAMPLE_RATE/FFT_HOP (~86 fps); the library's
         # model_frames_to_time maps frame m to ~m*FFT_HOP/22050 with a per-inference-window seam
-        # correction. The timestamp calibration (tests/test_time_calibration.py) measures the
+        # correction. The timestamp calibration measures the
         # reported content a further CONTENT_DELAY after those times: +10.8 ms at 16 kHz and
         # +10.7 ms at 22.05 kHz (rate-invariant; step probe agrees in sign). The error is not a
         # single geometric constant: it ramps ~+5..+15 ms across each 142-frame inference window
         # (basic_pitch windows clips internally at ~1.64 s), so this corrects the MEAN stamp error
         # and the remaining within-window jitter stays part of BasicPitch's score. Applied per the
-        # calibration policy in TIMING.md.
+        # calibration rule: a constant measured offset is corrected in the wrapper, so
+        # every tracker is compared on one shared grid.
         times = model_frames_to_time(n_frames) + self.CONTENT_DELAY
 
         return times, pitch_estimates, max_confidences

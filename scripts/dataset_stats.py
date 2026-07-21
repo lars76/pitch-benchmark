@@ -2,7 +2,8 @@
 
 Exact (full pass over every clip, no sampling): clip count, total hours, average
 clip length, voiced-frame fraction, ground-truth f0 distribution (p5/p50/p95 + min/max
-over voiced frames), and per-pitch-band coverage. Writes a Markdown table to --out.
+over voiced frames), and the f0 distribution across pitch bands. Writes a Markdown
+table to --out.
 
 Note on ranges: datasets default to clip_pitch=False, so ground-truth f0 outside a
 dataset's [fmin, fmax] window is marked UNVOICED (excluded), not clamped. Reported f0
@@ -124,9 +125,9 @@ def main():
     lines = ["# Dataset Corpus Statistics\n",
              "*Exact, full-pass measurement. f0 stats are over in-window voiced frames "
              "(out-of-[fmin,fmax] ground truth is marked unvoiced, not clamped). "
-             "Band coverage = % of voiced frames whose f0 falls in each band.*\n",
+             "f0 by band = % of voiced frames whose f0 falls in each band.*\n",
              "| **Dataset** | **Domain** | **Clips** | **Hours** | **Avg len (s)** | "
-             "**Voiced %** | **f0 p5-p50-p95 (Hz)** | **Window [fmin-fmax]** | **Band coverage** |",
+             "**Voiced %** | **f0 p5-p50-p95 (Hz)** | **Window [fmin-fmax]** | **f0 by band** |",
              "|---|---|--:|--:|--:|--:|---|---|---|"]
     for name, domain, s in rows:
         cov = ", ".join(f"{b} {s['bands'][b]:.0f}%" for b, _, _ in PITCH_BANDS if s["bands"][b] >= 1.0)

@@ -12,9 +12,7 @@ from tqdm import tqdm
 
 from algorithms import build_algorithm
 from metrics import (
-    voicing_boundary_latency,
     clip_and_group,
-    DEFAULT_THRESHOLDS,
     FRAME_STAT_COLS,
     MetricAccumulator,
     is_voiced,
@@ -29,7 +27,6 @@ def _failure_dict(skipped_samples: int) -> dict:
         "thresholds": [],
         "sweep": [],
         "per_clip": {"stats_schema": list(FRAME_STAT_COLS), "clips": [], "stats": []},
-        "coverage": {"clips_evaluated": 0, "clips_skipped": skipped_samples},
     }
 
 
@@ -70,7 +67,6 @@ def run_single_evaluation(
     accumulators = [MetricAccumulator() for _ in thresholds]
     clips_meta = []                             # [clip_id, group, n_frames] once per clip
     per_clip_stats = []                         # per clip: one suff-stat row per threshold
-    latencies = [([], []) for _ in thresholds]  # pooled (onset_ms, offset_ms) region latencies
     skipped_samples = 0
     clips_evaluated = 0
     did_fail = False
@@ -107,7 +103,6 @@ def run_single_evaluation(
 
             clip_id, group = clip_and_group(dataset, sample.get("wav_path"), idx)
             clips_meta.append([clip_id, group, int(len(true_pitch))])
-            frame_period = dataset.hop_size / dataset.sample_rate
             clip_stats = []
             for ti, (acc, (pred_pitch, pred_voicing, _)) in enumerate(zip(accumulators, results)):
                 acc.update(pred_pitch, pred_voicing, true_pitch, true_voicing, pitch_conf=pc)
@@ -115,10 +110,6 @@ def run_single_evaluation(
                 # aggregate); summing rows across clips reproduces the aggregate EXACTLY
                 one = MetricAccumulator()
                 one.update(pred_pitch, pred_voicing, true_pitch, true_voicing, pitch_conf=pc)
-                on_ms, off_ms = voicing_boundary_latency(
-                    (np.asarray(pred_voicing).astype(bool) & (np.asarray(pred_pitch) > 0)),
-                    is_voiced(true_voicing), frame_period)
-                latencies[ti][0].extend(on_ms); latencies[ti][1].extend(off_ms)
                 ss = one.suff_stats()
                 clip_stats.append([
                     ss[c] if not isinstance(ss[c], float) else round(ss[c], 2)
@@ -161,20 +152,11 @@ def run_single_evaluation(
         tqdm.write(f"  ({algo_name} skipped {skipped_samples} unvoiced samples)")
 
     sweep = sweep_summary(accumulators, thresholds)
-    for entry, (on_ms, off_ms) in zip(sweep, latencies):
-        entry["latency"] = {
-            "onset_median_ms": float(np.median(on_ms)) if on_ms else None,
-            "onset_p90_ms": float(np.percentile(on_ms, 90)) if on_ms else None,
-            "offset_median_ms": float(np.median(off_ms)) if off_ms else None,
-            "offset_p90_ms": float(np.percentile(off_ms, 90)) if off_ms else None,
-            "n_regions": len(on_ms),
-        }
     results = {
         "thresholds": [float(t) for t in thresholds],
         "sweep": sweep,
         # suff-stat rows per clip PER THRESHOLD: threshold choice is a report-time decision
         "per_clip": {"stats_schema": list(FRAME_STAT_COLS),
                      "clips": clips_meta, "stats": per_clip_stats},
-        "coverage": {"clips_evaluated": clips_evaluated, "clips_skipped": skipped_samples},
     }
     return to_json_safe(results), False

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""The v2 report: one-glance leaderboard (Overall + seven question-tracks), then one
-section per track with its diagnostics beneath. Renders whatever cells exist; a missing
-track is shown as a gap, never silently averaged over.
+"""The v2 report: results first, definitions in METRICS.md.
+
+Presentation only -- every number here comes from metrics.py, so a table can never
+disagree with a score. Renders whatever cells exist; a track with no cells is one
+sentence, never a column of blanks.
 
     .venv/bin/python generate_report.py --results results --out benchmark_report.md
 """
@@ -9,54 +11,36 @@ track is shown as a gap, never silently averaged over.
 import argparse
 import json
 import os
-from pathlib import Path
 
 import numpy as np
 
 import metrics
-from datasets.augment import CONDITION_FAMILIES
 from evaluate import load_cells
-from metrics import (
-    FRAME_REDUCERS,
-    PITCH_BANDS,
-    SIGMA0,
-    T_MAX,
-    TRACKS_SCORED,
-    band_label,
-    ci_cell,
-    cluster_bootstrap,
-)
+from metrics import PITCH_BANDS, SIGMA0, band_label, cluster_bootstrap, FRAME_REDUCERS
 
-# Datasets whose pitch/note ground truth is SCORE-GRADE (the notated note, not the performed
-# f0): reliable for VOICING, but their pitch scores are a GT artifact and must not enter the
-# accuracy leaderboard.
-VOICING_ONLY = frozenset({"M4Singer"})
-# Sparse-voiced corpora: long clinical/lab sessions that are mostly UNVOICED (~13-21% voiced);
-# precision-type denominators are dominated by silence false positives and are not comparable
-# to the dense corpora. Flagged in place, never dropped.
+# Sparse-voiced corpora: long clinical/lab sessions that are mostly UNVOICED; precision
+# denominators are dominated by silence false positives and are not
+# comparable to the dense corpora. Flagged in place, never dropped -- unlike
+# metrics.PITCH_INELIGIBLE, which the scorer excludes outright.
 SPARSE_VOICED = frozenset({"OSFGlottis", "AVID"})
 
-_EGG_SPEECH = ["PTDB", "MOCHA", "CMUArctic", "AVID", "OSFGlottis", "SVD", "APLAWD", "KEELE", "FDA"]
-DATASET_GROUPS = {
-    "By Origin": {
-        "Synthetic": ["Bach10Synth", "MDBStemSynth", "SpeechSynth", "NSynth"],
-        "Real": ["MIR1K", "Vocadito", "URMP", *_EGG_SPEECH],
-    },
-    "By Domain": {
-        "Speech": ["SpeechSynth", *_EGG_SPEECH],
-        "Music": ["Bach10Synth", "MDBStemSynth", "NSynth", "Vocadito", "MIR1K", "URMP"],
-    },
-    "By Cross-Dimension": {
-        "Synthetic + Speech": ["SpeechSynth"],
-        "Synthetic + Music": ["Bach10Synth", "MDBStemSynth", "NSynth"],
-        "Real + Speech": _EGG_SPEECH,
-        "Real + Music": ["Vocadito", "MIR1K", "URMP"],
-    },
+# The split a reader actually chooses on. Finer groupings were measured to be exact means
+# of the per-dataset numbers already printed, so they are not rendered.
+DOMAIN_GROUPS = {
+    "Speech": ["SpeechSynth", "PTDB", "MOCHA", "CMUArctic", "AVID", "OSFGlottis",
+               "SVD", "APLAWD", "KEELE", "FDA"],
+    "Music": ["Bach10Synth", "MDBStemSynth", "NSynth", "Vocadito", "MIR1K", "URMP"],
 }
 
-TRACK_LABELS = [("accuracy", "Accuracy"), ("noise", "Noise"), ("signals", "Signals"),
-                ("stability", "Stability"), ("dynamics", "Dynamics"), ("notes", "Notes"),
-                ("speed", "Speed")]
+TRACK_LABELS = [("correctness", "Correctness"), ("noise", "Noise"),
+                ("signal_types", "Signal types"), ("tracking", "Tracking"),
+                ("notes", "Notes"), ("speed", "Speed")]
+
+
+def _and_list(items):
+    """'a', 'a and b', 'a, b and c' -- so a list of missing tracks reads as English."""
+    items = list(items)
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
 def _is_bad(v):
@@ -72,214 +56,423 @@ def md_table(headers, rows):
 
 
 def fmt_best(value, column_values, fmt="{:.3f}", lower=False, na="n/a"):
-    """Format `value`, bolding it if it is the best (max, or min if lower) of column_values."""
+    """Format `value`, bolding it if it is the best (max, or min if lower) of the column."""
     if _is_bad(value):
         return na
     valid = [v for v in column_values if not _is_bad(v)]
     best = (min if lower else max)(valid) if valid else None
     s = fmt.format(value)
-    if best is not None and abs(value - best) < 1e-9:
-        s = f"**{s}**"
-    return s
+    return f"**{s}**" if best is not None and abs(value - best) < 1e-9 else s
 
 
-def _quarantine_corrupt(file_path):
-    """Rename a corrupt result to <name>.corrupt and warn loudly, so the runner's
-    exists()-based skip regenerates the cell instead of skipping a broken one forever."""
-    q = str(file_path) + ".corrupt"
-    try:
-        os.replace(file_path, q)
-    except OSError:
-        q = file_path
-    print(f"Warning: corrupt result JSON quarantined -> {q}")
-
-
-def load_all_results(results_dir):
-    """All JSON result files split into (frame, speed, synthetic) by benchmark_type.
-    Kept for the dedup utilities and tests; the report itself scores via load_cells."""
-    frame, speed, synth = [], [], []
-    for file_path in Path(results_dir).glob("*.json"):
-        try:
-            with open(file_path) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            _quarantine_corrupt(file_path)
-            continue
-        except OSError as e:
-            print(f"Warning: skipping {file_path}: {e}")
-            continue
-        m = data.get("metadata", {})
-        if m.get("track") == "notes":
-            continue
-        bt = m.get("benchmark_type")
-        if bt == "speed":
-            speed.append(data)
-        elif bt == "synthetic":
-            synth.append(data)
-        elif m.get("dataset_name"):
-            frame.append(data)
-    return frame, speed, synth
-
-
-def _dedupe_prefer_cpu(results, key_fn):
-    """One result per key: non-crashed beats crashed, then cpu (the reproducible
-    reference) beats gpu. Device lives in the filename so variants coexist on disk."""
-    def rank(r):
-        m = r.get("metadata", {})
-        return (not m.get("crashed"), m.get("device") == "cpu")
-
-    chosen = {}
-    for r in results:
-        k = key_fn(r.get("metadata", {}), r.get("parameters", {}))
-        cur = chosen.get(k)
-        if cur is None or rank(r) > rank(cur):
-            chosen[k] = r
-    return list(chosen.values())
-
-
-def _pitch_key(m, p):
-    return (m.get("algorithm_name"), m.get("dataset_name"), m.get("condition", "clean"),
-            bool(m.get("probe")), m.get("seed"),
-            p.get("sample_rate"), p.get("hop_size"), p.get("max_samples"), p.get("max_seconds"))
-
-
-def _ood_key(m, _p):
-    return (m.get("algorithm_name"), m.get("family"))
+def ci_cell(value, lo, hi):
+    return f"{value:.3f} [n/a]" if _is_bad(lo) else f"{value:.3f} [{lo:.3f}, {hi:.3f}]"
 
 
 def _algos(cells):
-    return sorted({k[3] for k in cells})
+    return sorted({k.algo for k in cells})
 
 
-def _star(cells, algo, cache={}):
-    if algo not in cache:
-        cache[algo] = metrics.theta_star(cells, algo)
-    return cache[algo]
-
-
-def _is_fixed_operating_point(cells, algo):
-    """A flat F@50 sweep on every clean cell = no usable confidence curve (binary voicing)."""
-    seen = False
-    for (track, _ds, cond, a), cell in cells.items():
-        if track == "frame" and a == algo and cond == "clean":
-            f = [e["pitch_f"]["f50"] for e in cell.get("results", {}).get("sweep", [])]
-            if not f:
-                continue
-            seen = True
-            if max(f) - min(f) > 1e-9:
-                return False
-    return seen
+def _live_tracks(cells, algos):
+    """Only the tracks something actually measured. A track with no cells anywhere is
+    reported once, in a sentence, instead of as a column of n/a in every table."""
+    # Tracks is attribute-addressed; flatten to {name: value} once here so the
+    # rendering below stays a plain lookup by the track name it is iterating.
+    scored = {a: dict(metrics.track_scores(cells, a, intervals=False).items())
+              for a in algos}
+    scored = {a: {n: s.value for n, s in d.items()} for a, d in scored.items()}
+    live = [(k, l) for k, l in TRACK_LABELS
+            if any(scored[a][k] is not None for a in algos)]
+    missing = [l for k, l in TRACK_LABELS if (k, l) not in live]
+    return scored, live, missing
 
 
 # --------------------------------------------------------------------------- #
-# 1. Leaderboard
+# Leaderboard
 # --------------------------------------------------------------------------- #
 def section_leaderboard(cells):
     algos = _algos(cells)
-    scores = {a: metrics.track_scores(cells, a) for a in algos}
+    scored, live, missing = _live_tracks(cells, algos)
     overalls = {a: metrics.overall(cells, a) for a in algos}
+    order = sorted(algos, key=lambda a: metrics.rank_key(overalls[a], scored[a].values()))
 
-    def _hm_positive(a):
-        vals = [v for v in scores[a].values() if v]
-        return len(vals) / np.sum(1.0 / np.asarray(vals)) if vals else 0.0
-
-    # zeros rank below every positive Overall but keep an order among themselves
-    # (HM of their non-zero tracks), so a failed tracker is still comparable
-    order = sorted(algos, key=lambda a: (overalls[a] is None, -(overalls[a] or 0),
-                                         -_hm_positive(a)))
-    headers = ["**Algorithm**", "**Overall**"] + [f"**{lbl}**" for _k, lbl in TRACK_LABELS]
-    cols = {k: [scores[a][k] for a in algos] for k, _l in TRACK_LABELS}
-    rows = []
-    for a in order:
-        dag = "†" if _is_fixed_operating_point(cells, a) else ""
-        if overalls[a] == 0.0:
-            killers = ", ".join(l for k, l in TRACK_LABELS if scores[a][k] == 0.0)
-            ov = f"0 ({killers})"
-        else:
-            ov = fmt_best(overalls[a], list(overalls.values()))
-        row = [a + dag, ov]
-        row += [fmt_best(scores[a][k], cols[k]) for k, _l in TRACK_LABELS]
-        rows.append(row)
     s = "## Leaderboard\n\n"
-    s += ("Overall = harmonic mean of the seven track scores, equal weights. A missing "
-          "track makes the Overall n/a (never a silent partial mean); a zero track "
-          "sinks it to 0, annotated with the failing track; zero-Overall trackers are "
-          "ordered among themselves by the harmonic mean of their non-zero tracks. `†` = fixed operating point (no confidence curve to tune).\n\n")
-    s += md_table(headers, rows)
-    gaps = {a: [l for (k, l) in TRACK_LABELS if scores[a][k] is None] for a in algos}
-    gaps = {a: g for a, g in gaps.items() if g}
-    if gaps:
-        s += "\nMissing tracks: " + "; ".join(f"{a}: {', '.join(g)}" for a, g in gaps.items()) + ".\n"
-    s += "\n### Operating points (theta\\*)\n\n"
+    if missing:
+        s += (f"**{_and_list(missing)} {'are' if len(missing) > 1 else 'is'} not measured "
+              f"in this run**, so Overall is not computed; rank by Correctness. "
+              f"Definitions for every column are in [METRICS.md](METRICS.md).\n\n")
+    else:
+        s += ("Overall is the harmonic mean of the six track scores, so a tracker is only "
+              "as good as its weakest situation of use. Definitions for every column are "
+              "in [METRICS.md](METRICS.md).\n\n")
+
+    cols = {k: [scored[a][k] for a in algos] for k, _l in live}
     rows = []
     for a in order:
-        st = _star(cells, a)
-        rows.append([a, "n/a" if st["theta"] is None else f"{st['theta']:.1f}",
-                     st["provenance"], str(st["n_datasets"])])
-    s += md_table(["**Algorithm**", "**theta\\***", "**selected on**", "**#datasets**"], rows)
+        dag = " †" if metrics.has_fixed_operating_point(cells, a) else ""
+        ov = overalls[a]
+        if ov == 0.0:
+            killers = ", ".join(l for k, l in live if scored[a][k] == 0.0)
+            ov_cell = f"0 ({killers})"
+        else:
+            ov_cell = fmt_best(ov, list(overalls.values()))
+        star = metrics.theta_star(cells, a)
+        rows.append([a + dag, ov_cell,
+                     "n/a" if star["theta"] is None else f"{star['theta']:.1f}"]
+                    + [fmt_best(scored[a][k], cols[k]) for k, _l in live])
+    s += md_table(["**Algorithm**", "**Overall**", "**theta\\***"]
+                  + [f"**{l}**" for _k, l in live], rows)
+    if any(metrics.has_fixed_operating_point(cells, a) for a in algos):
+        s += "\n† no usable voicing confidence: the sweep is flat, so theta\\* is nominal.\n"
+    s += _headline(cells, order, scored, live)
+    return s
+
+
+def _headline(cells, order, scored, live):
+    """The sentence a reader came for: who wins, and what it costs."""
+    if len(order) < 2:
+        return ""
+    best = order[0]
+    per_track_best = {l: max((a for a in order if scored[a][k] is not None),
+                             key=lambda a: scored[a][k], default=None)
+                      for k, l in live}
+    others = sorted({l: a for l, a in per_track_best.items() if a and a != best}.items())
+    if not others:
+        return f"\n**{best}** leads every measured track.\n"
+    trade = "; ".join(f"{a} leads {l}" for l, a in others)
+    return f"\n**{best}** leads overall; {trade}.\n"
+
+
+# --------------------------------------------------------------------------- #
+# Track 1: Correctness
+# --------------------------------------------------------------------------- #
+def section_correctness(cells):
+    s = "## Track 1: Correctness\n\n"
+    s += ("Pitch F on clean real recordings at each algorithm's theta\\*, averaged with "
+          "equal weight per dataset. Datasets whose pitch ground truth is score-grade are "
+          "excluded by the scorer; sparse-voiced corpora are flagged in place.\n\n")
+    any_rows = False
+    for algo in _algos(cells):
+        star = metrics.theta_star(cells, algo)
+        if star["idx"] is None:
+            continue
+        acc = metrics.track_correctness(cells, algo)
+        rows = []
+        for ds, cap, cell in sorted(metrics.frame_cells(cells, algo, "clean")):
+            e = cell["results"]["sweep"][star["idx"]]
+            pc = cell["results"].get("per_clip")
+            if pc and pc.get("stats"):
+                keyed, _n = metrics.frame_keyed(pc, star["idx"])
+                lo, hi = cluster_bootstrap(list(keyed.values()), FRAME_REDUCERS["pitch_f1"])
+                fs = ci_cell(e["pitch"]["f1"], lo, hi)
+            else:
+                fs = f"{e['pitch']['f1']:.3f}"
+            flag = " (sparse)" if ds in SPARSE_VOICED else ""
+            probe = f" [capped n{cap[0]}/t{cap[1]}]" if cap else ""
+            rows.append([ds + flag + probe, fs, f"{e['pitch']['recall']:.3f}",
+                         f"{e['pitch']['precision']:.3f}"])
+        # a crashed dataset scores 0 and must be VISIBLE, or the track score cannot be
+        # reconciled with the rows above it
+        for ds in sorted(metrics.crashed_datasets(cells, algo, conditions={"clean"})):
+            rows.append([ds, "0.000 (crashed)", "0.000", "0.000"])
+        if not rows:
+            continue
+        any_rows = True
+        s += f"### {algo}\n\n"
+        s += md_table(["**Dataset**", "**pitch F1 [95% CI]**", "**pitch recall**",
+                       "**pitch precision**"], rows)
+        if acc["score"] is not None:
+            s += f"\nTrack score (equal per dataset): **{acc['score']:.3f}**"
+            ci = metrics.track_ci(cells, algo, "correctness")
+            if ci:
+                s += f" [{ci[0]:.3f}, {ci[1]:.3f}]"
+            if acc.get("n_crashed"):
+                s += f" over {acc['n_completed']} completed + {acc['n_crashed']} crashed"
+            s += ".\n"
+        fac = metrics.factorization(cells, algo, theta_idx=star["idx"])
+        if fac:
+            s += (f"\nWhere the recall comes from: pitch recall {fac['pitch_recall']:.3f} "
+                  f"= voicing recall {fac['voicing_recall']:.3f} x the correct rate "
+                  f"(exact+close, below).\n\n")
+    if not any_rows:
+        s += "No clean frame cells.\n"
+    return s + _error_breakdown(cells) + _band_table(cells) + _ties_table(cells)
+
+
+def _error_breakdown(cells):
+    """WHERE the errors are: is it precision, or is it picking the wrong pitch?"""
+    rows = []
+    for algo in _algos(cells):
+        star = metrics.theta_star(cells, algo)
+        if star["idx"] is None:
+            continue
+        e = metrics.error_classes(cells, algo, theta_idx=star["idx"])
+        if e:
+            rows.append([algo, f"{e['exact']:.3f}", f"{e['close']:.3f}",
+                         f"{e['off']:.3f}", f"{e['wrong']:.3f}",
+                         f"{e['cents_mae']:.1f}",
+                         "n/a" if _is_bad(e['cents_bias']) else f"{e['cents_bias']:+.1f}"])
+    if not rows:
+        return ""
+    return ("\n### Error breakdown\n\nOn frames scored for pitch, at theta\\*, pooled "
+            "over all conditions. The four classes are disjoint and cover every scored "
+            "frame, so a row reads as a sentence: *exact on X, loses tuning on Y, wanders "
+            "on Z, picks the wrong pitch on W*. `cents bias` is the mean SIGNED error over the "
+            "in-tolerance frames only (so its denominator differs from MAE's): 0 means "
+            "symmetric scatter, non-zero means the tracker sits systematically sharp (+) "
+            "or flat (-) and can be corrected by subtracting it. It is the only signed "
+            "column; every other one is blind to the direction of the error.\n\n"
+            + md_table(["**Algorithm**", "**exact** (<10c)", "**close** (10-50c)",
+                        "**off** (50-200c)", "**wrong** (>200c)", "**cents MAE**",
+                        "**cents bias**"], rows))
+
+
+def _band_table(cells):
+    bands = [b for b, _, _ in PITCH_BANDS]
+    rows = []
+    for algo in _algos(cells):
+        star = metrics.theta_star(cells, algo)
+        if star["idx"] is None:
+            continue
+        agg = metrics.band_aggregate(cells, algo, theta_idx=star["idx"])
+        if not any(n for _r, n in agg.values()):
+            continue
+        rows.append([algo] + [f"{r:.2f} ({n:,})" if r is not None else "n/a"
+                              for r, n in (agg[b] for b in bands)])
+    if not rows:
+        return ""
+    return ("\n### By pitch band\n\nCorrect rate (exact+close) with the frame count it "
+            "rests on, by ground-truth band. A register collapse shows up here and "
+            "nowhere else in the aggregate; a small count means the cell is not "
+            "evidence.\n\n"
+            + md_table(["**Algorithm**"] + [f"**{b}** ({band_label(lo, hi)})"
+                                            for b, lo, hi in PITCH_BANDS], rows))
+
+
+def _ties_table(cells):
+    t = metrics.ties(cells)
+    if not t:
+        return ""
+    rows = [[ds, f"{d['best']} ({d['f1']:.3f})", ", ".join(d["tied"]) or "none"]
+            for ds, d in sorted(t.items())]
+    return ("\n### Statistical ties\n\nPer clean dataset: the best pitch F1, and every "
+            "algorithm whose paired 95% CI of the difference over the clips both scored "
+            "includes 0. A tied algorithm is not beaten on that dataset, whatever the "
+            "third decimal suggests. Many pairs are compared with no multiple-comparisons "
+            "correction, so read a single tie as descriptive.\n\n"
+            + md_table(["**Dataset**", "**best pitch F1**", "**tied with best**"], rows))
+
+
+# --------------------------------------------------------------------------- #
+# Track 2: Noise
+# --------------------------------------------------------------------------- #
+def section_noise(cells):
+    algos = _algos(cells)
+    s = "## Track 2: Noise\n\n"
+    s += ("Absolute pitch F1 on the degraded conditions at theta\\*, equal weight per "
+          "dataset. This is how well the tracker works in noise, not how much of its "
+          "clean performance it kept: a retention ratio rises when clean performance "
+          "falls, so it rewards being bad on clean and is not scored.\n\n")
+    conds = sorted({k.condition for k in cells if k.suite == metrics.Suite.FRAME
+                    and k.condition != "clean"})
+    if not conds:
+        return s + "No degradation cells.\n"
+    rows = []
+    for algo in algos:
+        nz = metrics.track_noise(cells, algo)
+        per = nz.get("per_condition", {})
+        lo, hi, n = metrics.noise_drop_ci(cells, algo)
+        ci = metrics.track_ci(cells, algo, "noise")
+        score_cell = ("n/a" if nz["score"] is None else
+                      f"{nz['score']:.3f}" + (f" [{ci[0]:.3f}, {ci[1]:.3f}]" if ci else ""))
+        rows.append([algo, score_cell,
+                     str(nz.get("n_conditions", 0)),
+                     "n/a" if not n else f"{lo:.1f} to {hi:.1f}"]
+                    + [f"{per[c]:.3f}" if c in per else "n/a" for c in conds])
+    s += md_table(["**Algorithm**", "**Score**", "**#conditions**",
+                   "**drop pp [95% CI]**"] + [f"**{c}**" for c in conds], rows)
+    s += ("\n`drop` is the paired clean-minus-degraded difference in pitch F1, in "
+          "percentage points, resampled over the clips both sides scored. `#conditions` "
+          "is the denominator of the score: two algorithms averaged over different "
+          "numbers of conditions are not directly comparable.\n")
     return s
 
 
 # --------------------------------------------------------------------------- #
-# 2. Methodology
+# Track 3: Signal types
 # --------------------------------------------------------------------------- #
-def section_methodology():
-    return f"""## Methodology
+def section_signal_types(cells):
+    algos = _algos(cells)
+    s = "## Track 3: Signal types\n\n"
+    s += ("Synthetic families with exact labels. Per family: unconditional pitch recall "
+          "at theta\\*, so a family the tracker refuses to voice scores low rather than "
+          "vanishing. Score = mean over families, each family one equally-weighted probe "
+          "question. A dead family is one scoring exactly 0 -- the capability is absent, "
+          "not merely weak.\n\n")
+    rows, any_row = [], False
+    for algo in algos:
+        sig = metrics.track_signal_types(cells, algo)
+        if sig["score"] is None:
+            continue
+        any_row = True
+        pf = sig.get("per_family", {})
+        dead = sorted(f for f, v in pf.items() if v == 0.0)
+        rows.append([algo, f"{sig['score']:.3f}",
+                     f"{sig['worst_family']} ({sig['worst']:.2f})",
+                     str(len(dead)), ", ".join(dead) if dead else "none"])
+    if not any_row:
+        return s + "No synthetic stationary cells.\n"
+    s += md_table(["**Algorithm**", "**Score**", "**worst family**",
+                   "**dead**", "**which**"], rows)
+    s += _controls_line(cells, algos)
+    return s
 
-### The contract
-An algorithm is `(f0(t), q(t))`: a pitch estimate and a voicing confidence per frame.
-`f0 <= 0` or `NaN` is a **voicing claim, never a pitch estimate**: at threshold theta, a
-frame counts as voiced-with-pitch iff `q >= theta` and f0 is finite-positive. Abstaining on a truly
-voiced frame costs recall; it never fabricates a cents error.
 
-### The core metric: the pitch F-score
-With counts at threshold theta and cents tolerance T -- `n_ok(T)` = frames truly voiced,
-voiced by the tracker, and within T cents; `tp/fp/fn` = the voicing confusion --
-
-    pitch recall    R(T) = n_ok / (tp + fn)
-    pitch precision P(T) = n_ok / (tp + fp)
-    pitch F-score   F(T) = 2 n_ok / ((tp+fp) + (tp+fn))
-
-Pure counts, no weights. The identity `R = voicing_recall x accuracy_on_voiced`
-displays both classic RPA definitions as factors of one product. `T -> inf` recovers
-voicing F1; the headline tolerance is 50 cents; the **tolerance AUC** integrates F over
-T in [0, {T_MAX:.0f}] and equals `1 - truncated-MAE/{T_MAX:.0f}` on the scored frames.
-
-### The operating point
-One global **theta\\*** per algorithm: argmax over the threshold grid of the
-equal-per-dataset mean F@50 on clean cells (full cells preferred, probe fallback
-stamped; ties -> lowest theta). Frozen; every track reads it. There is no per-cell
-threshold selection anywhere.
-
-### The tracks (questions, not decompositions)
-Each column is a complete situation of use, so nothing is scored twice. Diagnostics
-(voicing P/R/F1, accuracy-on-voiced, RPA@50, cents, RCA, octave/gross rates,
-per-band, smoothness, latency, coverage) explain the columns and are never scored.
-
-1. **Accuracy** -- how correct is the output curve on clean real recordings? (F@50)
-2. **Noise** -- how much survives corruption? (F@50 degraded / clean, paired probe clips)
-3. **Signals** -- how much of the signal-class space is handled? (mean over stationary families; worst family named)
-4. **Stability** -- does one threshold work everywhere? (F(theta*)/F(oracle))
-5. **Dynamics** -- is a moving pitch followed faithfully? (steady jitter + vibrato retention)
-6. **Notes** -- is musical structure recoverable? (COnP)
-7. **Speed** -- is it deployable? (1/(1+RTF))
-
-### Weight audit
-The only named conventions: tolerances (10/25/50 cents), T_MAX={T_MAX:.0f},
-steady-jitter normalizer sigma0={SIGMA0:.0f} cents, speed mapping 1/(1+RTF), the HM's
-equal track weights, and equal-per-dataset pooling for track scores (the frame-pooled
-variant is shown as a diagnostic). Everything else is counts.
-
-### Statistics
-All CIs are 95% paired cluster bootstraps over per-clip sufficient statistics (clusters
-= speaker/singer/piece), and every scored value is exactly recomputable from summed
-per-clip stats -- the CI machinery resamples and recomputes the same formula it reports.
-"""
+def _controls_line(cells, algos):
+    """Controls carry no pitch, so a false positive is the only thing to report. One line:
+    the column is 0.000 for nearly everyone and a table would be mostly zeros."""
+    ctl = sorted({k.subject for k, c in cells.items() if k.suite == metrics.Suite.SYNTHETIC
+                  and (c.get("results") or {}).get("kind") == "control"})
+    if not ctl:
+        return ""
+    hits = []
+    for algo in algos:
+        for f in ctl:
+            cell = cells.get(metrics.CellKey(suite="synthetic", subject=f,
+                                             condition=None, algo=algo))
+            fp = (cell.get("results") or {}).get("false_positive_rate") if cell else None
+            if not _is_bad(fp) and fp > 0:
+                hits.append(f"{algo} {f} {fp:.3f}")
+    tail = "; ".join(hits) if hits else "no tracker fires on any control"
+    return (f"\nControls ({', '.join(ctl)}) contain no pitch, so the only readout is the "
+            f"false-positive rate (diagnostic, never scored): {tail}.\n")
 
 
 # --------------------------------------------------------------------------- #
-# 3. Datasets
+# Track 4: Tracking
 # --------------------------------------------------------------------------- #
+def section_tracking(cells):
+    s = "## Track 4: Tracking\n\n"
+    s += (f"Trajectory families with exact labels, read at theta\\*. Steady tones score "
+          f"sigma0/(sigma0+error) on the TOTAL error hypot(jitter, bias) with "
+          f"sigma0={SIGMA0:.0f} cents, so a constant output that is an octave off cannot "
+          f"win by having no jitter. Vibrato scores depth ratio x voiced fraction. Track "
+          f"score = mean of the two capabilities.\n\n")
+    fams = sorted({k.subject for k, c in cells.items() if k.suite == metrics.Suite.SYNTHETIC
+                   and (c.get("results") or {}).get("kind") == "trajectory"})
+    if not fams:
+        return s + "No trajectory cells.\n"
+    rows = []
+    for algo in _algos(cells):
+        trk = metrics.track_tracking(cells, algo)
+        if trk["score"] is None:
+            continue
+        row = [algo, f"{trk['score']:.3f}"]
+        for f in fams:
+            e = trk.get("per_family", {}).get(f)
+            if not e:
+                row.append("n/a")
+            elif "jitter_cents" in e:
+                j, b = e.get("jitter_cents"), e.get("bias_cents")
+                row.append("n/a" if _is_bad(j)
+                           else f"jitter {j:.1f}c, bias {0.0 if _is_bad(b) else b:+.1f}c")
+            else:
+                row.append(f"depth {e.get('depth_ratio') or 0:.2f} x "
+                           f"voiced {e.get('voiced_fraction') or 0:.2f}")
+        rows.append(row)
+    if not rows:
+        return s + "No trajectory cells.\n"
+    return s + md_table(["**Algorithm**", "**Score**"] + [f"**{f}**" for f in fams], rows)
+
+
+# --------------------------------------------------------------------------- #
+# Track 5: Notes   /   Track 6: Speed
+# --------------------------------------------------------------------------- #
+def section_notes(cells):
+    s = "## Track 5: Notes\n\n"
+    note_ds = sorted({k.subject for k in cells if k.suite == metrics.Suite.NOTE})
+    if not note_ds:
+        return s + "Not measured in this run.\n"
+    s += ("Note transcription (COnP = correct onset and pitch; COnPOff also requires the "
+          "offset). This track selects its own threshold and segmentation cost "
+          "internally, the one deliberate exception to the global theta\\* rule.\n\n")
+    rows = []
+    for algo in _algos(cells):
+        row = [algo]
+        for ds in note_ds:
+            cell = cells.get(metrics.CellKey(suite="note", subject=ds,
+                                             condition="clean", algo=algo))
+            r = (cell or {}).get("results", {})
+            conp, conpoff = r.get("conp"), r.get("conpoff")
+            row.append("n/a" if _is_bad(conp) else f"{conp:.3f} / {conpoff:.3f}")
+        rows.append(row)
+    return s + md_table(["**Algorithm**"] + [f"**{d}** (COnP/COnPOff)" for d in note_ds],
+                        rows)
+
+
+def section_speed(cells):
+    s = "## Track 6: Speed\n\n"
+    rows = []
+    for algo in _algos(cells):
+        sp = metrics.track_speed(cells, algo)
+        rows.append([algo, "n/a" if sp.get("rtf_cpu") is None else f"{sp['rtf_cpu']:.4f}",
+                     "n/a" if sp.get("score") is None else f"{sp['score']:.3f}"])
+    if not any(r[1] != "n/a" for r in rows):
+        return s + "Not measured in this run.\n"
+    s += ("Real-time factor on cpu under controlled conditions (serial, isolated, "
+          "repeated): seconds of compute per second of audio, so lower is faster. "
+          "Score = 1/(1+RTF).\n\n")
+    return s + md_table(["**Algorithm**", "**RTF (cpu)**", "**Score**"], rows)
+
+
+# --------------------------------------------------------------------------- #
+# Reliability, datasets, caveats
+# --------------------------------------------------------------------------- #
+def section_reliability(cells):
+    """Reliability, not scored: did each cell finish, and how did the rest fail.
+
+    The numbers come from metrics.cost_summary; this only formats them."""
+    rows = []
+    for algo in _algos(cells):
+        c = metrics.cost_summary(cells, algo)
+        if not c["attempted"]:
+            continue
+        detail = "" if not c["crash_kinds"] else " (" + ", ".join(
+            f"{v}x {k}" for k, v in sorted(c["crash_kinds"].items())) + ")"
+        rows.append([algo, f"{c['completed']}/{c['attempted']}{detail}"])
+    if not rows:
+        return ""
+    return ("## Reliability\n\nNothing here is scored -- these are facts about running the "
+            "code. A crashed cell still counts against the tracker's scores (it contributes "
+            "0 to its track), so `completed/attempted` explains a low score rather than "
+            "excusing it. Speed is measured separately, and comparably, by the Speed "
+            "track.\n\n"
+            + md_table(["**Algorithm**", "**completed/attempted**"], rows))
+
+
+def section_by_domain(cells):
+    """Speech vs music: the one grouping a reader chooses on. Finer groupings were
+    measured to be exact means of the per-dataset numbers already printed."""
+    rows = []
+    for algo in _algos(cells):
+        star = metrics.theta_star(cells, algo)
+        if star["idx"] is None:
+            continue
+        by_ds = {ds: cell["results"]["sweep"][star["idx"]]["pitch"]["f1"]
+                 for ds, _cap, cell in metrics.frame_cells(cells, algo, "clean")}
+        row = [algo]
+        for _g, members in DOMAIN_GROUPS.items():
+            vals = [by_ds[d] for d in members if d in by_ds]
+            row.append(f"{np.mean(vals):.3f}" if vals else "n/a")
+        if any(c != "n/a" for c in row[1:]):
+            rows.append(row)
+    if not rows:
+        return ""
+    return ("\n### Correctness by domain\n\nClean pitch F1, equal weight per dataset "
+            "within each domain.\n\n"
+            + md_table(["**Algorithm**"] + [f"**{g}**" for g in DOMAIN_GROUPS], rows))
+
+
 def section_datasets(repo_root):
     path = os.path.join(repo_root, "dataset_stats.json")
     s = "## Datasets\n\n"
@@ -288,331 +481,36 @@ def section_datasets(repo_root):
                     "`scripts/dataset_stats.py --json dataset_stats.json` and commit the "
                     "JSON to render this section.\n")
     rows = json.load(open(path))
-    hdr = ["**Dataset**", "**Domain**", "**Clips**", "**Hours**", "**Avg len (s)**",
-           "**Voiced %**", "**f0 p5-p50-p95 (Hz)**", "**Band coverage**"]
     body = []
     for r in rows:
-        cov = ", ".join(f"{b} {r['bands'][b]:.0f}%" for b, _, _ in PITCH_BANDS
-                        if r["bands"].get(b, 0) >= 1.0)
+        by_band = ", ".join(f"{b} {r['bands'][b]:.0f}%" for b, _, _ in PITCH_BANDS
+                            if r["bands"].get(b, 0) >= 1.0)
         flag = " (sparse-voiced)" if r["name"] in SPARSE_VOICED else \
-               " (voicing-only GT)" if r["name"] in VOICING_ONLY else ""
+               " (score-grade pitch GT, unscored)" if r["name"] in metrics.PITCH_INELIGIBLE \
+               else ""
         body.append([r["name"] + flag, r["domain"], str(r["n"]), f"{r['hours']:.1f}",
-                     f"{r['avg_len']:.1f}", f"{r['voiced_pct']:.0f}",
-                     f"{r['p5']:.0f}-{r['p50']:.0f}-{r['p95']:.0f}", cov])
-    s += md_table(hdr, body)
+                     f"{r['voiced_pct']:.0f}",
+                     f"{r['p5']:.0f}-{r['p50']:.0f}-{r['p95']:.0f}", by_band])
+    s += md_table(["**Dataset**", "**Domain**", "**Clips**", "**Hours**", "**Voiced %**",
+                   "**f0 p5-p50-p95 (Hz)**", "**f0 by band**"], body)
     s += ("\nBands: " + ", ".join(f"{n} ({band_label(lo, hi)})" for n, lo, hi in PITCH_BANDS)
           + ". f0 statistics are over in-window voiced frames.\n")
     return s
 
 
-# --------------------------------------------------------------------------- #
-# 4. Accuracy
-# --------------------------------------------------------------------------- #
-def _clean_cells(cells, algo):
-    for (track, ds, cond, a), cell in cells.items():
-        if track == "frame" and a == algo and cond == "clean" \
-                and not cell.get("metadata", {}).get("crashed") \
-                and cell.get("results", {}).get("sweep"):
-            yield ds, cell
-
-
-def section_accuracy(cells):
-    algos = _algos(cells)
-    s = "## Track 1: Accuracy\n\n"
-    s += ("Clean real recordings at each algorithm's theta\\*. Datasets flagged "
-          "voicing-only are excluded from the score; sparse-voiced corpora are flagged "
-          "(precision denominators dominated by silence).\n\n")
-    any_rows = False
-    for algo in algos:
-        st = _star(cells, algo)
-        if st["idx"] is None:
-            continue
-        rows = []
-        for ds, cell in sorted(_clean_cells(cells, algo)):
-            e = cell["results"]["sweep"][st["idx"]]
-            pc = cell["results"].get("per_clip")
-            f50 = e["pitch_f"]["f50"]
-            if pc and pc.get("stats"):
-                keyed, _n = metrics.frame_keyed(pc, st["idx"])
-                lo, hi = cluster_bootstrap(list(keyed.values()), FRAME_REDUCERS["pitch_f"])
-                f50s = ci_cell(f50, lo, hi)
-            else:
-                f50s = f"{f50:.3f}"
-            flag = " (sparse)" if ds in SPARSE_VOICED else \
-                   " (voicing-only, unscored)" if ds in VOICING_ONLY else ""
-            probe = " [probe]" if cell.get("metadata", {}).get("probe") else ""
-            rows.append([ds + flag + probe, f50s,
-                         f"{e['pitch_f']['r50']:.3f}", f"{e['pitch_f']['p50']:.3f}",
-                         f"{e['pitch_f']['auc']:.3f}", f"{e['pitch']['rpa']:.3f}",
-                         f"{e['pitch']['coverage']:.3f}"])
-        if not rows:
-            continue
-        any_rows = True
-        s += f"### {algo}\n\n"
-        s += md_table(["**Dataset**", "**F@50 [95% CI]**", "**R@50**", "**P@50**",
-                       "**AUC**", "**RPA@50 (voiced)**", "**Coverage**"], rows)
-        fac = metrics.factorization(cells, algo, theta_idx=st["idx"])
-        if fac:
-            s += (f"\nFactorization (frame-pooled): pitch recall {fac['pitch_recall']:.3f} "
-                  f"= voicing recall {fac['voicing_recall']:.3f} x accuracy-on-voiced "
-                  f"{fac['accuracy_on_voiced']:.3f}; pitch F {fac['pitch_f']:.3f}.\n\n")
-    if not any_rows:
-        s += "No clean frame cells.\n"
-    return s
-
-
-# --------------------------------------------------------------------------- #
-# 5. Noise
-# --------------------------------------------------------------------------- #
-def section_noise(cells):
-    algos = _algos(cells)
-    s = "## Track 2: Noise robustness\n\n"
-    s += ("Retention ratio F@50(degraded)/F@50(clean) on the SAME probe clips, at "
-          "theta\\*, equal-per-dataset. **Floor-effect caveat**: a tracker that is "
-          "already poor on clean has little to lose; read this column next to "
-          "Accuracy, never alone.\n\n")
-    conds = sorted({k[2] for k in cells if k[0] == "frame"
-                    and k[2] not in ("clean", "clean_probe")})
-    if not conds:
-        return s + "No degradation cells.\n"
-    rows = []
-    per_algo = {}
-    for algo in algos:
-        nz = metrics.track_noise(cells, algo)
-        per_algo[algo] = nz.get("per_condition", {})
-        row = [algo, "n/a" if nz["score"] is None else f"{nz['score']:.3f}"]
-        row += [f"{per_algo[algo][c]:.3f}" if c in per_algo[algo] else "n/a" for c in conds]
-        rows.append(row)
-    s += md_table(["**Algorithm**", "**Mean**"] + [f"**{c}**" for c in conds], rows)
-    fams = {f: [c for c in members if c in conds]
-            for f, members in CONDITION_FAMILIES.items()}
-    fams = {f: cs for f, cs in fams.items() if len(cs) >= 2}
-    if fams:
-        rows = []
-        for algo in algos:
-            row = [algo]
-            for f, cs in fams.items():
-                vals = [per_algo[algo][c] for c in cs if c in per_algo[algo]]
-                row.append(f"{np.mean(vals):.3f}" if vals else "n/a")
-            rows.append(row)
-        s += "\nBy condition family:\n\n"
-        s += md_table(["**Algorithm**"] + [f"**{f}**" for f in fams], rows)
-    return s
-
-
-# --------------------------------------------------------------------------- #
-# 6. Signals
-# --------------------------------------------------------------------------- #
-def section_signals(cells):
-    algos = _algos(cells)
-    s = "## Track 3: Signal robustness\n\n"
-    s += ("Stationary synthetic families with exact labels; per-family accuracy = "
-          "coverage-aware pitch recall@50 at theta\\*. Score = the MEAN over families "
-          "(each family is one probe question, equally weighted); the worst family is "
-          "named beside it as the diagnostic. A worst-family SCORE was measured and "
-          "rejected: 6 of 7 surveyed trackers have at least one exactly-dead family, "
-          "so a min would zero almost the whole field. Controls (no pitch present) "
-          "report false-positive rate as a diagnostic.\n\n")
-    fams = sorted({k[1] for k, c in cells.items() if k[0] == "synthetic"
-                   and c.get("results", {}).get("kind") == "stationary"})
-    if not fams:
-        return s + "No synthetic stationary cells.\n"
-    rows = []
-    for algo in algos:
-        sig = metrics.track_signals(cells, algo)
-        pf = sig.get("per_family", {})
-        row = [algo, "n/a" if sig["score"] is None else
-               f"**{sig['score']:.2f}** (worst {sig['worst_family']} {sig['worst']:.2f})"]
-        row += [f"{pf[f]:.2f}" if f in pf else "n/a" for f in fams]
-        rows.append(row)
-    s += md_table(["**Algorithm**", "**Score (worst)**"] + [f"**{f}**" for f in fams], rows)
-    ctl = sorted({k[1] for k, c in cells.items() if k[0] == "synthetic"
-                  and c.get("results", {}).get("kind") == "control"})
-    if ctl:
-        rows = []
-        for algo in algos:
-            row = [algo]
-            for f in ctl:
-                cell = cells.get(("synthetic", f, None, algo))
-                fp = cell.get("results", {}).get("false_positive_rate") if cell else None
-                row.append("n/a" if _is_bad(fp) else f"{fp:.3f}")
-            rows.append(row)
-        s += "\nControls (false-positive rate, lower is better; diagnostic only):\n\n"
-        s += md_table(["**Algorithm**"] + [f"**{f}**" for f in ctl], rows)
-    return s
-
-
-# --------------------------------------------------------------------------- #
-# 7. Stability
-# --------------------------------------------------------------------------- #
-def section_stability(cells):
-    algos = _algos(cells)
-    s = "## Track 4: Operating stability\n\n"
-    s += ("F@50 at the frozen theta\\* divided by F@50 at each cell's oracle threshold "
-          "(1.0 = the one global threshold loses nothing anywhere). Fixed-operating-"
-          "point trackers are trivially 1.0 (nothing to mistune) and flagged `†` on the "
-          "leaderboard.\n\n")
-    rows = []
-    for algo in algos:
-        st = metrics.track_stability(cells, algo)
-        star = _star(cells, algo)
-        flat = []
-        for _ds, cell in _clean_cells(cells, algo):
-            f = [e["pitch_f"]["f50"] for e in cell["results"]["sweep"]]
-            if f and star["idx"] is not None:
-                flat.append(max(f) - f[star["idx"]])
-        rows.append([algo,
-                     "n/a" if st["score"] is None else f"{st['score']:.3f}",
-                     f"{max(flat):.3f}" if flat else "n/a"])
-    s += md_table(["**Algorithm**", "**Efficiency**", "**Worst peak-vs-theta\\* gap**"], rows)
-    return s
-
-
-# --------------------------------------------------------------------------- #
-# 8. Dynamics
-# --------------------------------------------------------------------------- #
-def section_dynamics(cells):
-    algos = _algos(cells)
-    s = "## Track 5: Tracking dynamics\n\n"
-    s += (f"Trajectory families with exact labels, read at theta\\*. Steady tones: "
-          f"jitter (cents std) and bias, scored sigma0/(sigma0+jitter) with "
-          f"sigma0={SIGMA0:.0f}c. Vibrato: modulation-depth retention x voiced "
-          f"coverage. Track score = mean of the two family groups.\n\n")
-    fams = sorted({k[1] for k, c in cells.items() if k[0] == "synthetic"
-                   and c.get("results", {}).get("kind") == "trajectory"})
-    if not fams:
-        return s + "No trajectory cells.\n"
-    rows = []
-    for algo in algos:
-        dyn = metrics.track_dynamics(cells, algo)
-        row = [algo, "n/a" if dyn["score"] is None else f"{dyn['score']:.3f}"]
-        for f in fams:
-            e = dyn.get("per_family", {}).get(f)
-            if not e:
-                row.append("n/a")
-            elif "jitter_cents" in e:
-                j, b = e.get("jitter_cents"), e.get("bias_cents")
-                row.append("n/a" if _is_bad(j) else f"jit {j:.1f}c, bias {b:+.1f}c")
-            else:
-                row.append(f"ret {e.get('depth_retention', 0):.2f} x cov "
-                           f"{e.get('coverage', 0):.2f}")
-        rows.append(row)
-    s += md_table(["**Algorithm**", "**Score**"] + [f"**{f}**" for f in fams], rows)
-    return s
-
-
-# --------------------------------------------------------------------------- #
-# 9. Notes
-# --------------------------------------------------------------------------- #
-def section_notes(cells):
-    algos = _algos(cells)
-    s = "## Track 6: Notes\n\n"
-    s += ("Note transcription (COnP / COnPOff). This track selects its own threshold "
-          "and segmentation cost internally -- the one deliberate exception to the "
-          "global-theta rule, documented here.\n\n")
-    note_ds = sorted({k[1] for k in cells if k[0] == "note"})
-    if not note_ds:
-        return s + "No note cells.\n"
-    rows = []
-    for algo in algos:
-        row = [algo]
-        for ds in note_ds:
-            cell = cells.get(("note", ds, "clean", algo))
-            r = cell.get("results", {}) if cell else {}
-            conp, conpoff = r.get("conp"), r.get("conpoff")
-            row.append("n/a" if _is_bad(conp) else f"{conp:.3f} / {conpoff:.3f}")
-        rows.append(row)
-    s += md_table(["**Algorithm**"] + [f"**{d}** (COnP/COnPOff)" for d in note_ds], rows)
-    return s
-
-
-# --------------------------------------------------------------------------- #
-# 10. Speed
-# --------------------------------------------------------------------------- #
-def section_speed(cells):
-    algos = _algos(cells)
-    s = "## Track 7: Speed\n\n"
-    rows = []
-    for algo in algos:
-        sp = metrics.track_speed(cells, algo)
-        rows.append([algo,
-                     "n/a" if sp.get("rtf_cpu") is None else f"{sp['rtf_cpu']:.3f}",
-                     "n/a" if sp["score"] is None else f"{sp['score']:.3f}"])
-    if not any(r[1] != "n/a" for r in rows):
-        return s + "No speed cells.\n"
-    s += md_table(["**Algorithm**", "**RTF (cpu)**", "**Score 1/(1+RTF)**"], rows)
-    return s
-
-
-# --------------------------------------------------------------------------- #
-# 11. Caveats
-# --------------------------------------------------------------------------- #
 def section_caveats():
     return """## Caveats
 
-- **Floor effect** (Noise track): retention is only meaningful next to absolute
-  Accuracy; a tracker that is poor on clean audio has little room to drop.
-- **Sparse-voiced corpora** (OSFGlottis, AVID): mostly-unvoiced sessions; precision
-  denominators are dominated by silence false positives. Flagged in the tables.
-- **Score-grade ground truth** (M4Singer): notated pitch, not performed f0; voicing GT
-  is reliable, pitch scores are not; excluded from Accuracy.
+- **Sparse-voiced corpora** (OSFGlottis, AVID): mostly-unvoiced sessions, so precision
+  denominators are dominated by silence false positives. Flagged in the tables, never
+  dropped.
+- **Score-grade pitch ground truth** (M4Singer): the notated note, not the performed f0.
+  Its voicing labels are sound, so the corpus is kept for voicing, but it is excluded
+  from every pitch number including theta\\* selection.
 - **Training-data leakage**: learned trackers may have trained on these public corpora.
-  A clean-only advantage that collapses under degradation is a leakage signature;
+  A clean-only advantage that collapses under degradation is a leakage signature; the
   degraded and synthetic tracks move inputs away from anything seen verbatim.
-- **Why v1 scored pitch conditionally, and v2 does not**: v1 computed RPA only where
-  both sides agreed on voicing, to dodge GT voicing-label errors and to accommodate
-  trackers that output no pitch on unvoiced frames. v2 scores the joint event instead:
-  labels are now exact-by-construction or consensus-derived, paired comparisons cancel
-  the shared residue, and the (f0, q) contract makes abstention a voicing claim (a
-  recall cost) rather than a fabricated pitch error. The conditional quantity survives
-  as the accuracy-on-voiced diagnostic in the factorization.
 """
-
-
-# --------------------------------------------------------------------------- #
-# 12. Appendix
-# --------------------------------------------------------------------------- #
-def section_appendix(cells):
-    algos = _algos(cells)
-    s = "## Appendix\n\n### Accuracy by dataset group\n\n"
-    per_algo_ds = {}
-    for algo in algos:
-        st = _star(cells, algo)
-        if st["idx"] is None:
-            continue
-        per_algo_ds[algo] = {ds: cell["results"]["sweep"][st["idx"]]["pitch_f"]["f50"]
-                             for ds, cell in _clean_cells(cells, algo)
-                             if ds not in VOICING_ONLY}
-    grouped = {d for t in DATASET_GROUPS.values() for names in t.values() for d in names}
-    present = {d for v in per_algo_ds.values() for d in v}
-    for d in sorted(present - grouped):
-        print(f"Warning: dataset {d} not covered by DATASET_GROUPS")
-    for title, groups in DATASET_GROUPS.items():
-        rows = []
-        for algo, by_ds in per_algo_ds.items():
-            row = [algo]
-            for gname, members in groups.items():
-                vals = [by_ds[d] for d in members if d in by_ds]
-                row.append(f"{np.mean(vals):.3f}" if vals else "n/a")
-            rows.append(row)
-        if rows:
-            s += f"**{title}**\n\n"
-            s += md_table(["**Algorithm**"] + [f"**{g}**" for g in groups], rows) + "\n"
-    s += "### Aggregation sensitivity\n\n"
-    s += ("The Overall uses the harmonic mean (one mean family everywhere; dominated by "
-          "the weakest track). The alternatives on the same track scores:\n\n")
-    rows = []
-    for algo in algos:
-        sc = [v for v in metrics.track_scores(cells, algo).values() if v is not None]
-        if len(sc) != len(TRACKS_SCORED) or any(v <= 0 for v in sc):
-            rows.append([algo, "n/a", "n/a", "n/a"])
-            continue
-        am = float(np.mean(sc))
-        gm = float(np.exp(np.mean(np.log(sc))))
-        hm = float(len(sc) / np.sum(1.0 / np.asarray(sc)))
-        rows.append([algo, f"{am:.3f}", f"{gm:.3f}", f"{hm:.3f}"])
-    s += md_table(["**Algorithm**", "**AM**", "**GM**", "**HM (used)**"], rows)
-    return s
 
 
 # --------------------------------------------------------------------------- #
@@ -621,20 +519,28 @@ def update_readme_table(readme_path, cells):
     if not os.path.exists(readme_path):
         return
     algos = _algos(cells)
+    scored, live, missing = _live_tracks(cells, algos)
     overalls = {a: metrics.overall(cells, a) for a in algos}
     complete = {a: v for a, v in overalls.items() if v is not None}
     order = sorted(complete, key=lambda a: -complete[a])
-    scores = {a: metrics.track_scores(cells, a) for a in order}
-    lines = ["", "The overall score is the harmonic mean of the seven track scores "
-                 "(see the benchmark report for definitions and diagnostics).", ""]
+    note = ("The overall score is the harmonic mean of the six track scores "
+            "(see [METRICS.md](METRICS.md) for definitions).")
+    if missing:
+        note = (f"{_and_list(missing)} {'are' if len(missing) > 1 else 'is'} not yet "
+                f"measured, so Overall is not computed; the table ranks by Correctness. "
+                f"See [METRICS.md](METRICS.md) for definitions.")
+        order = sorted(algos, key=lambda a: -(scored[a]["correctness"] or 0))
+    lines = ["", note, ""]
     if order:
-        hdr = ["**Algorithm**", "**Overall**"] + [f"**{l}**" for _k, l in TRACK_LABELS]
-        rows = [[a, f"{complete[a]:.3f}"]
-                + [f"{scores[a][k]:.3f}" for k, _l in TRACK_LABELS] for a in order]
+        hdr = ["**Algorithm**"] + ([] if missing else ["**Overall**"]) \
+            + [f"**{l}**" for _k, l in live]
+        rows = []
+        for a in order:
+            row = [a] + ([] if missing else [f"{complete[a]:.3f}"])
+            row += ["n/a" if scored[a][k] is None else f"{scored[a][k]:.3f}"
+                    for k, _l in live]
+            rows.append(row)
         lines.append(md_table(hdr, rows).rstrip())
-    partial = sorted(set(algos) - set(order))
-    if partial:
-        lines += ["", "Awaiting complete v2 runs: " + ", ".join(partial) + "."]
     lines.append("")
     src = open(readme_path).read()
     head = "## Overall Results"
@@ -662,20 +568,19 @@ def main():
     parts = [
         "# Pitch Benchmark Report\n",
         section_leaderboard(cells),
-        section_methodology(),
-        section_datasets(repo_root),
-        section_accuracy(cells),
+        section_correctness(cells),
+        section_by_domain(cells),
         section_noise(cells),
-        section_signals(cells),
-        section_stability(cells),
-        section_dynamics(cells),
+        section_signal_types(cells),
+        section_tracking(cells),
         section_notes(cells),
         section_speed(cells),
+        section_reliability(cells),
+        section_datasets(repo_root),
         section_caveats(),
-        section_appendix(cells),
     ]
     with open(args.out, "w") as f:
-        f.write("\n".join(parts))
+        f.write("\n".join(p for p in parts if p))
     print(f"report -> {args.out}")
     if args.readme:
         update_readme_table(args.readme, cells)

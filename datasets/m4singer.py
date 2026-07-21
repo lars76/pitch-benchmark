@@ -33,11 +33,12 @@ class PitchDatasetM4Singer(PitchDataset):
     """
     # Caveat: score-grade GT (the intended note, not the performed f0): voicing labels are
     # reliable, pitch-accuracy labels are not; the report excludes it from accuracy/note
-    # leaderboards (generate_report.VOICING_ONLY).
+    # leaderboards (metrics.PITCH_INELIGIBLE).
 
     # Has note intervals (score MIDI), so the CAPABILITY is present, but the note leaderboard
     # EXCLUDES M4Singer by runner/report policy (score-grade GT, not 50ms/50c reference). Capability
-    # lives on the dataset; leaderboard inclusion is a separate policy decision (see note_benchmark).
+    # lives on the dataset; scoring eligibility is a separate policy decision (metrics.PITCH_INELIGIBLE,
+    # which now covers the Notes track too, since COnP is also a 50-cent pitch test).
     provides_notes = True
     fmin = 65
     fmax = 2093

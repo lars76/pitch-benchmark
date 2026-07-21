@@ -1,9 +1,10 @@
 from .augment import (
-    CONDITION_FAMILIES,
-    REGISTRY,
+    BY_NAME,
+    CANONICAL,
     Augment,
+    Condition,
+    Recorded,
     Truncate,
-    build_pipeline,
     subset,
 )
 from .bach10synth import PitchDatasetBach10Synth
@@ -28,8 +29,10 @@ from .urmp import PitchDatasetURMP
 from .vocadito import PitchDatasetVocadito
 
 __all__ = [
-    "CONDITION_FAMILIES",
-    "REGISTRY",
+    "BY_NAME",
+    "CANONICAL",
+    "Condition",
+    "Recorded",
     "Augment",
     "PitchDataset",
     "PitchDatasetAPLAWD",
@@ -50,7 +53,6 @@ __all__ = [
     "PitchDatasetURMP",
     "PitchDatasetVocadito",
     "Truncate",
-    "build_pipeline",
     "subset",
 ]
 
