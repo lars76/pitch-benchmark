@@ -2,27 +2,27 @@
 
 ## Leaderboard
 
-**Notes is not measured in this run**, so Overall is not computed; rank by Correctness. Definitions for every column are in [METRICS.md](METRICS.md).
+Overall is the harmonic mean of the six track scores, so a tracker is only as good as its weakest situation of use. Definitions for every column are in [METRICS.md](METRICS.md).
 
-| **Algorithm** | **Overall** | **theta\*** | **Correctness** | **Noise** | **Signal types** | **Tracking** | **Speed** |
-|---|---|---|---|---|---|---|---|
-| Praat | n/a | 0.7 | 0.824 | 0.492 | **0.953** | **0.987** | **0.998** |
-| CREPE | n/a | 0.6 | 0.825 | 0.637 | 0.893 | 0.914 | 0.718 |
-| SwiftF0 | n/a | 0.9 | 0.774 | 0.525 | 0.817 | 0.881 | 0.955 |
-| RMVPE | n/a | 0.5 | **0.853** | **0.756** | 0.471 | 0.940 | 0.900 |
-| BasicPitch | n/a | 0.3 | 0.666 | 0.531 | 0.809 | 0.833 | 0.970 |
-| DIO | n/a | 0.3 | 0.804 | 0.443 | 0.685 | 0.975 | 0.996 |
-| RAPT | n/a | 0.2 | 0.816 | 0.400 | 0.664 | 0.953 | 0.998 |
-| Harvest | n/a | 1.0 | 0.747 | 0.542 | 0.510 | 0.747 | 0.966 |
-| SWIPE | n/a | 0.7 | 0.686 | 0.363 | 0.809 | 0.785 | 0.982 |
-| SPICE | n/a | 0.8 | 0.706 | 0.504 | 0.507 | 0.729 | 0.955 |
-| PENN | n/a | 0.3 | 0.791 | 0.426 | 0.675 | 0.870 | 0.630 |
-| pYIN | n/a | 0.1 | 0.635 | 0.347 | 0.776 | 0.506 | 0.860 |
-| TorchCREPE | n/a | 0.6 | 0.801 | 0.583 | 0.892 | 0.544 | 0.295 |
-| YAAPT | n/a | 0.9 | 0.705 | 0.496 | 0.399 | 0.192 | 0.980 |
-| REAPER | n/a | 0.1 | 0.504 | 0.295 | 0.222 | 0.317 | 0.000 |
+| **Algorithm** | **Overall** | **theta\*** | **Correctness** | **Noise** | **Signal types** | **Tracking** | **Notes** | **Speed** |
+|---|---|---|---|---|---|---|---|---|
+| Praat | **0.793** | 0.7 | 0.824 | 0.492 | **0.953** | **0.987** | 0.793 | **0.998** |
+| CREPE | 0.787 | 0.6 | 0.825 | 0.637 | 0.893 | 0.914 | **0.811** | 0.718 |
+| SwiftF0 | 0.755 | 0.9 | 0.774 | 0.525 | 0.817 | 0.881 | 0.742 | 0.955 |
+| RMVPE | 0.744 | 0.5 | **0.853** | **0.756** | 0.471 | 0.940 | 0.785 | 0.900 |
+| BasicPitch | 0.734 | 0.3 | 0.666 | 0.531 | 0.809 | 0.833 | 0.754 | 0.970 |
+| DIO | 0.715 | 0.3 | 0.804 | 0.443 | 0.685 | 0.975 | 0.715 | 0.996 |
+| RAPT | 0.702 | 0.2 | 0.816 | 0.400 | 0.664 | 0.953 | 0.791 | 0.998 |
+| Harvest | 0.679 | 1.0 | 0.747 | 0.542 | 0.510 | 0.747 | 0.757 | 0.966 |
+| SPICE | 0.654 | 0.8 | 0.706 | 0.504 | 0.507 | 0.729 | 0.724 | 0.955 |
+| PENN | 0.633 | 0.3 | 0.791 | 0.426 | 0.675 | 0.870 | 0.605 | 0.630 |
+| pYIN | 0.586 | 0.1 | 0.635 | 0.347 | 0.776 | 0.506 | 0.739 | 0.860 |
+| TorchCREPE | 0.561 | 0.6 | 0.801 | 0.583 | 0.892 | 0.544 | 0.724 | 0.295 |
+| YAAPT | 0.436 | 0.9 | 0.705 | 0.496 | 0.399 | 0.192 | 0.620 | 0.980 |
+| SWIPE | 0 (Notes) | 0.7 | 0.686 | 0.363 | 0.809 | 0.785 | 0.000 | 0.982 |
+| REAPER | 0 (Notes, Speed) | 0.1 | 0.504 | 0.295 | 0.222 | 0.317 | 0.000 | 0.000 |
 
-**Praat** leads overall; RMVPE leads Correctness; RMVPE leads Noise.
+**Praat** leads overall; RMVPE leads Correctness; RMVPE leads Noise; CREPE leads Notes.
 
 ## Track 1: Correctness
 
@@ -566,7 +566,25 @@ Trajectory families with exact labels, read at theta\*. Steady tones score sigma
 
 ## Track 5: Notes
 
-Not measured in this run.
+Note transcription (COnP = correct onset and pitch; COnPOff also requires the offset). This track selects its own threshold and segmentation cost internally, the one deliberate exception to the global theta\* rule.
+
+| **Algorithm** | **URMP** (COnP/COnPOff) | **Vocadito** (COnP/COnPOff) |
+|---|---|---|
+| BasicPitch | 0.846 / 0.760 | 0.661 / 0.497 |
+| CREPE | 0.859 / 0.777 | 0.763 / 0.618 |
+| DIO | 0.726 / 0.640 | 0.705 / 0.558 |
+| Harvest | 0.809 / 0.667 | 0.704 / 0.507 |
+| PENN | 0.509 / 0.357 | 0.702 / 0.553 |
+| Praat | 0.829 / 0.756 | 0.758 / 0.629 |
+| RAPT | 0.819 / 0.737 | 0.763 / 0.629 |
+| REAPER | n/a | n/a |
+| RMVPE | 0.789 / 0.689 | 0.780 / 0.646 |
+| SPICE | 0.749 / 0.658 | 0.699 / 0.485 |
+| SWIPE | n/a | n/a |
+| SwiftF0 | 0.732 / 0.559 | 0.752 / 0.607 |
+| TorchCREPE | 0.680 / 0.611 | 0.767 / 0.614 |
+| YAAPT | 0.491 / 0.429 | 0.748 / 0.619 |
+| pYIN | 0.808 / 0.739 | 0.670 / 0.419 |
 
 ## Track 6: Speed
 
@@ -596,21 +614,21 @@ Nothing here is scored -- these are facts about running the code. A crashed cell
 
 | **Algorithm** | **completed/attempted** |
 |---|---|
-| BasicPitch | 239/239 |
-| CREPE | 239/239 |
-| DIO | 239/239 |
-| Harvest | 239/239 |
-| PENN | 239/239 |
-| Praat | 239/239 |
-| RAPT | 239/239 |
-| REAPER | 131/239 (4x IndexError, 79x exit -11, 25x exit -6) |
-| RMVPE | 239/239 |
-| SPICE | 239/239 |
-| SWIPE | 219/239 (20x exit -11) |
-| SwiftF0 | 239/239 |
-| TorchCREPE | 239/239 |
-| YAAPT | 239/239 |
-| pYIN | 239/239 |
+| BasicPitch | 241/241 |
+| CREPE | 241/241 |
+| DIO | 241/241 |
+| Harvest | 241/241 |
+| PENN | 241/241 |
+| Praat | 241/241 |
+| RAPT | 241/241 |
+| REAPER | 131/241 (4x IndexError, 81x exit -11, 25x exit -6) |
+| RMVPE | 241/241 |
+| SPICE | 241/241 |
+| SWIPE | 219/241 (22x exit -11) |
+| SwiftF0 | 241/241 |
+| TorchCREPE | 241/241 |
+| YAAPT | 241/241 |
+| pYIN | 241/241 |
 
 ## Datasets
 
