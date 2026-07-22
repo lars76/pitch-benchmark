@@ -20,8 +20,7 @@ from metrics import PITCH_BANDS, SIGMA0, band_label, cluster_bootstrap, FRAME_RE
 
 # Sparse-voiced corpora: long clinical/lab sessions that are mostly UNVOICED; precision
 # denominators are dominated by silence false positives and are not
-# comparable to the dense corpora. Flagged in place, never dropped -- unlike
-# metrics.PITCH_INELIGIBLE, which the scorer excludes outright.
+# comparable to the dense corpora. Flagged in place, never dropped.
 SPARSE_VOICED = frozenset({"OSFGlottis", "AVID"})
 
 # The split a reader actually chooses on. Finer groupings were measured to be exact means
@@ -485,9 +484,7 @@ def section_datasets(repo_root):
     for r in rows:
         by_band = ", ".join(f"{b} {r['bands'][b]:.0f}%" for b, _, _ in PITCH_BANDS
                             if r["bands"].get(b, 0) >= 1.0)
-        flag = " (sparse-voiced)" if r["name"] in SPARSE_VOICED else \
-               " (score-grade pitch GT, unscored)" if r["name"] in metrics.PITCH_INELIGIBLE \
-               else ""
+        flag = " (sparse-voiced)" if r["name"] in SPARSE_VOICED else ""
         body.append([r["name"] + flag, r["domain"], str(r["n"]), f"{r['hours']:.1f}",
                      f"{r['voiced_pct']:.0f}",
                      f"{r['p5']:.0f}-{r['p50']:.0f}-{r['p95']:.0f}", by_band])

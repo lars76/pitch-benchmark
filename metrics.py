@@ -607,18 +607,13 @@ def cap_of(cell):
 
 SIGMA0 = 10.0        # cents; steady-jitter normalizer s = SIGMA0/(SIGMA0+jitter)
 
-# Datasets whose PITCH ground truth is score-grade (the notated note, not the performed
-# f0). Their voicing labels are sound, but a pitch score against them measures the
-# annotation convention rather than the tracker, so they are excluded from every pitch
-# number INCLUDING theta* selection -- a threshold tuned partly against an annotation
-# artifact would then govern all the other tables. The policy lives here, at the scoring
-# layer, so the report and the training repo cannot disagree with it.
-PITCH_INELIGIBLE = frozenset({"M4Singer"})
-
-
 def _eligible(key, algo, datasets):
-    """Shared row filter: right algorithm, scoreable dataset, inside any narrowing."""
-    return (key.algo == algo and key.subject not in PITCH_INELIGIBLE
+    """Shared row filter: right algorithm, inside any narrowing. Which datasets are in a run
+    is the caller's choice -- a dataset enters only when its path is supplied -- so the scorer
+    imposes no dataset policy of its own. A corpus with score-grade pitch GT (the notated note,
+    not the performed f0) shifts theta* and every pitch table if included; that trade-off is the
+    user's to make by supplying, or withholding, its path."""
+    return (key.algo == algo
             and not (datasets and key.subject not in datasets))
 
 
@@ -914,7 +909,7 @@ def cost_summary(cells, algo):
         attempted += 1
         m = cell.get("metadata", {})
         if m.get("crashed"):
-            k = m.get("crash_kind", "unknown")
+            k = m.get("crash_kind") or m.get("error") or "unknown"   # "error": pre-rename cells
             kinds[k] = kinds.get(k, 0) + 1
             continue
         completed += 1
@@ -1039,20 +1034,23 @@ def track_tracking(cells, algo, *, datasets=None):
 
 
 def track_notes(cells, algo):
-    """Is musical note structure recoverable? Mean COnP over note datasets (this track
-    selects its own threshold x segmentation-cost internally, documented)."""
-    vals, dead = {}, set()
+    """Is musical note structure recoverable? Mean COnP over note datasets (this track selects
+    its own threshold x segmentation-cost internally, documented). Cap-aware like frame_cells:
+    per dataset the UNCAPPED note cell is preferred over a capped probe, so a probe never stands
+    in for -- nor masks a crash in -- the full run."""
+    best = {}          # ds -> (cap, conp | None, crashed)
     for key, cell in cells.items():
-        ds = key.subject
-        if key.suite != Suite.NOTE or key.algo != algo or ds in PITCH_INELIGIBLE:
-            continue        # COnP is a 50-cent PITCH test, so the same exclusion applies
-        if cell.get("metadata", {}).get("crashed"):
-            dead.add(ds)                       # a crash is a failed dataset, not a skip
+        if key.suite != Suite.NOTE or key.algo != algo:
             continue
-        v = cell.get("results", {}).get("conp")
-        if v is not None and np.isfinite(v):
-            vals[ds] = v
-    dead -= set(vals)
+        crashed = bool(cell.get("metadata", {}).get("crashed"))
+        v = None if crashed else (cell.get("results", {}) or {}).get("conp")
+        if not crashed and (v is None or not np.isfinite(v)):
+            continue
+        prev = best.get(key.subject)
+        if prev is None or (prev[0] is not None and key.cap is None):   # prefer uncapped
+            best[key.subject] = (key.cap, v, crashed)
+    vals = {ds: v for ds, (_c, v, crashed) in best.items() if not crashed}
+    dead = {ds for ds, (_c, _v, crashed) in best.items() if crashed}
     if not vals and not dead:
         return {"score": None}
     return {"score": _with_zeros(list(vals.values()), len(dead)),

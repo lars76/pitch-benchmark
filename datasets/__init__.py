@@ -63,7 +63,7 @@ _PITCH_REGISTRY = {
     "MDBStemSynth": PitchDatasetMDBStemSynth,
     "SpeechSynth": PitchDatasetSpeechSynth,
     "MIR1K": PitchDatasetMIR1K,
-    # M4Singer: score-grade GT (voicing-reliable, pitch is intended-score); selection/voicing use.
+    # M4Singer: score-grade pitch GT (voicing-reliable). Off by default; include by supplying its path.
     "M4Singer": PitchDatasetM4Singer,
     "Vocadito": PitchDatasetVocadito,
     "Bach10Synth": PitchDatasetBach10Synth,
@@ -148,8 +148,8 @@ def list_note_datasets() -> list[str]:
 
     Notes are a CAPABILITY of a pitch dataset, not a separate type, so this is the one pitch
     registry filtered by the capability flag, never a second registry to keep in sync. Whether a
-    note-capable dataset belongs on the note LEADERBOARD is a separate policy (e.g. M4Singer has
-    notes but is excluded for score-grade GT); that decision lives in the runner, not here.
+    note-capable dataset actually runs is a separate choice: a dataset enters a run only when its
+    path is supplied, so M4Singer's score-grade caveat is the user's call, not a policy here.
 
     Returns:
         List[str]: Registered dataset names whose samples include a "notes" key.

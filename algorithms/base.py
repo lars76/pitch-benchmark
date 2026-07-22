@@ -52,8 +52,10 @@ class TensorFlowModelMixin:
 
         global _TF_CONFIGURED
         if not _TF_CONFIGURED:
-            os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-            os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+            # The C++-level env vars (TF_CPP_MIN_LOG_LEVEL, ...) must be set BEFORE `import
+            # tensorflow` to have any effect, so they live in evaluate.py's entrypoint shim, not
+            # here (setting them after the import above is a no-op). This just quiets the Python
+            # logger, which TF re-levels on import, so it has to be done here, post-import.
             tf.get_logger().setLevel("ERROR")
             try:
                 for gpu in tf.config.list_physical_devices("GPU"):

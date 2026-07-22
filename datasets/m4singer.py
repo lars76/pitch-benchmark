@@ -32,13 +32,11 @@ class PitchDatasetM4Singer(PitchDataset):
         use_cache (bool): cache decoded samples. Defaults to True.
     """
     # Caveat: score-grade GT (the intended note, not the performed f0): voicing labels are
-    # reliable, pitch-accuracy labels are not; the report excludes it from accuracy/note
-    # leaderboards (metrics.PITCH_INELIGIBLE).
-
-    # Has note intervals (score MIDI), so the CAPABILITY is present, but the note leaderboard
-    # EXCLUDES M4Singer by runner/report policy (score-grade GT, not 50ms/50c reference). Capability
-    # lives on the dataset; scoring eligibility is a separate policy decision (metrics.PITCH_INELIGIBLE,
-    # which now covers the Notes track too, since COnP is also a 50-cent pitch test).
+    # reliable, pitch-accuracy labels are not. Scoring M4Singer therefore measures the
+    # annotation convention, and (because pitch feeds theta*) shifts every tracker's pitch
+    # table. It is not excluded automatically -- it simply is not in a run unless you supply
+    # its path. Note intervals are score MIDI, so COnP against it is the same 50-cent pitch
+    # test with the same caveat.
     provides_notes = True
     fmin = 65
     fmax = 2093

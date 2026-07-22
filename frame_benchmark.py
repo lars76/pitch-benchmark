@@ -35,17 +35,18 @@ def run_single_evaluation(
     algorithm_class: object,
     thresholds: np.ndarray,
     device: str = "auto",
-) -> tuple[dict, bool]:
+) -> tuple[dict, bool, "str | None"]:
     """Evaluate one algorithm on one dataset with a streaming, O(1)-memory threshold sweep.
 
     Metrics fold in one clip at a time (metrics.MetricAccumulator, one per threshold), so runner
     memory is independent of dataset size and clip length, and identical to evaluating on the fully
     concatenated arrays.
 
-    Returns ``(metrics, crashed)``. ``crashed`` is True only when a clip raised (e.g. OOM); the caller
-    stamps it into ``metadata.crashed`` so the report counts it as 0 (not dropped) and the failed cell
-    is cached like any other. A deterministically empty run (all clips unvoiced, or no finite
-    threshold) returns crashed=False; it is a normal cached result.
+    Returns ``(metrics, crashed, crash_kind)``. ``crashed`` is True only when a clip raised (e.g.
+    OOM); ``crash_kind`` is the exception type name then (else None), so the caller can stamp
+    ``metadata.crash_kind`` -- the SAME field a spawned segfault records -- and the report groups
+    an in-process failure by its kind instead of showing "unknown". A deterministically empty run
+    (all clips unvoiced, or no finite threshold) returns crashed=False; it is a normal cached result.
 
     Memory: device cache is released once per algorithm at teardown, NOT per clip. PyTorch's
     caching allocator reuses freed blocks within a run, so emptying per clip only adds malloc churn;
@@ -62,7 +63,7 @@ def run_single_evaluation(
         )
     except Exception as e:
         tqdm.write(f"FATAL: {algo_name} failed to build ({e}). Recording as crashed.")
-        return to_json_safe(_failure_dict(0)), True
+        return to_json_safe(_failure_dict(0)), True, type(e).__name__
 
     accumulators = [MetricAccumulator() for _ in thresholds]
     clips_meta = []                             # [clip_id, group, n_frames] once per clip
@@ -70,6 +71,7 @@ def run_single_evaluation(
     skipped_samples = 0
     clips_evaluated = 0
     did_fail = False
+    crash_kind = None                           # the exception type name if a clip raises
 
     # Iterate the dataset directly (one sample dict at a time, in order), single-process on purpose:
     # the per-dataset in-memory decode cache (built on the first algorithm's pass) is reused by every
@@ -124,6 +126,7 @@ def run_single_evaluation(
                 f"Aborting this algorithm. Error: {e}"
             )
             did_fail = True
+            crash_kind = type(e).__name__
             break
 
         finally:
@@ -146,7 +149,7 @@ def run_single_evaluation(
         torch.mps.empty_cache()
 
     if did_fail or clips_evaluated == 0:
-        return to_json_safe(_failure_dict(skipped_samples)), did_fail
+        return to_json_safe(_failure_dict(skipped_samples)), did_fail, crash_kind
 
     if skipped_samples > 0:
         tqdm.write(f"  ({algo_name} skipped {skipped_samples} unvoiced samples)")
@@ -159,4 +162,4 @@ def run_single_evaluation(
         "per_clip": {"stats_schema": list(FRAME_STAT_COLS),
                      "clips": clips_meta, "stats": per_clip_stats},
     }
-    return to_json_safe(results), False
+    return to_json_safe(results), False, None

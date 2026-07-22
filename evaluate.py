@@ -51,19 +51,41 @@ in-process (no child processes).
 import argparse
 import glob
 import json
+import logging
 import os
 import random
+import signal
 import subprocess
 import sys
+import threading
 import time
+import warnings
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
+
+# --- Quiet third-party backend chatter (KEEP our own warnings) ----------------------------- #
+# Each isolated child re-imports its tracker backend, so without this the console fills with the
+# same import-time warnings from dependencies over and over. Silence those, targeted, before any
+# backend imports (inherited by children, which import this module too); the benchmark's OWN
+# UserWarnings survive (dataset EGG/consensus checks, format guards).
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")            # TensorFlow C++ log spam
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")           # hf re-sets its logger on import
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=r".*pkg_resources is deprecated.*")
+for _noisy in ("coremltools", "tensorflow", "tensorflow_hub", "pysptk", "pyreaper",
+               "pyworld", "resampy", "sklearn"):
+    warnings.filterwarnings("ignore", module=fr".*{_noisy}.*")
+for _lg in ("", "huggingface_hub", "tensorflow", "coremltools"):
+    logging.getLogger(_lg).setLevel(logging.ERROR)
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 import metrics
 import note_benchmark
@@ -105,11 +127,12 @@ from datasets import (
 # THE BENCHMARK DEFINITION: registered = benchmarked, nothing more to declare.
 # datasets from datasets.list_pitch_datasets(), conditions from datasets.augment.CANONICAL,
 # note membership from the provides_notes capability, suites = the four measurement libraries.
-# Opt out per run with --skip-datasets / --datasets; interpretation caveats (score-grade GT,
+# Datasets are opt-in (--data / --datasets); interpretation caveats (score-grade GT,
 # train/test overlap) live on the dataset classes and in the report, not as exclusions here.
 # A run is uncapped by default -- the full, certifiable measurement. A cap (run_cells
-# max_clips=/max_seconds=) applies to every frame cell, clean included; the cap is part of a
-# cell's key, and assert_full() rejects any cell carrying one, so a verdict must run uncapped.
+# max_clips=/max_seconds=) applies to every dataset-backed cell (frame + note), clean included;
+# the cap is part of a cell's key, and assert_full() rejects any cell carrying one, so a verdict
+# must run uncapped.
 # The affordable leaderboard is two runs (capped-all + uncapped-clean), see the README.
 # Everything below this section is execution machinery, not definition.
 # ---------------------------------------------------------------------------- #
@@ -198,8 +221,10 @@ def frame_cell_filename(dataset, algo, degradation, *, is_probe=False, max_clips
     return f"{dataset}_{algo}_{param_str}_seed{seed}.json"
 
 
-def note_cell_filename(algo, dataset, condition, seed=42):
-    return f"notes_{algo}_{dataset}_{condition}_seed{seed}.json"
+def note_cell_filename(algo, dataset, condition, seed=42, *, is_probe=False, max_clips=None,
+                       max_seconds=None):
+    probe = f"probe-n{max_clips}-t{max_seconds}_" if is_probe else ""
+    return f"notes_{algo}_{dataset}_{condition}_{probe}seed{seed}.json"
 
 
 def synthetic_cell_filename(algo, family, device):
@@ -210,6 +235,12 @@ def synthetic_cell_filename(algo, family, device):
 def speed_cell_filename(algo, sample_rate, hop_length, signal_length_sec, n_runs):
     return (f"speed_{algo}_sr{int(sample_rate / 1000)}k_hop{hop_length}_"
             f"len{signal_length_sec}s_runs{n_runs}.json")
+
+
+# The speed suite always measures under these fixed conditions (a 1 s harmonic signal, 10 runs);
+# they are part of the speed cell's identity -- its filename -- so the measurement (_run_speed_cells)
+# and the expected-path lookup (_expected_path) share one definition and cannot drift.
+SPEED_MEASUREMENT = dict(sample_rate=22050, hop_length=256, signal_length_sec=1.0, n_runs=10)
 
 
 def write_cell(result_path, *, suite, metadata, parameters, results):
@@ -270,7 +301,7 @@ def enumerate_cells(algos, *, datasets=None, conditions=None, suites=SUITES, fam
     _check_names("synthetic families", fams, synthetic_benchmark.ALL_FAMILIES)
     cells = []
     if Suite.FRAME in suites:
-        for c in conds:                                  # clean first (never capped)
+        for c in conds:                                  # clean first
             for d in frame_ds:
                 for a in algos:
                     cells.append(CellKey(suite=Suite.FRAME, subject=d, condition=c, algo=a))
@@ -290,13 +321,13 @@ def enumerate_cells(algos, *, datasets=None, conditions=None, suites=SUITES, fam
 
 
 def _cell_cap(cell, cap):
-    """The one sizing rule: the run's cap applies to every FRAME cell, clean included. The
-    other suites ignore it (their runners take no cap). A capped run therefore produces clean
-    at the same cap as the degraded conditions, which is exactly the same-clips partner the
-    report's Delta-from-clean pairing needs. The full-corpus clean headline comes from a
-    separate uncapped run (its clean cell has cap=None, a distinct key), which theta_star
-    then prefers -- see the standard leaderboard run in the README."""
-    return cap if cell.suite is Suite.FRAME else {}
+    """The one sizing rule: the run's cap applies to every DATASET-BACKED cell -- frame (clean
+    included) and note. A capped run therefore produces clean at the same cap as the degraded
+    conditions (the same-clips partner the report's Delta-from-clean pairing needs) and note as a
+    fast probe. The full-corpus headline comes from a separate uncapped run (its cells have
+    cap=None, distinct keys), which theta_star / track_notes then prefer -- see the standard
+    leaderboard run in the README. Synthetic and speed are dataless, so they are exempt."""
+    return cap if cell.suite in (Suite.FRAME, Suite.NOTE) else {}
 
 
 def _algo_classes(algos):
@@ -326,7 +357,7 @@ def _algo_classes(algos):
 # ---------------------------------------------------------------------------- #
 def run_and_write_frame_cell(eval_dataset, cls, *, out_dir, dataset, condition, is_probe,
                              max_clips, max_seconds, seed, sample_rate, hop_size, device,
-                             algo_name=None):
+                             algo_name=None, report=None):
     """Execute ONE frame cell on an already-built dataset and write it (skip if cached).
     `cls` is the algorithm class (None = an uninstalled named backend -> crashed cell;
     `algo_name` then supplies the name). Also the reference path for external parity tests that
@@ -342,24 +373,30 @@ def run_and_write_frame_cell(eval_dataset, cls, *, out_dir, dataset, condition, 
         max_seconds=max_seconds, sample_rate=sample_rate, hop_size=hop_size,
         device=eff, seed=seed))
     if os.path.exists(path):   # cache-as-done
-        print(f"[frame] skip {os.path.basename(path)} (exists; delete to redo)")
+        if report:
+            report("skip", 0.0)
+        elif not is_child():
+            print(f"[frame] skip {os.path.basename(path)} (exists; delete to redo)")
         return path
     t0 = time.time()
     if cls is None:
-        result, crashed = frame_benchmark._failure_dict(0), True
+        result, crashed, crash_kind = frame_benchmark._failure_dict(0), True, "not installed"
     else:
-        result, crashed = frame_benchmark.run_single_evaluation(
+        result, crashed, crash_kind = frame_benchmark.run_single_evaluation(
             dataset=eval_dataset, algorithm_class=cls,
             thresholds=metrics.DEFAULT_THRESHOLDS, device=device)
+    meta = {
+        "algorithm_name": algo_name, "dataset_name": dataset, "condition": condition,
+        "probe": is_probe, "seed": seed, "device": eff, "crashed": crashed,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "execution_time_seconds": round(time.time() - t0, 2),
+    }
+    if crashed:                                 # a caught in-process exception -> same crash_kind
+        meta["crash_kind"] = crash_kind         # field a spawned segfault uses (else "unknown")
     write_cell(
         path,
         suite=Suite.FRAME,
-        metadata={
-            "algorithm_name": algo_name, "dataset_name": dataset, "condition": condition,
-            "probe": is_probe, "seed": seed, "device": eff, "crashed": crashed,
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "execution_time_seconds": round(time.time() - t0, 2),
-        },
+        metadata=meta,
         parameters={
             "sample_rate": sample_rate, "hop_size": hop_size,
             "max_clips": max_clips, "max_seconds": max_seconds,
@@ -367,16 +404,21 @@ def run_and_write_frame_cell(eval_dataset, cls, *, out_dir, dataset, condition, 
         },
         results=result,
     )
-    sweep = result.get("sweep") or []
-    peak = max((e["pitch"]["f1"] for e in sweep if e.get("pitch")), default=None)
-    status = "CRASHED" if crashed else (
-        f"pitch F1(peak)={peak:.4f}" if peak is not None else "empty")
-    print(f"[frame] {dataset}/{condition} {algo_name}: {status} "
-          f"({time.time() - t0:.1f}s) -> {os.path.basename(path)}")
+    dt = time.time() - t0
+    if report:
+        report("crashed" if crashed else "ok", dt)
+    elif not is_child():
+        sweep = result.get("sweep") or []
+        peak = max((e["pitch"]["f1"] for e in sweep if e.get("pitch")), default=None)
+        status = "CRASHED" if crashed else (
+            f"pitch F1(peak)={peak:.4f}" if peak is not None else "empty")
+        print(f"[frame] {dataset}/{condition} {algo_name}: {status} "
+              f"({dt:.1f}s) -> {os.path.basename(path)}")
     return path
 
 
-def _run_frame_cells(cells, *, datasets, conditions, out_dir, device, seed, run_cap, cls_map):
+def _run_frame_cells(cells, *, datasets, conditions, out_dir, device, seed, run_cap, cls_map,
+                     emit=None):
     """Frame cells grouped by (dataset, condition): build the dataset ONCE per group and run the
     group's algorithms over it (decode + degradation synthesis shared). `conditions` maps a
     condition name to its typed Condition object (carrying any recorded corpus)."""
@@ -388,12 +430,16 @@ def _run_frame_cells(cells, *, datasets, conditions, out_dir, device, seed, run_
         if all(os.path.exists(_expected_path(c, out_dir, device, seed, cap,
                                              cls_map[c.algo])) for c in group):
             for c in group:
-                print(f"[frame] skip {ds}/{cond}/{c.algo} (cached)")
+                if emit:
+                    emit(c, "skip", 0.0)
+                elif not is_child():
+                    print(f"[frame] skip {ds}/{cond}/{c.algo} (cached)")
             continue
         random.seed(seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
-        print(f"[frame] {ds}/{cond}: {len(group)} algorithms (seed {seed})")
+        if emit is None and not is_child():
+            print(f"[frame] {ds}/{cond}: {len(group)} algorithms (seed {seed})")
         eval_ds, is_probe = build_eval_dataset(
             ds, _data_dir(ds, datasets), condition=conditions[cond], seed=seed, **cap)
         for c in group:
@@ -401,32 +447,44 @@ def _run_frame_cells(cells, *, datasets, conditions, out_dir, device, seed, run_
                 eval_ds, cls_map[c.algo], out_dir=out_dir, dataset=ds, condition=cond,
                 is_probe=is_probe, max_clips=cap.get("max_clips"),
                 max_seconds=cap.get("max_seconds"), seed=seed,
-                sample_rate=16000, hop_size=256, device=device, algo_name=c.algo)
+                sample_rate=16000, hop_size=256, device=device, algo_name=c.algo,
+                report=(lambda st, dt, c=c: emit(c, st, dt)) if emit else None)
 
 
-def _run_note_cells(cells, *, datasets, out_dir, device, seed, cls_map):
-    """Note cells grouped by dataset (always clean, never capped): one shared dataset build."""
+def _run_note_cells(cells, *, datasets, out_dir, device, seed, run_cap, cls_map, emit=None):
+    """Note cells grouped by dataset (always clean): one shared dataset build. The run's cap
+    applies here as it does to frame -- a capped run produces a note probe under its own key."""
     groups = {}
     for c in cells:
         groups.setdefault(c.subject, []).append(c)
     for ds, group in groups.items():
+        cap = _cell_cap(group[0], run_cap)
         pending = [c for c in group if not os.path.exists(os.path.join(
-            out_dir, note_cell_filename(c.algo, ds, "clean", seed)))]
+            out_dir, note_cell_filename(c.algo, ds, "clean", seed, is_probe=bool(cap),
+                                        max_clips=cap.get("max_clips"),
+                                        max_seconds=cap.get("max_seconds"))))]
         for c in group:
             if c not in pending:
-                print(f"[note] skip {ds}/{c.algo} (exists; delete to redo)")
+                if emit:
+                    emit(c, "skip", 0.0)
+                elif not is_child():
+                    print(f"[note] skip {ds}/{c.algo} (exists; delete to redo)")
         if not pending:
             continue
-        eval_ds, _ = build_eval_dataset(ds, _data_dir(ds, datasets), seed=seed)
+        eval_ds, _ = build_eval_dataset(ds, _data_dir(ds, datasets), seed=seed, **cap)
         thresholds = np.round(np.arange(0.0, 1.01, 0.1), 2)
         for c in pending:
             _run_note_cell(eval_ds, c.algo, cls_map[c.algo], ds, "clean", thresholds,
-                           out_dir, device, seed)
+                           out_dir, device, seed, cap=cap,
+                           report=(lambda st, dt, c=c: emit(c, st, dt)) if emit else None)
 
 
 def _run_note_cell(eval_dataset, algo_name, cls, dataset, cond, thresholds, out_dir, device,
-                   seed):
-    path = os.path.join(out_dir, note_cell_filename(algo_name, dataset, cond, seed))
+                   seed, *, cap=None, report=None):
+    cap = cap or {}
+    path = os.path.join(out_dir, note_cell_filename(
+        algo_name, dataset, cond, seed, is_probe=bool(cap),
+        max_clips=cap.get("max_clips"), max_seconds=cap.get("max_seconds")))
     t0 = time.time()
     if cls is None:
         print(f"FATAL: {algo_name} is not installed, recording as crashed")
@@ -444,17 +502,23 @@ def _run_note_cell(eval_dataset, algo_name, cls, dataset, cond, thresholds, out_
         },
         parameters={
             "sample_rate": eval_dataset.sample_rate, "hop_size": eval_dataset.hop_size,
+            "max_clips": cap.get("max_clips"), "max_seconds": cap.get("max_seconds"),
             "thresholds": [float(t) for t in thresholds],
             "lam_grid": note_benchmark.LAM_GRID,
             "onset_tolerance_s": 0.05, "pitch_tolerance_cents": 50.0, "offset_ratio": 0.2,
         },
         results=result,
     )
-    print(f"[note] {dataset} {algo_name}: COnP={result.get('conp')} "
-          f"({time.time() - t0:.1f}s) -> {os.path.basename(path)}")
+    dt = time.time() - t0
+    if report:
+        report("crashed" if crashed else "ok", dt)
+    elif not is_child():
+        print(f"[note] {dataset} {algo_name}: COnP={result.get('conp')} "
+              f"({dt:.1f}s) -> {os.path.basename(path)}")
 
 
-def _write_synthetic_cell(out_dir, algo, family, ftype, device, results, crashed=False, error=None):
+def _write_synthetic_cell(out_dir, algo, family, ftype, device, results, crashed=False,
+                          crash_kind=None):
     meta = {
         "algorithm_name": algo, "family": family,
         "family_type": ftype, "device": device,
@@ -462,7 +526,7 @@ def _write_synthetic_cell(out_dir, algo, family, ftype, device, results, crashed
     }
     if crashed:
         meta["crashed"] = True
-        meta["error"] = error
+        meta["crash_kind"] = crash_kind         # same field frame/note/speed use (was "error")
     write_cell(
         os.path.join(out_dir, synthetic_cell_filename(algo, family, device)),
         suite=Suite.SYNTHETIC,
@@ -494,46 +558,63 @@ def _run_one_synthetic_cell(cell, *, out_dir, device, in_process, cls_map):
                             synthetic_benchmark.run_synthetic_cell(cls, family, device))
             return None
         except Exception as e:
-            _write_synthetic_cell(out_dir, algo, family, ftype, eff, {}, crashed=True, error=str(e))
-            return str(e)
+            _write_synthetic_cell(out_dir, algo, family, ftype, eff, {}, crashed=True,
+                                  crash_kind=type(e).__name__)
+            return type(e).__name__
     # ood needs no data paths, and its stimuli are seed-frozen by design (item_rng with fixed
     # family ids), the child's --seed is unused, so any value works here.
     return _spawn_cell(cell, datasets=None, conditions={}, out_dir=out_dir, device=device,
                        seed=42, cap={}, expected=path,
                        on_crash=lambda k, _a=algo, _f=family, _t=ftype, _e=eff:
                            _write_synthetic_cell(out_dir, _a, _f, _t, _e, {},
-                                           crashed=True, error=k))
+                                           crashed=True, crash_kind=k))
 
 
-def _run_synthetic_cells(cells, *, out_dir, device, in_process, cls_map):
-    if not cells:
-        return
-    counts = {"done": 0, "skip": 0, "crash": 0}
-    bar = tqdm(cells, desc="[synthetic] cells", unit="cell")
-    for cell in bar:
+def _run_synthetic_cells(cells, *, out_dir, device, in_process, cls_map, emit=None):
+    for cell in cells:
+        t0 = time.time()
         kind = _run_one_synthetic_cell(cell, out_dir=out_dir, device=device,
-                                 in_process=in_process, cls_map=cls_map)
-        if kind == "skip":
-            counts["skip"] += 1
-        elif kind:
-            counts["crash"] += 1
-            bar.write(f"[synthetic] CRASH {cell.algo}/{cell.subject} ({kind})")
-        else:
-            counts["done"] += 1
-        bar.set_postfix(**counts)
+                                       in_process=in_process, cls_map=cls_map)
+        status = "skip" if kind == "skip" else (kind if kind else "ok")
+        if emit:
+            emit(cell, status, time.time() - t0)
+        elif not is_child() and status not in ("ok", "skip"):
+            print(f"[synthetic] CRASH {cell.algo}/{cell.subject} ({status})")
 
 
-def _run_speed_cells(cells, *, out_dir, device, cls_map, sample_rate=22050, hop_length=256,
-                     signal_length_sec=1.0, n_runs=10):
-    """Serial + in-process, and ALWAYS overwrites: timing depends on machine state."""
+def _run_speed_cells(cells, *, out_dir, device, seed, cls_map, emit=None):
+    """Each tracker is timed in its OWN fresh, thread-pinned (OMP=1), SERIAL child process, so
+    every tracker is measured under identical single-threaded, contention-free conditions -- the
+    only honest raw-speed comparison. Always re-measures (timing depends on machine state)."""
     if not cells:
         return
+    sample_rate, hop_length, signal_length_sec, n_runs = (
+        SPEED_MEASUREMENT["sample_rate"], SPEED_MEASUREMENT["hop_length"],
+        SPEED_MEASUREMENT["signal_length_sec"], SPEED_MEASUREMENT["n_runs"])
+    if not is_child():
+        for a in cells:                       # SERIAL: one tracker at a time, never the pool
+            t0 = time.time()
+            if cls_map[a.algo] is None:
+                if emit:
+                    emit(a, "skip", 0.0)
+                continue
+            expected = os.path.join(out_dir, speed_cell_filename(
+                a.algo, sample_rate, hop_length, signal_length_sec, n_runs))
+            if os.path.exists(expected):
+                os.remove(expected)           # always re-measure; clear stale so a crash is visible
+            kind = _spawn_cell(a, datasets={}, conditions={}, out_dir=out_dir, device=device,
+                               seed=seed, cap={}, expected=expected,
+                               on_crash=_crash_writer(a, out_dir, device, seed, {}, cls_map[a.algo]))
+            if emit:
+                emit(a, kind or "ok", time.time() - t0)
+        return
+    # CHILD: the actual thread-pinned in-process measurement -- OMP/MKL/...=1 was set in the spawn
+    # env BEFORE any import, so BLAS/torch here really are single-threaded. Exactly one cell.
     devices = ["cpu", device] if device in ("cuda", "mps") else ["cpu"]
     timestamp = datetime.now(timezone.utc).isoformat()
     for a in cells:
         cls = cls_map[a.algo]
         if cls is None:
-            print(f"[speed] skip {a.algo} (not installed)")
             continue
         results = speed_benchmark.run_speed_cell(
             cls, devices=devices, sample_rate=sample_rate,
@@ -554,13 +635,29 @@ def _run_speed_cells(cells, *, out_dir, device, cls_map, sample_rate=22050, hop_
             },
             results=results,
         )
-        print(f"[speed] {a.algo} done")
+
+
+# A child that ends on one of these was interrupted or killed (Ctrl-C, OOM, terminate), not
+# crashed by its own code -- it is retried on resume, never recorded as a crashed cell. Genuine
+# faults (SIGSEGV/SIGABRT, a Python error, a timeout) are recorded.
+_INTERRUPT_SIGNALS = frozenset({-signal.SIGINT, -signal.SIGTERM, -signal.SIGKILL})
+
+
+def _cell_metadata(path):
+    """The metadata block of a written cell -- how the parent reads back a child's outcome when the
+    child exited cleanly but may have recorded a crash in the file itself."""
+    try:
+        with open(path) as f:
+            return json.load(f).get("metadata", {})
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def _spawn_cell(cell, *, datasets, conditions, out_dir, device, seed, cap, expected, on_crash):
-    """ONE child process for one cell: a narrowed evaluate.py CLI invocation, threads pinned,
-    tqdm silenced (child bars would garble the parent console; the [suite] result lines
-    survive). If the child dies without writing its cell, the orchestrator records the crash.
+    """ONE child process for one cell: a narrowed evaluate.py CLI invocation, threads pinned, its
+    console CAPTURED so the child's backend-import chatter never reaches the terminal (the parent's
+    progress line is the only console output; a crash's stderr is kept in {out_dir}/crashes.log).
+    If the child dies without writing its cell, the orchestrator records the crash.
     `conditions` is the name->Condition map, so a recorded cell's corpus dir travels on --data."""
     # CHILD_ENV marks the process as a spawned child: it runs its one cell in-process (no
     # further spawning) and skips the run summary (the parent owns it). An env var, not a
@@ -590,18 +687,38 @@ def _spawn_cell(cell, *, datasets, conditions, out_dir, device, seed, cap, expec
     # Only ood cells get a timeout: their runtime is known and bounded (fixed 2-s synthetic
     # clips) AND their stimuli are what makes fragile C-extension trackers hang. Frame/note
     # runtimes are data x algorithm dependent; any fixed bound would kill honest work.
-    timeout = 300 if cell.suite == Suite.SYNTHETIC else None
-    kind = None
+    timeout = 300 if cell.suite in (Suite.SYNTHETIC, Suite.SPEED) else None
+    # Capture the child's stdout/stderr so its backend-import chatter never reaches the terminal;
+    # the parent's progress line is the only console output. On a real crash the captured stderr
+    # is kept in crashes.log so segfaults/tracebacks stay diagnosable.
+    kind, err, rc = None, "", None
     try:
-        r = subprocess.run(cmd, env=env, cwd=REPO, timeout=timeout)
-        if r.returncode != 0:
-            kind = f"exit {r.returncode}"
-    except subprocess.TimeoutExpired:
-        kind = f"timeout > {timeout}s"
-    if not os.path.exists(expected):
-        on_crash(kind or "no output")
-        return kind or "no output"
-    return None
+        r = subprocess.run(cmd, env=env, cwd=REPO, timeout=timeout,
+                           capture_output=True, text=True)
+        rc = r.returncode
+        if rc != 0:
+            kind, err = f"exit {rc}", r.stderr or ""
+    except subprocess.TimeoutExpired as e:
+        kind, err = f"timeout > {timeout}s", e.stderr or ""
+    if os.path.exists(expected):
+        # The child wrote its cell. Usually a clean result -> "ok"; but a child can CATCH a Python
+        # exception, write a `crashed` cell, and still exit 0, so read the cell back: this live
+        # status must reflect the SAME crashed-or-not the post-run footer reads from the same file.
+        m = _cell_metadata(expected)
+        return (m.get("crash_kind") or "crashed") if m.get("crashed") else None
+    # The child died before writing. An INTERRUPT/KILL signal (Ctrl-C, OOM, terminate) is not a
+    # tracker fault: leave the cell ABSENT so a resume retries it. Only genuine faults are recorded
+    # -- a segfault/abort, a Python error, or a timeout.
+    if rc in _INTERRUPT_SIGNALS:
+        return "interrupted"              # not a crash: leave the cell absent, retry on resume
+    kind = kind or "no output"
+    try:
+        with open(os.path.join(out_dir, "crashes.log"), "a") as f:
+            f.write(f"\n=== {cell.algo} {cell.subject}/{cell.condition} ({kind}) ===\n{err}\n")
+    except OSError:
+        pass
+    on_crash(kind)
+    return kind
 
 
 def _expected_path(cell, out_dir, device, seed, cap, cls):
@@ -613,15 +730,28 @@ def _expected_path(cell, out_dir, device, seed, cap, cls):
             device=eff, seed=seed))
     if cell.suite == Suite.NOTE:
         return os.path.join(out_dir, note_cell_filename(
-            cell.algo, cell.subject, cell.condition, seed))
+            cell.algo, cell.subject, cell.condition, seed, is_probe=bool(cap),
+            max_clips=cap.get("max_clips"), max_seconds=cap.get("max_seconds")))
+    if cell.suite == Suite.SPEED:
+        return os.path.join(out_dir, speed_cell_filename(cell.algo, **SPEED_MEASUREMENT))
     return os.path.join(out_dir, synthetic_cell_filename(cell.algo, cell.subject, eff))
 
 
 def _crash_writer(cell, out_dir, device, seed, cap, cls):
-    """The crashed-cell record for a frame/note child that died without output."""
+    """The crashed-cell record for a child that died without output. Every suite writes one so the
+    filesystem is the single truth: a crash is a `crashed` cell everywhere (the live tally, the
+    post-run footer scan, and the report's per-track crash accounting all agree) rather than an
+    absent file the footer cannot tell apart from 'never ran'."""
     def _write(kind):
-        print(f"[{cell.suite.value}] CRASHED {cell.subject}/{cell.algo} ({kind})")
-        if cell.suite == Suite.FRAME:
+        if cell.suite == Suite.SPEED:
+            write_cell(
+                _expected_path(cell, out_dir, device, seed, cap, cls),
+                suite=Suite.SPEED,
+                metadata={"algorithm_name": cell.algo, "crashed": True, "crash_kind": kind,
+                          "timestamp_utc": datetime.now(timezone.utc).isoformat()},
+                parameters=dict(SPEED_MEASUREMENT),
+                results={"device_results": {}})
+        elif cell.suite == Suite.FRAME:
             write_cell(
                 _expected_path(cell, out_dir, device, seed, cap, cls),
                 suite=Suite.FRAME,
@@ -640,13 +770,201 @@ def _crash_writer(cell, out_dir, device, seed, cap, cls):
                           "dataset_name": cell.subject, "condition": cell.condition,
                           "seed": seed, "crashed": True, "crash_kind": kind,
                           "timestamp_utc": datetime.now(timezone.utc).isoformat()},
-                parameters={}, results={"conp": None, "conpoff": None})
+                parameters={"max_clips": cap.get("max_clips"),
+                            "max_seconds": cap.get("max_seconds")},
+                results={"conp": None, "conpoff": None})
     return _write
+
+
+class _Ema:
+    """Bias-corrected exponential moving average -- tqdm's algorithm (smoothing = alpha). The
+    /(1-beta**calls) correction makes early estimates honest instead of dragged toward zero."""
+    __slots__ = ("alpha", "last", "calls")
+
+    def __init__(self, alpha=0.3):
+        self.alpha, self.last, self.calls = alpha, 0.0, 0
+
+    def __call__(self, x=None):
+        beta = 1 - self.alpha
+        if x is not None:
+            self.last = self.alpha * x + beta * self.last
+            self.calls += 1
+        return self.last / (1 - beta ** self.calls) if self.calls else self.last
+
+
+@dataclass
+class Progress:
+    """One cell finished, delivered to a run_cells `progress=` callback. `status` is 'ok', 'skip'
+    (cached), 'interrupted' (killed -- retried on resume), or a crash-kind string; `dt` is this
+    cell's wall time, `elapsed` the run's; `eta` is seconds remaining (None until estimable);
+    `failed` is the cumulative failed-cell count (seeded from crashes already on disk)."""
+    done: int
+    total: int
+    failed: int
+    elapsed: float
+    dt: float
+    eta: "float | None"
+    suite: str
+    subject: "str | None"
+    condition: "str | None"
+    algo: str
+    status: str
+
+
+def _fmt_eta(seconds):
+    s = int(max(seconds, 0))
+    if s >= 3600:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    if s >= 60:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s}s"
+
+
+def _fit(s, width):
+    """Bound a field to `width` columns (ellipsis-truncate) so a long algorithm name -- e.g. a
+    consumer's content-hashed name -- cannot overflow its column and shift every field after it."""
+    return s if len(s) <= width else s[:width - 1] + "…"
+
+
+def _default_progress(ev):
+    """The built-in progress line (stderr): one aligned, icon-free line per non-skip cell. Every
+    caller -- the CLI or a programmatic consumer of run_cells -- gets this unless it passes its
+    own `progress=` callback."""
+    if ev.status == "skip":
+        return                                        # cached: counted, not printed
+    outcome = ("ok" if ev.status == "ok"
+               else "interrupted" if ev.status == "interrupted"
+               else "FAILED")
+    reason = f"  ({ev.status})" if outcome == "FAILED" else ""
+    loc = "/".join(x for x in (ev.subject, ev.condition) if x) or ev.suite
+    w = len(str(ev.total))
+    pct = round(100 * ev.done / ev.total) if ev.total else 100
+    eta = _fmt_eta(ev.eta) if ev.eta is not None else "?"
+    print(f"{f'[{ev.suite}]':<10} {ev.done:>{w}}/{ev.total} {pct:>3d}%  "
+          f"{_fit(ev.algo, 16):<16} {outcome:<11} {ev.dt:>6.1f}s  eta {eta:<7} {loc}{reason}"
+          f"  | {ev.failed} failed",
+          file=sys.stderr, flush=True)
+
+
+def _make_emitter(total, progress, remaining=None, failed=0):
+    """A thread-safe per-cell emitter shared by the worker pool and the in-process runners.
+    `progress=None` uses the built-in stderr printer; a callable receives each Progress event.
+
+    The ETA is COMPOSITION-AWARE: it weights the remaining cells by each algorithm's own
+    EMA-smoothed time and divides by the observed effective parallelism (completed compute over
+    wall time). `remaining` is a {algo: count} of every cell; `failed` seeds the cumulative
+    failed count from crashes already on disk."""
+    sink = _default_progress if progress is None else progress
+    remaining = dict(remaining or {})
+    ema = {}                                          # algo -> _Ema of its cell wall-time
+    state = {"done": 0, "failed": failed, "work": 0, "work_start": None, "compute": 0.0}
+    lock = threading.Lock()
+    start = time.time()
+
+    def emit(cell, status, dt):
+        with lock:
+            now = time.time()
+            state["done"] += 1
+            if remaining.get(cell.algo, 0) > 0:
+                remaining[cell.algo] -= 1
+            if status not in ("ok", "skip", "interrupted"):     # interrupted != a tracker fault
+                state["failed"] += 1
+            eta = None
+            if status not in ("skip", "interrupted"):           # a real completed cell
+                if state["work_start"] is None:
+                    state["work_start"] = now
+                state["work"] += 1
+                state["compute"] += dt
+                ema.setdefault(cell.algo, _Ema())(dt)
+                w_elapsed = now - state["work_start"]
+                if state["work"] >= 3 and state["compute"] > 0 and w_elapsed > 0:
+                    global_mean = sum(m() for m in ema.values()) / len(ema)
+                    remaining_compute = sum(
+                        n * (ema[a]() if a in ema else global_mean)
+                        for a, n in remaining.items() if n > 0)
+                    eta = w_elapsed * remaining_compute / state["compute"]
+            sink(Progress(done=state["done"], total=total, failed=state["failed"],
+                          elapsed=now - start, dt=dt, eta=eta, suite=cell.suite.value,
+                          subject=cell.subject, condition=cell.condition, algo=cell.algo,
+                          status=status))
+    return emit
+
+
+def _matrix_status(cells, out_dir, device, seed, cap, cls_map, *, speed_pending):
+    """The single source of truth for the run banners: classify every matrix cell as ok / failed /
+    pending by the file it will (or did) write. `pending` = the cell will run -- no file yet, or a
+    speed cell (speed never caches, always re-measured) while `speed_pending`; otherwise a present
+    cell's own `crashed` flag decides failed vs ok. Matrix-scoped, so stray files from another
+    config are invisible. `speed_pending` is the ONLY difference between the two call sites: the
+    pre-run header passes True (what will run), the post-run footer False (what the files now say)."""
+    tally = Counter({"ok": 0, "failed": 0, "pending": 0})
+    for c in cells:
+        if speed_pending and c.suite is Suite.SPEED:
+            tally["pending"] += 1
+            continue
+        path = _expected_path(c, out_dir, device, seed, _cell_cap(c, cap), cls_map[c.algo])
+        if not os.path.exists(path):
+            tally["pending"] += 1
+            continue
+        try:
+            with open(path) as f:
+                crashed = json.load(f).get("metadata", {}).get("crashed")
+        except (json.JSONDecodeError, OSError):
+            crashed = True
+        tally["failed" if crashed else "ok"] += 1
+    return tally
+
+
+def _status_phrase(status):
+    """The one tally vocabulary, identical in header and footer."""
+    return f"{status['ok']} ok, {status['failed']} failed, {status['pending']} pending"
+
+
+def _clock(seconds):
+    return (f"{int(seconds // 3600)}h{int(seconds % 3600 // 60):02d}m" if seconds >= 3600 else
+            f"{int(seconds // 60)}m{int(seconds % 60):02d}s" if seconds >= 60 else f"{seconds:.0f}s")
+
+
+def _print_run_header(suites, names, frame_cells, note_cells, synthetic_cells, speed_cells,
+                      cap, device, workers, seed, out_dir, status):
+    """The one-time run banner (default-printer path only): the config, then the shared tally."""
+    title = " + ".join(s for s in ("frame", "note", "synthetic", "speed") if s in suites)
+    dims = [f"algorithms {len(names)}"]
+    if frame_cells or note_cells:
+        dims.append(f"datasets {len({c.subject for c in frame_cells + note_cells})}")
+    if frame_cells:
+        dims.append(f"conditions {len({c.condition for c in frame_cells})}")
+    if synthetic_cells:
+        dims.append(f"families {len({c.subject for c in synthetic_cells})}")
+    if not cap:
+        cap_desc = "uncapped"
+    else:
+        bits = ([f"{cap['max_clips']} clips"] if cap.get("max_clips") else []) \
+             + ([f"{cap['max_seconds']:g} s"] if cap.get("max_seconds") else [])
+        cap_desc = " / ".join(bits) + " (probe)"
+    per_suite = ", ".join(f"{name} {len(cs)}" for name, cs in
+                          (("frame", frame_cells), ("note", note_cells),
+                           ("synthetic", synthetic_cells), ("speed", speed_cells)) if cs)
+    print("\n".join([
+        f"=== benchmark: {title} ===",
+        "  " + "   ".join(dims),
+        f"  cap {cap_desc}   device {device}   workers {workers}   seed {seed}",
+        f"  cells  {sum(status.values())} total: {per_suite}",
+        f"  status {_status_phrase(status)}",
+        f"  output {out_dir}",
+        "===",
+    ]), file=sys.stderr, flush=True)
+
+
+def _print_run_footer(status, clock):
+    """The one-line end banner: the same tally as the header, now that everything has run."""
+    print(f"\n=== done in {clock}: {sum(status.values())} cells — {_status_phrase(status)} ===",
+          file=sys.stderr, flush=True)
 
 
 def run_cells(algos, *, datasets=None, suites=None,
               max_clips=None, max_seconds=None, out_dir="results",
-              device="cpu", seed=42, workers=4):
+              device="cpu", seed=42, workers=4, progress=None):
     """Run every missing cell, then return load_cells(out_dir).
 
     `suites` is the measurement spec, a {suite: narrowing} map -- presence of a key runs that
@@ -665,8 +983,8 @@ def run_cells(algos, *, datasets=None, suites=None,
     a string is the directory, None means the dataset's own default (only bundled corpora have
     one, else it raises); to drop a dataset, leave it out.
 
-    The cap (max_clips, max_seconds) applies to EVERY frame cell, clean included; default is
-    uncapped -- the full, certifiable measurement. Pass a cap to sample; a capped run cannot
+    The cap (max_clips, max_seconds) applies to EVERY dataset-backed cell (frame + note), clean
+    included; default is uncapped -- the full, certifiable measurement. Pass a cap to sample; a capped run cannot
     certify (assert_full rejects it). The affordable leaderboard is two runs, see the README.
 
     Isolation is per algorithm and uniform: a registry tracker always runs in a child process
@@ -674,7 +992,11 @@ def run_cells(algos, *, datasets=None, suites=None,
     in-process (a child cannot rebuild it). `workers` is only how many children run at once --
     a concurrency cap on short-lived per-cell processes, not a persistent pool; it overlaps their
     startups and is bounded by cores / memory / GPU. Default 4 (a few concurrent children fit a
-    typical laptop's RAM with room to spare; set 1 for contention-free serial)."""
+    typical laptop's RAM with room to spare; set 1 for contention-free serial).
+
+    `progress` reports one cell at a time. None (default) prints a clean progress line to stderr
+    (count, per-cell time, crash tally, ETA) -- so the CLI and any programmatic caller get progress
+    for free; pass a callable to receive each `Progress` event instead (format it, or silence it)."""
     suites = suites if suites is not None else {s.value: None for s in Suite}
     _check_names("suites", suites, [s.value for s in Suite])
     # None = every procedural condition; an explicit list (incl. []) is taken verbatim -- [] means
@@ -703,6 +1025,23 @@ def run_cells(algos, *, datasets=None, suites=None,
     note_cells = [c for c in cells if c.suite == Suite.NOTE]
     synthetic_cells = [c for c in cells if c.suite == Suite.SYNTHETIC]
     speed_cells = [c for c in cells if c.suite == Suite.SPEED]
+    # Progress: the PARENT emits one event per cell (the pool + the in-process runners); a spawned
+    # child never emits -- the parent that spawned it does. `progress=None` -> the built-in stderr
+    # printer; a callable gets each Progress event, so consumers of run_cells get progress too.
+    total = len(frame_cells) + len(note_cells) + len(synthetic_cells) + len(speed_cells)
+    all_cells = frame_cells + note_cells + synthetic_cells + speed_cells
+    _emit, t0 = None, 0.0
+    if not is_child():
+        remaining = Counter(c.algo for c in all_cells)
+        # ONE matrix scan seeds the banner AND the running failed tally -- both matrix-scoped, so
+        # stray files from another config never leak in. speed_pending: before the run every speed
+        # cell is `pending` (it re-measures regardless of any stale file on disk).
+        status = _matrix_status(all_cells, out_dir, device, seed, cap, cls_map, speed_pending=True)
+        if progress is None:                            # banners are for the default-printer path only
+            _print_run_header(suites, names, frame_cells, note_cells, synthetic_cells,
+                              speed_cells, cap, device, workers, seed, out_dir, status)
+        _emit = _make_emitter(total, progress, remaining=remaining, failed=status["failed"])
+        t0 = time.time()
     # Isolation is decided PER ALGORITHM, uniformly: a registry name a child can rebuild ALWAYS
     # runs in a child, so a segfault becomes a crashed cell and its result never depends on the
     # worker count; a class we were handed cannot be rebuilt in a fresh interpreter, so it always
@@ -715,46 +1054,56 @@ def run_cells(algos, *, datasets=None, suites=None,
         return [c for c in cs if c.algo not in in_process]
 
     if is_child():
-        # a spawned worker runs its ONE cell in-process and never re-spawns (anti-recursion)
+        # a spawned worker runs its ONE cell in-process and never re-spawns (anti-recursion); it
+        # emits no progress (emit defaults None) -- the parent that spawned it owns the line.
         _run_frame_cells(frame_cells, datasets=datasets, conditions=conditions, out_dir=out_dir,
                          device=device, seed=seed, run_cap=cap, cls_map=cls_map)
         _run_note_cells(note_cells, datasets=datasets, out_dir=out_dir,
-                        device=device, seed=seed, cls_map=cls_map)
+                        device=device, seed=seed, run_cap=cap, cls_map=cls_map)
         _run_synthetic_cells(synthetic_cells, out_dir=out_dir, device=device,
                              in_process=True, cls_map=cls_map)
     else:
         if in_process:
             print(f"evaluate: {sorted(in_process)} cannot be isolated (custom class) and run "
-                  f"in-process; the rest run in child processes")
+                  f"in-process; the rest run in child processes", file=sys.stderr)
         from concurrent.futures import ThreadPoolExecutor
 
         def _child(cell):
             cell_cap = _cell_cap(cell, cap)
-            expected = _expected_path(cell, out_dir, device, seed, cell_cap,
-                                      cls_map[cell.algo])
+            expected = _expected_path(cell, out_dir, device, seed, cell_cap, cls_map[cell.algo])
             if cell.suite != Suite.SYNTHETIC and os.path.exists(expected):
-                return
+                return "skip"
             if cell.suite == Suite.SYNTHETIC:
                 kind = _run_one_synthetic_cell(cell, out_dir=out_dir, device=device,
-                                         in_process=False, cls_map=cls_map)
-                if kind and kind != "skip":
-                    print(f"[synthetic] CRASH {cell.algo}/{cell.subject} ({kind})")
-                return
-            _spawn_cell(cell, datasets=datasets, conditions=conditions, out_dir=out_dir,
-                        device=device, seed=seed, cap=cell_cap, expected=expected,
-                        on_crash=_crash_writer(cell, out_dir, device, seed, cell_cap,
-                                               cls_map[cell.algo]))
+                                               in_process=False, cls_map=cls_map)
+                return "skip" if kind == "skip" else (kind or "ok")
+            kind = _spawn_cell(cell, datasets=datasets, conditions=conditions, out_dir=out_dir,
+                               device=device, seed=seed, cap=cell_cap, expected=expected,
+                               on_crash=_crash_writer(cell, out_dir, device, seed, cell_cap,
+                                                      cls_map[cell.algo]))
+            return kind or "ok"
+
+        def _child_tracked(cell):     # time + emit in the PARENT; the child console is captured
+            t0 = time.time()
+            status = _child(cell)
+            _emit(cell, status, time.time() - t0)
         # registry cells spawn (pool of `workers`; workers=1 is a serial pool of one); custom
         # cells run here in-process, sharing the per-group dataset build across algorithms.
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(_child, _isolated(frame_cells + note_cells + synthetic_cells)))
+            list(pool.map(_child_tracked, _isolated(frame_cells + note_cells + synthetic_cells)))
         _run_frame_cells(_local(frame_cells), datasets=datasets, conditions=conditions,
-                         out_dir=out_dir, device=device, seed=seed, run_cap=cap, cls_map=cls_map)
+                         out_dir=out_dir, device=device, seed=seed, run_cap=cap, cls_map=cls_map,
+                         emit=_emit)
         _run_note_cells(_local(note_cells), datasets=datasets, out_dir=out_dir,
-                        device=device, seed=seed, cls_map=cls_map)
+                        device=device, seed=seed, run_cap=cap, cls_map=cls_map, emit=_emit)
         _run_synthetic_cells(_local(synthetic_cells), out_dir=out_dir, device=device,
-                             in_process=True, cls_map=cls_map)
-    _run_speed_cells(speed_cells, out_dir=out_dir, device=device, cls_map=cls_map)
+                             in_process=True, cls_map=cls_map, emit=_emit)
+    _run_speed_cells(speed_cells, out_dir=out_dir, device=device, seed=seed, cls_map=cls_map,
+                     emit=_emit)
+    if not is_child() and progress is None:             # the closing tally, from the same scan --
+        _print_run_footer(                              # now speed has run (speed_pending=False)
+            _matrix_status(all_cells, out_dir, device, seed, cap, cls_map, speed_pending=False),
+            _clock(time.time() - t0))
     return load_cells(out_dir, algos=names)
 
 
@@ -794,7 +1143,7 @@ def load_cells(results_dir, algos=None):
         suite = Suite(m["suite"])
         if suite is Suite.NOTE:
             key = CellKey(suite=suite, subject=m.get("dataset_name"),
-                          condition=m.get("condition", "clean"), algo=algo)
+                          condition=m.get("condition", "clean"), algo=algo, cap=cap_of(d))
         elif suite is Suite.SYNTHETIC:
             key = CellKey(suite=suite, subject=m.get("family"), condition=None, algo=algo)
         elif suite is Suite.SPEED:
@@ -896,7 +1245,7 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--max-clips", type=int, default=0,
-                   help="Clip cap for every frame cell (clean included); 0 = uncapped "
+                   help="Clip cap for every dataset-backed cell (frame + note, clean included); 0 = uncapped "
                         "(the default: the full, certifiable measurement). Pass a cap to "
                         "sample; see the standard leaderboard run in the README")
     p.add_argument("--max-seconds", type=float, default=0.0,
@@ -925,7 +1274,7 @@ def main():
     p.add_argument("--families", nargs="+", default=None,
                    choices=synthetic_benchmark.ALL_FAMILIES)
     p.add_argument("--report", action="store_true",
-                   help="Generate the markdown report from --output-dir after the run")
+                   help="After the run, render benchmark_report.md (repo root) from --output-dir")
     args = p.parse_args()
 
     algos = args.algorithms or get_available_algorithms()
@@ -942,12 +1291,22 @@ def main():
             p.error(f"--data expects NAME=DIR with a registered NAME, got: {spec}")
         provided[name] = d
     corpora = {k: v for k, v in provided.items() if k in RECORDED_NAMES}
-    dsmap = {name: provided.get(name) for name in list_pitch_datasets()}
+    # Datasets are opt-in: a dataset is in the run only when you name it -- a path via --data, or
+    # an explicit --datasets selection (a bundled dataset like SpeechSynth then resolves with no
+    # path). Nothing rides along automatically, and nothing is hard-excluded.
+    provided_ds = {k: v for k, v in provided.items() if k in list_pitch_datasets()}
     if args.datasets:
-        unknown = set(args.datasets) - set(dsmap)
+        unknown = set(args.datasets) - set(list_pitch_datasets())
         if unknown:
             p.error(f"--datasets: unknown {sorted(unknown)}; choose from the dataset registry")
-        dsmap = {k: dsmap[k] for k in args.datasets}
+        dsmap = {name: provided_ds.get(name) for name in args.datasets}
+    else:
+        dsmap = provided_ds
+    needy = [n for n in dsmap if dsmap[n] is None and n not in BUNDLED]
+    if needy:
+        p.error(f"no path for {sorted(needy)}: pass --data NAME=DIR (only a bundled dataset needs none)")
+    if any(s in (Suite.FRAME, Suite.NOTE) for s in args.suites) and not dsmap:
+        p.error("frame/note suites need at least one dataset; pass --data NAME=DIR or --datasets NAME")
     # Resolve --conditions names to Condition OBJECTS; a recorded name is bound to its corpus
     # (from --data) here, else it is an error -- the object carries the dir, there is no map.
     def _recorded(name):
@@ -970,21 +1329,19 @@ def main():
     for suite in args.suites:
         smap[suite.value] = (frame_narrowing if suite is Suite.FRAME
                              else args.families if suite is Suite.SYNTHETIC else None)
-    cells = run_cells(
+    run_cells(                                 # prints its own header + footer (parent, default path)
         algos, datasets=dsmap, suites=smap,
         max_clips=args.max_clips, max_seconds=args.max_seconds,
         out_dir=args.output_dir, device=args.device,
         seed=args.seed, workers=args.workers,
     )
-    if not is_child():                         # children skip the summary (parent owns it)
-        cap_desc = ("uncapped" if not (args.max_clips or args.max_seconds)
-                    else f"capped n{args.max_clips or '-'}/t{args.max_seconds or '-'}")
-        print(f"\n=== {len(cells)} result cells in {args.output_dir} "
-              f"(robust cells {cap_desc}, algos={len(algos)}) ===")
     if args.report:
-        # write the report NEXT TO the cells it renders: the repo's committed report
-        # describes the full reference run, and a scratch run must not overwrite it
-        out = os.path.join(args.output_dir, "benchmark_report.md")
+        # Render to the repo-root benchmark_report.md -- the tracked, committable file (results/ is
+        # gitignored, so writing it there produced a report that could never be committed). Matches
+        # README's `generate_report.py --out benchmark_report.md`. The report is self-describing (a
+        # capped run marks datasets [capped] and leaves Overall n/a), so overwriting is safe; commit
+        # it only when the run warrants.
+        out = os.path.join(REPO, "benchmark_report.md")
         subprocess.run([sys.executable, os.path.join(REPO, "generate_report.py"),
                         "--results", args.output_dir, "--out", out], cwd=REPO, check=True)
 

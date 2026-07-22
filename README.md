@@ -150,9 +150,16 @@ your-datasets/                       # each entry passed with --data NAME=DIR
 ├── DEMAND/                          # real-noise source for the demand degradation
 ├── MOCHA/                           # raw CSTR <spk>_<num>.wav + .lar
 ├── CMUArctic/                       # -WAVEGG cmu_us_<spk>_arctic/orig/*.wav (folder: cmu_arctic_egg if you keep the download name; point --data at it)
-└── M4Singer/                        # score-grade GT: voicing-reliable; excluded from accuracy tables by the report
+└── M4Singer/                        # score-grade pitch GT: voicing-reliable; off by default -- include only by passing its path
 ```
-SpeechSynth needs no download, it renders at runtime from `datasets/speechsynth.pt` inside the repo.
+SpeechSynth needs no download, it renders at runtime from `datasets/speechsynth.pt` inside the repo;
+being bundled it is the one dataset you can opt in without a path (`--datasets SpeechSynth`).
+
+**Datasets are opt-in.** A dataset is in a run only when you name it — a path via `--data NAME=DIR`,
+or an explicit `--datasets NAME` (a bundled dataset then needs no path). Nothing rides along
+automatically and nothing is hard-excluded, so a corpus with score-grade pitch GT (M4Singer) is
+in a run only if you pass its path — with the understanding that scoring it shifts `theta*` and
+every pitch table.
 
 ### Usage
 
@@ -161,47 +168,58 @@ SpeechSynth needs no download, it renders at runtime from `datasets/speechsynth.
 python visualize_algorithms.py your_audio.wav --selected_algorithms SwiftF0 CREPE Praat
 ```
 
-**2. Run the whole benchmark**, `evaluate.py` is the ONE entry point for all four
-measurement suites (frame accuracy + robustness, note transcription, synthetic signals,
-speed) and the report:
+**2. Run the benchmark.** `evaluate.py` is the ONE entry point for all four suites (frame
+accuracy + robustness, note transcription, synthetic signals, speed) and the report. It writes
+cached cells into `--output-dir` (default `results/`); every run is **opt-in** (a dataset or
+algorithm runs only if you name it) and **resumable** (finished cells are skipped, so re-running
+after adding an algorithm or dataset only computes the new cells).
+
+The knobs, composed freely:
+
+| flag | selects | default |
+|---|---|---|
+| `--data NAME=DIR …` | dataset + `chime`/`demand` corpus locations | none (name it to include it) |
+| `--suites {frame,note,synthetic,speed}` | which suites | all four |
+| `--algorithms NAME …` | which trackers | all installed |
+| `--datasets NAME …` | narrow to a subset of the named datasets | all named |
+| `--conditions NAME …` | narrow frame degradations (frame only) | all procedural |
+| `--max-clips N --max-seconds S` | cap (sample) every dataset-backed cell (frame + note) | uncapped |
+| `--device {cpu,mps,cuda}` · `--workers N` · `--report` | how / where | cpu · 4 · off |
+
+**The affordable two-tier workflow.** A full-corpus sweep of all 13 conditions across many
+trackers is not affordable, so run it in two tiers into one `results/`:
 
 ```bash
-uv run python evaluate.py --data "PTDB=/data/SPEECH DATA" KEELE=/data/KEELE/KEELE --workers 10 --report
-# narrow to what you need:
-uv run python evaluate.py --data KEELE=/data/KEELE/KEELE --datasets KEELE --suites frame
+# TIER 1 -- the cheap probe (fast): capped frame (all conditions) + synthetic + speed
+uv run python evaluate.py --data <paths> --suites frame synthetic speed \
+  --max-clips 30 --max-seconds 10 --device mps --workers 6
+
+# TIER 2 -- the verdict (slow, full corpus): the clean headline + full note, then the report
+uv run python evaluate.py --data <paths> --suites frame note --conditions clean \
+  --device mps --workers 6 --report
 ```
-A run is **uncapped by default** — the full, certifiable measurement. A cap
-(`--max-clips 30 --max-seconds 10`) applies to *every* frame cell, clean included, and a
-capped run cannot certify: the cap is part of a cell's identity, so a capped and an uncapped
-measurement of the same thing are distinct cells and `assert_full()` rejects the capped one.
-Resumable: finished result cells are skipped, so re-running after adding an algorithm is cheap.
-`--workers N` fans cells out over child processes (also giving crash isolation);
-`--skip-datasets AVID` drops the long poles.
 
-**The standard leaderboard run**, two commands into one `results/`, because a full-corpus
-sweep of all 12 degradations across many trackers is not affordable — so degradations run on a
-30-clip probe while the headline (accuracy on clean) stays full-corpus:
+Tier 1's cap makes every degraded condition a 30-clip probe (and note a fast capped pass) — the
+affordable leaderboard. Tier 2 adds the uncapped clean cell that `theta*` and Correctness read,
+plus full-corpus note; the capped clean from Tier 1 stays as the Noise track's Δ-from-clean
+partner. Capped and uncapped cells coexist under their own keys (the cap is part of a cell's
+identity), and `theta*` / `track_notes` prefer the uncapped ones. Only the uncapped Tier 2 is
+certifiable — `assert_full()` rejects any capped cell. Because everything is cached, you can slice
+by cost however you like — fast DSP trackers today, slow neural ones (`--algorithms CREPE RMVPE
+…`) tomorrow — and nothing recomputes.
 
+**3. Narrowed / exploratory runs**, same entry point:
 ```bash
-# 1. every condition (clean included) on a 30-clip probe: the affordable robustness sweep
-uv run python evaluate.py --data ... --workers 10 --max-clips 30 --max-seconds 10
-# 2. clean only, full corpus: the headline + the frozen operating point theta*
-uv run python evaluate.py --data ... --workers 10 --conditions clean --report
+# one tracker, one dataset, frame only
+uv run python evaluate.py --data "Vocadito=/data/vocadito" --algorithms Praat --suites frame
+# one condition on one dataset
+uv run python evaluate.py --data "KEELE=/data/KEELE/KEELE" --conditions pink --suites frame
+# the dataless suites need no --data
+uv run python evaluate.py --suites synthetic speed
 ```
-The full clean cell (`cap=None`) is the one `theta*` and Correctness read; the 30-clip clean
-cell is the same-clips partner the Noise track's Δ-from-clean pairing needs; both coexist under
-their own keys. `assert_full()` deliberately refuses to certify this run — it is the affordable
-leaderboard, not the uncapped verdict.
-
-**3. Narrowed runs**, the same entry point, restricted:
-```bash
-uv run python evaluate.py --data KEELE=/data/KEELE/KEELE --algorithms Praat --datasets Vocadito --suites frame
-uv run python evaluate.py --data KEELE=/data/KEELE/KEELE --datasets Vocadito --conditions pink --suites frame
-uv run python evaluate.py --data KEELE=/data/KEELE/KEELE --suites speed synthetic
-```
-Conditions (13): `clean, white, pink, chime, demand, telephone, codec, reverb, room,
-gain, fade, pink_snr+10, pink_snr-5`. The chime/demand noise banks are named like any
-a recorded-condition corpus in `--data` (`chime=<dir> demand=<dir>`); its presence enables that condition.
+Conditions (13): `clean, white, pink, chime, demand, telephone, codec, reverb, room, gain, fade,
+pink_snr+10, pink_snr-5`. The recorded conditions chime/demand each need their corpus via
+`--data chime=<dir> demand=<dir>`; passing the corpora adds those two conditions to the frame axis.
 
 **4. Programmatic use** (your own tracker class, no registry edits):
 ```python
