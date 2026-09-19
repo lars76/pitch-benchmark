@@ -1,0 +1,56 @@
+[project]
+name = "pitch-benchmark-prepare"
+version = "2.0.0"
+description = "Rebuilds the pitch-benchmark train/ and eval/ splits from the raw corpora."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Lars Nieradzik", email = "l.nieradzik@gmail.com" }]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy",
+    "scipy",
+    "tqdm",
+    "soundfile",
+    "torch>=2.14,<2.15",
+    "torchaudio>=2.11,<2.12",
+    "pyworld",
+    "av",
+    "praat-parselmouth",
+    "pysptk",
+    "setuptools<81",
+]
+
+[tool.uv]
+package = false
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.extra-build-dependencies]
+pysptk = ["setuptools<81", "numpy", "cython"]
+pyworld = ["setuptools<81", "numpy", "cython"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "PIE", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003", "B905", "SIM108", "RUF012"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["build", "constants", "corpora", "degradation", "grid", "scripts",
+                     "seeds", "stages"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

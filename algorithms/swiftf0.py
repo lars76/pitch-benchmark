@@ -1,25 +1,14 @@
-from typing import Tuple
+from swift_f0 import SAMPLE_RATE, SwiftF0
 
-import numpy as np
-from swift_f0 import SwiftF0
-
-from .base import ContinuousPitchAlgorithm
+from .base import ContinuousPitchAlgorithm, resample_audio
 
 
 class SwiftF0PitchAlgorithm(ContinuousPitchAlgorithm):
-    def __init__(
-        self,
-        **kwargs,
-    ):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.detector = SwiftF0()
 
-    def _extract_raw_pitch_and_periodicity(
-        self, audio: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        result = self.detector.detect_from_array(audio, self.sample_rate)
-
+    def _extract_raw_pitch_and_periodicity(self, audio):
+        audio = resample_audio(audio, self.sample_rate, SAMPLE_RATE)
+        result = self.detector.detect(audio, SAMPLE_RATE, self.fmin, self.fmax)
         return result.timestamps, result.pitch_hz, result.confidence
-
-    def _get_default_threshold(self) -> float:
-        return 0.887

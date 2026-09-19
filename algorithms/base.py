@@ -1,254 +1,209 @@
+import contextlib
+import functools
+import os
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
+from resampling import resample_to_grid
+from score import is_voiced
+
+os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache", "numba"))
+
+PCM16_MAX = 32767.0
+
+
+def salience_band_mask(cents_mapping, fmin, fmax):
+    hz = 10.0 * 2.0 ** (np.asarray(cents_mapping, dtype=np.float64) / 1200.0)
+    return (hz >= fmin) & (hz <= fmax)
+
+
+def threshold_to_param(threshold, param_range):
+    lo, hi = param_range
+    return lo + float(threshold) * (hi - lo)
+
+
+def resample_audio(audio, orig_sr, target_sr):
+    if orig_sr == target_sr:
+        return audio
+    import torch
+    import torchaudio
+
+    x = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32))
+    return torchaudio.functional.resample(x, orig_sr, target_sr).numpy()
+
+
+_TF_CONFIGURED = False
+
+
+class TensorFlowModelMixin:
+
+    def _init_tensorflow(self):
+        import tensorflow as tf
+
+        global _TF_CONFIGURED
+        if not _TF_CONFIGURED:
+            tf.get_logger().setLevel("ERROR")
+            with contextlib.suppress(Exception):
+                tf.config.set_visible_devices([], "GPU")
+            _TF_CONFIGURED = True
+
 
 class PitchAlgorithm(ABC):
-    def __init__(self, sample_rate: int, hop_size: int, fmin: float, fmax: float):
-        if fmin >= fmax:
-            raise ValueError(f"fmin ({fmin}) must be less than fmax ({fmax})")
-        if sample_rate <= 0:
-            raise ValueError(f"Sample rate must be positive, got {sample_rate}")
-        if hop_size <= 0:
-            raise ValueError(f"Hop size must be positive, got {hop_size}")
 
+    CHUNK_SECONDS = 20.0
+    CHUNK_OVERLAP_SECONDS = 1.0
+
+    def __init__(self, sample_rate, hop_size, fmin, fmax):
         self.sample_rate = sample_rate
         self.hop_size = hop_size
         self.fmin = fmin
         self.fmax = fmax
 
-    @property
-    def supports_continuous_periodicity(self) -> bool:
-        return isinstance(self, ContinuousPitchAlgorithm)
+        if self.CHUNK_SECONDS is None:
+            self.chunk_samples = None
+        else:
+            self.chunk_samples = max(
+                hop_size, int(self.CHUNK_SECONDS * sample_rate) // hop_size * hop_size
+            )
+        self.chunk_overlap_samples = max(
+            hop_size, int(self.CHUNK_OVERLAP_SECONDS * sample_rate) // hop_size * hop_size
+        )
 
-    def _validate_audio(self, audio: np.ndarray) -> None:
+    def _extract_windowed(self, audio, raw_fn):
+        n = len(audio)
+        if self.chunk_samples is None or n <= self.chunk_samples:
+            return raw_fn(audio)
+
+        all_t, all_p, all_q = [], [], []
+        start = 0
+        while start < n:
+            end = min(start + self.chunk_samples, n)
+            cs = max(0, start - self.chunk_overlap_samples)
+            ce = min(n, end + self.chunk_overlap_samples)
+            t, p, q = raw_fn(audio[cs:ce])
+            t = np.asarray(t, dtype=float) + cs / self.sample_rate
+            ts = t * self.sample_rate
+            lo = start - 0.5
+            hi = np.inf if end >= n else end - 0.5
+            keep = (ts >= lo) & (ts < hi)
+            all_t.append(t[keep])
+            all_p.append(np.asarray(p)[keep])
+            all_q.append(np.asarray(q)[keep])
+            start = end
+        return np.concatenate(all_t), np.concatenate(all_p), np.concatenate(all_q)
+
+    def native_frames(self, audio):
+        audio = self._validate_audio(audio)
+        if isinstance(self, ContinuousPitchAlgorithm):
+            raw_fn = self._extract_raw_pitch_and_periodicity
+        else:
+            raw_fn = functools.partial(self._extract_pitch_with_threshold,
+                                       threshold=self._get_default_threshold())
+        times, pitch, periodicity = self._extract_windowed(audio, raw_fn)
+        return (
+            np.asarray(times, dtype=np.float64),
+            np.asarray(pitch, dtype=np.float64),
+            np.asarray(periodicity, dtype=np.float64),
+        )
+
+    def _validate_audio(self, audio):
         if audio.size == 0:
             raise ValueError("Empty audio input")
+        if audio.ndim != 1:
+            raise ValueError(f"Audio must be 1-D (mono), got shape {audio.shape}")
         if not np.isfinite(audio).all():
             raise ValueError("Audio contains non-finite values")
         if np.any(np.abs(audio) > 1.0):
             raise ValueError("Audio must be normalized to [-1.0, 1.0]")
+        return np.ascontiguousarray(audio, dtype=np.float32)
 
-    def _compute_target_times(self, audio_length: int) -> np.ndarray:
+    def _compute_target_times(self, audio_length):
         n_hops = audio_length // self.hop_size
         return np.arange(n_hops) * (self.hop_size / self.sample_rate)
 
-    def _align_to_grid(
-        self,
-        algorithm_times: np.ndarray,
-        values: np.ndarray,
-        target_times: np.ndarray,
-    ) -> np.ndarray:
-        if len(algorithm_times) == 0:
-            return np.zeros_like(target_times)
-        return np.interp(target_times, algorithm_times, values, left=0.0, right=0.0)
+    def _sanity_check(self, pitch, periodicity):
+        pitch = np.asarray(pitch, dtype=np.float64).copy()
+        periodicity = np.asarray(periodicity, dtype=np.float64).copy()
+        unusable = ~(np.isfinite(pitch) & np.isfinite(periodicity))
+        pitch[unusable] = 0.0
+        periodicity[unusable] = 0.0
 
-    def _sanity_check(
-        self, pitch: np.ndarray, periodicity: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        periodicity = np.nan_to_num(periodicity, nan=0.0)
-        pitch = np.nan_to_num(pitch, nan=0.0)
-
-        voiced = periodicity > 0
+        voiced = (periodicity > 0) & (pitch > 0)
         pitch[~voiced] = 0.0
+        periodicity[~voiced] = 0.0
         pitch[voiced] = np.clip(pitch[voiced], self.fmin, self.fmax)
 
         periodicity = np.clip(periodicity, 0.0, 1.0)
         return pitch, periodicity
 
-    def notes_from_pitch_contour(
-        self,
-        pitch_contour: np.ndarray,
-        voicing_contour: np.ndarray,
-        split_semitone_threshold: float = 0.8,
-        min_note_duration: float = 0.05,
-        unvoiced_grace_period: float = 0.02,
-    ) -> List[Dict[str, float]]:
-        frame_period = self.hop_size / self.sample_rate
-        notes = []
-        current_note_segment = None
-        unvoiced_frames_count = 0
-
-        valid_voiced_frames = (
-            (voicing_contour > 0)
-            & (pitch_contour >= self.fmin)
-            & (pitch_contour <= self.fmax)
-        )
-
-        midi_contour = np.full_like(pitch_contour, np.nan)
-        valid_indices = np.where(valid_voiced_frames)[0]
-        if len(valid_indices) > 0:
-            midi_contour[valid_indices] = 69 + 12 * np.log2(
-                pitch_contour[valid_indices] / 440.0
-            )
-
-        for i, is_voiced in enumerate(valid_voiced_frames):
-            t = i * frame_period
-            if is_voiced:
-                unvoiced_frames_count = 0
-                midi_pitch = midi_contour[i]
-                if current_note_segment is None:
-                    current_note_segment = {
-                        "start": t,
-                        "end": t + frame_period,
-                        "samples": [midi_pitch],
-                    }
-                else:
-                    current_median = np.median(current_note_segment["samples"])
-                    pitch_deviation = abs(midi_pitch - current_median)
-                    if pitch_deviation >= split_semitone_threshold:
-                        notes.append(current_note_segment)
-                        current_note_segment = {
-                            "start": t,
-                            "end": t + frame_period,
-                            "samples": [midi_pitch],
-                        }
-                    else:
-                        current_note_segment["samples"].append(midi_pitch)
-                        current_note_segment["end"] = t + frame_period
-            else:
-                if current_note_segment is not None:
-                    unvoiced_frames_count += 1
-                    unvoiced_duration = unvoiced_frames_count * frame_period
-                    if unvoiced_duration >= unvoiced_grace_period:
-                        notes.append(current_note_segment)
-                        current_note_segment = None
-                    else:
-                        current_note_segment["end"] = t + frame_period
-
-        if current_note_segment is not None:
-            notes.append(current_note_segment)
-        if not notes:
-            return []
-
-        processed_notes = []
-        for segment in notes:
-            duration = segment["end"] - segment["start"]
-            if duration >= min_note_duration and segment["samples"]:
-                median_pitch = np.median(segment["samples"])
-                processed_notes.append(
-                    {
-                        "start": segment["start"],
-                        "end": segment["end"],
-                        "midi_pitch": round(median_pitch),
-                    }
-                )
-        if not processed_notes:
-            return []
-
-        final_notes = [processed_notes[0]]
-        epsilon = 1e-9
-        for current_note in processed_notes[1:]:
-            previous_note = final_notes[-1]
-            gap = current_note["start"] - previous_note["end"]
-            if (
-                gap <= frame_period + epsilon
-                and previous_note["midi_pitch"] == current_note["midi_pitch"]
-            ):
-                previous_note["end"] = current_note["end"]
-            else:
-                final_notes.append(current_note)
-
-        return final_notes
-
-    def extract_pitch(
-        self,
-        audio: np.ndarray,
-        thresholds: Optional[Union[float, List[float]]] = None,
-    ) -> Union[
-        Tuple[np.ndarray, np.ndarray, List[Dict[str, float]]],
-        List[Tuple[np.ndarray, np.ndarray, List[Dict[str, float]]]],
-    ]:
+    def extract_pitch(self, audio, thresholds=None):
         if thresholds is None:
             thresholds = [self._get_default_threshold()]
-        elif isinstance(thresholds, (int, float)):
-            thresholds = [float(thresholds)]
-        else:
-            thresholds = list(thresholds)
-
-        if self.supports_continuous_periodicity:
-            results = self._extract_continuous_multiple_thresholds(audio, thresholds)
-        else:
-            results = self._extract_threshold_multiple_thresholds(audio, thresholds)
-
-        return results[0] if len(results) == 1 else results
+        return self._extract_all(audio, list(thresholds))
 
     @abstractmethod
-    def _get_default_threshold(self) -> float:
+    def _extract_all(self, audio, thresholds):
         pass
 
+    def _get_default_threshold(self):
+        return 0.5
+
     @classmethod
-    def get_name(cls) -> str:
-        return getattr(cls, "_name", cls.__name__.replace("PitchAlgorithm", ""))
+    def get_name(cls):
+        return cls.__name__.replace("PitchAlgorithm", "")
 
 
 class ContinuousPitchAlgorithm(PitchAlgorithm):
+    # A tracker whose periodicity is a binary voicing flag sets this to "nearest", so the
+    # flag stays 0 or 1 on the frame grid instead of being interpolated between stamps.
+    voicing_kind = "linear"
+
     @abstractmethod
-    def _extract_raw_pitch_and_periodicity(
-        self, audio: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _extract_raw_pitch_and_periodicity(self, audio):
         pass
 
-    def _get_default_threshold(self) -> float:
-        return 0.5
-
-    def extract_continuous_periodicity(
-        self, audio: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        self._validate_audio(audio)
-        times, pitch, periodicity = self._extract_raw_pitch_and_periodicity(audio)
+    def extract_continuous_periodicity(self, audio):
+        audio = self._validate_audio(audio)
+        times, pitch, periodicity = self._extract_windowed(
+            audio, self._extract_raw_pitch_and_periodicity
+        )
         pitch, periodicity = self._sanity_check(pitch, periodicity)
         target_times = self._compute_target_times(len(audio))
-        aligned_pitch = self._align_to_grid(times, pitch, target_times)
-        aligned_periodicity = self._align_to_grid(times, periodicity, target_times)
+        aligned_pitch, aligned_periodicity = resample_to_grid(
+            pitch, periodicity, times, target_times, voicing_kind=self.voicing_kind
+        )
         return aligned_pitch, aligned_periodicity
 
-    def _extract_continuous_multiple_thresholds(
-        self, audio: np.ndarray, thresholds: List[float]
-    ) -> List[Tuple[np.ndarray, np.ndarray, List[Dict[str, float]]]]:
+    def _extract_all(self, audio, thresholds):
         pitch, confidence = self.extract_continuous_periodicity(audio)
         results = []
         for threshold in thresholds:
             voicing = (confidence >= threshold).astype(bool)
-            notes = self.notes_from_pitch_contour(pitch, voicing)
-            results.append((pitch, voicing, notes))
+            pitch_t = np.where(voicing, pitch, 0.0)
+            results.append((pitch_t, voicing))
         return results
 
 
 class ThresholdPitchAlgorithm(PitchAlgorithm):
     @abstractmethod
-    def _extract_pitch_with_threshold(
-        self, audio: np.ndarray, threshold: float
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _extract_pitch_with_threshold(self, audio, threshold):
         pass
 
-    def _get_default_threshold(self) -> float:
-        return 0.5
-
-    def _extract_threshold_multiple_thresholds(
-        self, audio: np.ndarray, thresholds: List[float]
-    ) -> List[Tuple[np.ndarray, np.ndarray, List[Dict[str, float]]]]:
-        self._validate_audio(audio)
+    def _extract_all(self, audio, thresholds):
+        audio = self._validate_audio(audio)
         results = []
         target_times = self._compute_target_times(len(audio))
         for threshold in thresholds:
-            times, pitch, periodicity = self._extract_pitch_with_threshold(
-                audio, threshold
+            times, pitch, periodicity = self._extract_windowed(
+                audio, lambda a, t=threshold: self._extract_pitch_with_threshold(a, t)
             )
             pitch, periodicity = self._sanity_check(pitch, periodicity)
-            aligned_pitch = self._align_to_grid(times, pitch, target_times)
-            aligned_periodicity = self._align_to_grid(times, periodicity, target_times)
-            notes = self.notes_from_pitch_contour(
-                aligned_pitch, aligned_periodicity.astype(bool)
+            aligned_pitch, aligned_periodicity = resample_to_grid(
+                pitch, periodicity, times, target_times, voicing_kind="nearest"
             )
-            results.append((aligned_pitch, aligned_periodicity.astype(bool), notes))
+            voicing = is_voiced(aligned_periodicity)
+            aligned_pitch = np.where(voicing, aligned_pitch, 0.0)
+            results.append((aligned_pitch, voicing))
         return results
-
-    def extract_continuous_periodicity(
-        self, audio: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        raise NotImplementedError(
-            f"{self.__class__.__name__} doesn't support continuous periodicity extraction. "
-            f"Use extract_pitch() instead or check supports_continuous_periodicity property."
-        )

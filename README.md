@@ -1,145 +1,126 @@
 # Pitch Detection Benchmark
 
-A comprehensive benchmark suite evaluating pitch detection algorithms across 8 datasets covering speech, music, synthetic, and real-world audio conditions.
+This is version 2 of the benchmark: 19 monophonic pitch trackers over 10 corpora, with a common prepared dataset. Each clip has nine versions:
+clean audio and eight combinations of background sound, reverberation and microphone filtering.
+[BENCHMARK.md](BENCHMARK.md) contains the full report.
 
-## Which Algorithm Should I Use?
+## Results
 
-**TL;DR Recommendations:**
-- **Best Overall**: **SwiftF0** (90.2% accuracy, 90× faster than CREPE)
-- **Need Maximum Speed**: **Praat** (2.8ms per second of audio, 84.7% accuracy)
-- **Best Pitch Accuracy**: **CREPE** (85.3% accuracy, best RPA/RCA but slow and not good on all metrics)
-- **Best Human singing**: **RMVPE** (87.2% accuracy, best on Vocadito and MIR-1K)
+| Tracker | Score: pitch F1@50c ↑ [95% CI] | Speed (× real time) ↑ | Beats ↑ | Loses to ↓ | Undetermined |
+|---|---|---|---|---|---|
+| SwiftF0 | **0.778** [0.765, 0.792] | 416.6 | **16** | **0** | 1 |
+| RMVPE | 0.768 [0.752, 0.783] | 50.0 | **16** | **0** | 1 |
+| FCPE | 0.728 [0.712, 0.742] | 49.6 | 15 | 2 | 0 |
+| TorchCREPE | 0.691 [0.673, 0.706] | 2.2 | 12 | 3 | 2 |
+| CREPE | 0.689 [0.672, 0.704] | 2.7 | 12 | 3 | 2 |
+| PESTO | 0.680 [0.663, 0.697] | 33.2 | 12 | 3 | 2 |
+| SHS | 0.657 [0.640, 0.672] | 463.7 | 10 | 6 | 1 |
+| Praat | 0.651 [0.634, 0.667] | **2182.4** | 8 | 6 | 3 |
+| RAPT | 0.640 [0.621, 0.655] | 1148.2 | 8 | 7 | 2 |
+| HarmoF0 | 0.639 [0.622, 0.653] | 12.0 | 8 | 7 | 2 |
+| SWIPE | 0.610 [0.589, 0.624] | 50.4 | 5 | 10 | 2 |
+| SPICE | 0.602 [0.582, 0.619] | 469.1 | 5 | 10 | 2 |
+| Harvest | 0.600 [0.584, 0.614] | 11.1 | 5 | 10 | 2 |
+| YAAPT | 0.560 [0.539, 0.580] | 47.9 | 1 | 13 | 3 |
+| PENN | 0.560 [0.539, 0.579] | 20.2 | 1 | 13 | 3 |
+| DIO | 0.560 [0.541, 0.577] | 131.4 | 1 | 13 | 3 |
+| BasicPitch | 0.557 [0.539, 0.573] | 177.0 | 1 | 13 | 3 |
+| pYIN | 0.506 [0.482, 0.525] | 10.5 | 0 | 17 | 0 |
+| REAPER (crashed)* | - | - | - | - | - |
 
-## Overall Results
+*REAPER has incomplete accuracy results and is unranked. Its speed is measured separately.
 
-The table below shows the harmonic-mean accuracy score for each algorithm across the eight benchmark datasets. The average score determines the overall ranking.
+↑ Higher is better. ↓ Lower is better. Bold marks the best displayed value in each metric
+column, including ties. SwiftF0 has the highest score. Its difference to RMVPE is not
+statistically resolved.
 
-| **Algorithm** | **Bach10Synth** | **MDBStemSynth** | **MIR1K** | **NSynth** | **PTDB** | **PTDBNoisy** | **SpeechSynth** | **Vocadito** | **Average** |
-|---|---|---|---|---|---|---|---|---|---|
-| **SwiftF0** | 97.5% | 92.0% | 95.0% | **89.3%** | 90.4% | 74.0% | **90.7%** | 92.6% | **90.2%** |
-| RMVPE | 98.1% | 90.6% | **96.0%** | 68.2% | 88.9% | 68.5% | 90.6% | **96.4%** | 87.2% |
-| CREPE | **98.5%** | 90.5% | 95.7% | 80.2% | 79.7% | 53.8% | 88.3% | 95.6% | 85.3% |
-| PENN | 97.3% | **94.0%** | 89.0% | 63.3% | **91.0%** | **76.4%** | 84.8% | 82.4% | 84.8% |
-| Praat | 96.0% | 90.7% | 92.6% | 70.7% | 86.2% | 65.3% | 88.2% | 88.2% | 84.7% |
-| SPICE | 95.0% | 89.4% | 92.7% | 68.8% | 77.8% | 55.9% | 87.9% | 92.3% | 82.5% |
-| TorchCREPE | 96.7% | 85.1% | 71.4% | 83.8% | 78.3% | 61.2% | 79.7% | 89.0% | 80.6% |
-| pYIN | 97.5% | 90.3% | 91.2% | 74.3% | 72.1% | 43.2% | 81.4% | 79.5% | 78.7% |
-| RAPT | 91.9% | 79.6% | 82.4% | 54.6% | 68.4% | 48.9% | 74.3% | 87.5% | 73.5% |
-| SWIPE | 77.8% | 65.6% | 77.1% | 51.4% | 66.6% | 45.0% | 77.1% | 66.6% | 65.9% |
-| YAAPT | 58.5% | 39.6% | 82.0% | 6.4% | 69.8% | 51.7% | 83.5% | 88.6% | 60.0% |
-| BasicPitch | 23.7% | 12.4% | 36.5% | 77.7% | 23.1% | 12.6% | 61.2% | 17.8% | 33.1% |
+Every tracker's output is resampled onto one 16 ms frame grid, then scored frame by frame:
 
-For a detailed breakdown of results, see [Benchmark Report](benchmark_report.md).
+```
+cents_error = 1200 * log2(tracker pitch / reference pitch)
+hit         = tracker voiced AND reference voiced AND |cents_error| < 50
+precision   = Pr(hit | tracker voiced)
+recall      = Pr(hit | reference voiced)
+score       = F1, the harmonic mean of the two
+```
 
-## Running Your Own Benchmarks
+The score averages pitch F1 equally over the eight recording conditions and ten corpora.
+Clean audio is excluded.
 
-### Installation
+Brackets show 95% confidence intervals. Beats and loses to count statistically significant
+wins and losses after adjusting for all pairwise comparisons. Undetermined means the data
+do not resolve the difference.
 
-This project uses [uv](https://docs.astral.sh/uv/pip/environments/) (a fast Python package manager) for dependency management, but `conda` or `pip` will also work.
+Speed is audio duration divided by median processing time after warm-up. A value of 20 means
+20 seconds of audio processed per second. See [Speed](BENCHMARK.md#speed) for the measured CPU.
+
+## Install
+
+Install [uv](https://docs.astral.sh/uv/), then:
 
 ```bash
-uv venv --python 3.10
-source .venv/bin/activate
-uv pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match
+uv sync --all-extras
 ```
 
-### Dataset Setup
-
-Download the required datasets:
-
-- [PTDB-TUG](https://www.spsc.tugraz.at/databases-and-tools/ptdb-tug-pitch-tracking-database-from-graz-university-of-technology.html) - Speech with laryngograph ground truth
-- [NSynth](https://magenta.tensorflow.org/datasets/nsynth) - Synthetic musical instruments
-- [MDB-stem-synth](https://zenodo.org/records/1481172) - Synthetic music stems
-- [MIR-1K](https://zenodo.org/records/3532216) - Vocal excerpts
-- [Vocadito](https://zenodo.org/records/5578807) - Solo vocal recordings
-- [Bach10-mf0-synth](https://zenodo.org/records/1481156/files/Bach10-mf0-syth.tar.gz) - Synthetic Bach compositions
-- [CHiME-Home](https://archive.org/details/chime-home) - Background noise for testing
-
-Organize datasets in a directory structure like:
-```
-datasets/
-├── PTDB/
-├── NSynth/
-├── MDBStemSynth/
-├── MIR1K/
-├── Vocadito/
-├── Bach10Synth/
-└── chime_home/
-```
-
-### Usage
-
-**1. Visualize Algorithms on Your Audio**
-```bash
-python visualize_algorithms.py your_audio.wav --selected_algorithms SwiftF0 CREPE Praat
-```
-
-**2. Speed Benchmark**
-```bash
-python speed_benchmark.py --signal-length 1.0 --n-runs 20
-```
-
-**3. Pitch Benchmark**
+To benchmark only some of the trackers, install just their extras:
 
 ```bash
-for dataset in PTDB NSynth MIR1K Vocadito MDBStemSynth Bach10Synth; do
-  python pitch_benchmark.py \
-    --dataset $dataset \
-    --data-dir datasets/$dataset \
-    --chime-dir datasets/chime_home
-done
-python pitch_benchmark.py --dataset PTDBNoisy --data-dir datasets/PTDB --chime-dir datasets/chime_home
-python pitch_benchmark.py --dataset SpeechSynth --data-dir datasets/speechsynth.pt --chime-dir audio_datasets/chime_home
+uv sync --extra crepe --extra praat  # add trackers one --extra at a time
 ```
 
-**4. Generate Report**
+## Run
+
+Download the dataset from [Hugging Face](https://huggingface.co/datasets/lars1234/pitch-benchmark)
+(CC BY-NC-SA 4.0, research use), or rebuild it from the raw corpora with [prepare/](prepare/README.md):
 
 ```bash
-python generate_report.py --results-dir results/ --output benchmark_report.md
+uvx --from huggingface_hub hf download lars1234/pitch-benchmark eval.tar SHA256SUMS --repo-type dataset --local-dir dataset
+(cd dataset && sha256sum -c --ignore-missing SHA256SUMS)
+tar -xf dataset/eval.tar -C dataset
 ```
 
-### Algorithm Implementations
+`train.tar` is only needed for training and is not downloaded by this command.
 
-The benchmark includes implementations of these algorithms:
+Point `--dataset` at the extracted `eval/` directory:
 
-**Neural Networks:**
-- [SwiftF0](https://github.com/lars76/swift-f0) - Fast CNN-based pitch detection
-- [CREPE](https://github.com/marl/crepe) - CNN-based pitch estimation
-- [TorchCREPE](https://github.com/maxrmorrison/torchcrepe) - PyTorch CREPE implementation
-- [PENN](https://github.com/interactiveaudiolab/penn) - Pitch-Estimating Neural Networks
-- [BasicPitch](https://github.com/spotify/basic-pitch) - Spotify's multi-instrument pitch detector
-- [SPICE](https://www.tensorflow.org/hub/tutorials/spice) - Self-supervised pitch estimation
-- [RMVPE](https://github.com/yxlllc/RMVPE) - A Robust Model for Vocal Pitch Estimation in Polyphonic Music
+```bash
+nohup uv run python run.py --dataset dataset/eval --out cells --workers 8 \
+      > run.log 2>&1 &                        # the matrix: 9 panels x 10 corpora x 19 trackers
+tail -f run.log                               # the last line reads "=== done" when the matrix is complete
 
-**Classical Methods:**
-- [Praat](https://github.com/YannickJadoul/Parselmouth) - Autocorrelation-based
-- [pYIN](https://librosa.org/doc/main/generated/librosa.pyin.html) - Probabilistic YIN
-- [YAAPT](https://bjbschmitt.github.io/AMFM_decompy/pYAAPT.html) - Yet Another Algorithm for Pitch Tracking
-- [RAPT](https://pysptk.readthedocs.io/en/latest/generated/pysptk.sptk.rapt.html) - Robust Algorithm for Pitch Tracking
-- [SWIPE](https://pysptk.readthedocs.io/en/latest/generated/pysptk.sptk.swipe.html) - Sawtooth Waveform Inspired Pitch Estimator
-- [DIO](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder) - Distributed Inline-filter Operation: multi-band zero-crossing F0 estimator from the WORLD vocoder (via pyworld), with StoneMask refinement
-- [Harvest](https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder) - High-performance F0 estimator using band-pass filter candidates refined with instantaneous frequency and contour smoothing (via pyworld)
-
-## 🤝 Contributing
-
-Contributions are welcome! To add a new algorithm, you can either submit a Pull Request with your own implementation or create an Issue to request it, and I will run the benchmark for you.
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 📚 Citation
-
-If you use this benchmark in your research, please cite:
-
-```bibtex
-@misc{nieradzik2025swiftf0,
-      title={SwiftF0: Fast and Accurate Monophonic Pitch Detection},
-      author={Lars Nieradzik},
-      year={2025},
-      eprint={2508.18440},
-      archivePrefix={arXiv},
-      primaryClass={cs.SD},
-      url={https://arxiv.org/abs/2508.18440},
-}
+uv run python speed.py --out cells            # speed, afterwards, on an otherwise idle machine
+uv run python report.py --cells cells --out BENCHMARK.md    # rewrites the tables inside BENCHMARK.md
 ```
+
+`--algorithms SwiftF0 Praat` restricts a run to the trackers named, for example those whose
+extras are installed. `--datasets` and `--panels` restrict it the same way. Runs resume: a cell
+whose file exists is skipped, so delete `cells/` to start over. The leaderboard in this README is
+copied from the report.
+
+Each tracker, corpus and condition runs in a separate process with the thread-limit environment
+variables set to one. Set `--workers` to the number of physical CPU cores. The 19 trackers took
+around 8 hours at `--workers 8` on an 8-core Ryzen 9 8945HS. `nohup` keeps the run active after
+the terminal closes. Run the speed measurements afterwards on an otherwise idle machine.
+
+## Changes since version 1
+
+[Version 1](https://github.com/lars76/pitch-benchmark/tree/v1) scored 12 trackers on 8 corpora.
+Users had to download and process each corpus. Version 2 prepares a common dataset with separate
+training and evaluation corpora.
+
+Version 1 selected confidence thresholds on the clips used for ranking. Version 2 selects them on `valid/`
+and scores on `test/`, separated by speaker or recording group.
+
+Version 1 combined six metrics, including three exponential transforms with manually chosen
+constants. Version 2 uses pitch F1. It also tests all eight combinations of scene, room and microphone
+effects, plus clean audio, to measure their separate and combined effects. Version 1 added background
+noise at 10–30 dB SNR.
+
+## Contributing
+
+To add a tracker, open a pull request with a wrapper in `algorithms/` and its extra in
+`pyproject.toml`, or open an issue asking for it and it will be benchmarked here.
+
+## License
+
+MIT, see LICENSE.

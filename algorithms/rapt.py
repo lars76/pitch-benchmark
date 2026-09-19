@@ -1,19 +1,16 @@
-from typing import Tuple
 
 import numpy as np
 from pysptk import sptk
 
-from .base import ThresholdPitchAlgorithm
+from .base import PCM16_MAX, ThresholdPitchAlgorithm, threshold_to_param
 
 
 class RAPTPitchAlgorithm(ThresholdPitchAlgorithm):
-    def _extract_pitch_with_threshold(
-        self, audio: np.ndarray, threshold: float
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        audio_scaled = np.clip(audio * 32767, -32768, 32767)
-        # RAPT expects a special range.
-        # Map threshold from [0,1] to [-0.6,0.7]
-        norm_threshold = -0.6 + threshold * (0.7 - (-0.6))
+    NCCF_HALF_WINDOW_S = 0.00375
+
+    def _extract_pitch_with_threshold(self, audio, threshold):
+        audio_scaled = np.clip(audio * PCM16_MAX, -PCM16_MAX - 1, PCM16_MAX)
+        norm_threshold = threshold_to_param(threshold, (-0.6, 0.7))
 
         f0 = sptk.rapt(
             audio_scaled,
@@ -25,13 +22,14 @@ class RAPTPitchAlgorithm(ThresholdPitchAlgorithm):
             otype="f0",
         )
 
-        # Build time‐axis (center of RAPT’s ~3‑period window)
-        n_frames = len(f0)
-        # RAPT’s window ≈ 3 periods of the lowest F0:
-        window_center = int((self.sample_rate / self.fmin) * 1.5)
-        times = (np.arange(n_frames) * self.hop_size + window_center) / self.sample_rate
+        idx = np.arange(len(f0))
+        voiced = f0 > 0
+        half_period = (np.interp(idx, idx[voiced], 0.5 / f0[voiced]) if voiced.any()
+                       else np.full(len(f0), 0.5 / np.sqrt(self.fmin * self.fmax)))
+        times = np.maximum.accumulate(
+            idx * (self.hop_size / self.sample_rate) + self.NCCF_HALF_WINDOW_S + half_period)
 
         return times, f0, (f0 >= self.fmin).astype(np.float32)
 
-    def _get_default_threshold(self) -> float:
-        return 0.525
+    def _get_default_threshold(self):
+        return 0.325

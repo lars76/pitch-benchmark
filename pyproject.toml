@@ -1,0 +1,73 @@
+[project]
+name = "pitch-benchmark"
+version = "2.0.0"
+description = "Benchmark for monophonic pitch-detection algorithms."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Lars Nieradzik", email = "l.nieradzik@gmail.com" }]
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "numpy",
+    "tqdm",
+    "librosa",
+    "soundfile",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    "setuptools<81",
+]
+
+[project.optional-dependencies]
+crepe      = ["crepe", "tensorflow>=2.19", "hmmlearn"]
+spice      = ["tensorflow>=2.19", "tensorflow-hub"]
+torchcrepe = ["torchcrepe"]
+penn       = ["penn==0.0.14"]
+praat      = ["praat-parselmouth"]
+shs        = ["praat-parselmouth"]
+rapt       = ["pysptk"]
+reaper     = ["pyreaper"]
+swipe      = ["pysptk"]
+yaapt      = ["amfm-decompy"]
+basicpitch = ["basic-pitch", "onnxruntime"]
+swiftf0    = ["swift-f0>=0.2.0"]
+pesto      = ["pesto-pitch"]
+fcpe       = ["torchfcpe"]
+dio        = ["pyworld"]
+harvest    = ["pyworld"]
+
+[tool.uv]
+package = false
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.extra-build-dependencies]
+crepe = ["setuptools<81"]
+amfm-decompy = ["setuptools<81", "numpy"]
+pysptk = ["setuptools<81", "numpy", "cython"]
+pyworld = ["setuptools<81", "numpy", "cython"]
+pyreaper = ["setuptools<81", "numpy", "cython"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "PIE", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003", "B905", "SIM108", "RUF012"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["algorithms", "report", "resampling", "run", "score", "speed"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
