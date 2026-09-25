@@ -1,6 +1,6 @@
 [project]
 name = "pitch-benchmark"
-version = "2.0.0"
+version = "2.1.0"
 description = "Benchmark for monophonic pitch-detection algorithms."
 readme = "README.md"
 license = "MIT"
@@ -29,7 +29,7 @@ reaper     = ["pyreaper"]
 swipe      = ["pysptk"]
 yaapt      = ["amfm-decompy"]
 basicpitch = ["basic-pitch", "onnxruntime"]
-swiftf0    = ["swift-f0>=0.2.0"]
+swiftf0    = ["swift-f0>=0.3.0"]
 pesto      = ["pesto-pitch"]
 fcpe       = ["torchfcpe"]
 dio        = ["pyworld"]

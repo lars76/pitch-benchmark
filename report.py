@@ -36,7 +36,7 @@ def md_table(rows, header):
                 number, space, rest = str(rows[i][col]).partition(" ")
                 rows[i][col] = f"**{number}**{space}{rest}"
     out = ["| " + " | ".join(header) + " |",
-           "|" + "|".join("---" for _ in header) + "|"]
+           "|" + "|".join("---" if i == 0 else "---:" for i in range(len(header))) + "|"]
     out += ["| " + " | ".join(str(c) for c in row) + " |" for row in rows]
     return "\n".join(out)
 
@@ -225,14 +225,22 @@ def main():
     speeds = {a: score.speed_factor(speed_cells[a]) if a in speed_cells else None
             for a in [*order, *incomplete]}
     speed_order = sorted(speeds, key=lambda a: (math.inf if speeds[a] is None else -speeds[a], a))
-    rows = [[shown.get(a, a), _f(speeds[a], 1)] for a in speed_order]
-    parts.append(md_table(rows, ["Tracker", "Speed (× real time) ↑"]))
+    rows = [[shown.get(a, a), "-" if speeds[a] is None
+             else f"{_f(speeds[a], 1)} ± {_f(score.speed_sd(speed_cells[a]), 1)}"] for a in speed_order]
+    parts.append(md_table(rows, ["Tracker", "Speed (× real time, one core) ↑"]))
     machines = {c["parameters"].get("cpu") for c in speed_cells.values()
                 if c["parameters"].get("cpu")}
+    waiting = [shown.get(a, a) for a in speed_order
+               if speeds[a] is not None and score.cpu_per_wall(speed_cells[a]) < 0.8]
     parts.append(
-        "\nAudio duration divided by median processing time after warm-up: 20× means "
-        "20 seconds of audio processed per second. "
-        "Speed is measured separately by [speed.py](speed.py), including for trackers with "
+        "\nAudio duration divided by the median CPU time over five rounds: 20× means 20 seconds "
+        "of audio processed per second of CPU time. Every tracker runs pinned to one CPU core, "
+        "with the thread limits set to 1, after a warm-up, and the order of the trackers is "
+        "shuffled in each round. The value after ± is the standard deviation over the rounds. "
+        "A tracker without five successful rounds shows -. "
+        + (f"{', '.join(waiting)} also waited for its own threads, so its wall-clock time on one "
+           "core is longer. " if waiting else "")
+        + "Speed is measured separately by [speed.py](speed.py), including for trackers with "
         "incomplete accuracy results. CPU: "
         + (", ".join(sorted(machines)) if machines else "an unrecorded cpu")
         + ".\n")

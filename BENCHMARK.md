@@ -99,7 +99,7 @@ frequencies by different amounts.
 ### Sample size
 
 | Corpus | Test clips | Calibration clips / groups | Mean clip length (s) |
-|---|---|---|---|
+|---|---:|---:|---:|
 | APLAWD | 16 | 24 / 4 | 0.9 |
 | AVID | 26 | 14 / 13 | 9.9 |
 | Bach10Synth | 23 | 17 / 4 | 9.2 |
@@ -116,7 +116,7 @@ Each source clip is counted once, before rendering the recording conditions. Cal
 ### Pitch distribution
 
 | Corpus | Voiced (%) | f0 p5 / p50 / p95 (Hz) | Search range (Hz) | Out of range (%) | f0 by band |
-|---|---|---|---|---|---|
+|---|---:|---:|---:|---:|---:|
 | APLAWD | 63 | 106-162-293 | 65-400 | 0.2 | low 91%, mid 9% |
 | AVID | 49 | 98-168-324 | 65-400 | 1.3 | bass 2%, low 85%, mid 13% |
 | Bach10Synth | 93 | 111-296-519 | 65-1200 | 0.0 | low 39%, mid 61% |
@@ -142,8 +142,8 @@ Trackers use the search range to restrict pitch candidates where supported. Othe
 ### Overall performance
 
 | Tracker | Pitch F1@50c ↑ [95% CI] | Voicing F1 ↑ | Beats ↑ | Loses to ↓ | Undetermined |
-|---|---|---|---|---|---|
-| SwiftF0 | **0.778** [0.765, 0.792] | 0.839 | **16** | **0** | 1 |
+|---|---:|---:|---:|---:|---:|
+| SwiftF0 | **0.781** [0.768, 0.795] | 0.844 | **16** | **0** | 1 |
 | RMVPE | 0.768 [0.752, 0.783] | 0.837 | **16** | **0** | 1 |
 | FCPE | 0.728 [0.712, 0.742] | 0.812 | 15 | 2 | 0 |
 | TorchCREPE | 0.691 [0.673, 0.706] | 0.761 | 12 | 3 | 2 |
@@ -172,8 +172,8 @@ REAPER crashed in 56 of 90 runs and is unranked because its results are incomple
 ### Performance by dataset
 
 | Tracker | APLAWD ↑ | AVID ↑ | Bach10Synth ↑ | FDA ↑ | KEELE ↑ | OSFGlottis ↑ | SVD ↑ | SpeechSynth ↑ | URMP ↑ | Vocadito ↑ |
-|---|---|---|---|---|---|---|---|---|---|---|
-| SwiftF0 | **0.733** | 0.736 | **0.904** | 0.696 | 0.766 | 0.696 | **0.760** | 0.806 | **0.836** | 0.846 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| SwiftF0 | **0.732** | 0.739 | **0.905** | 0.707 | 0.769 | 0.703 | **0.761** | 0.809 | **0.838** | 0.847 |
 | RMVPE | 0.727 | **0.759** | 0.841 | **0.719** | **0.772** | **0.714** | 0.755 | **0.842** | 0.689 | **0.862** |
 | FCPE | 0.687 | 0.696 | 0.859 | 0.654 | 0.720 | 0.661 | 0.688 | 0.767 | 0.763 | 0.786 |
 | TorchCREPE | 0.597 | 0.636 | 0.870 | 0.603 | 0.660 | 0.636 | 0.660 | 0.725 | 0.737 | 0.789 |
@@ -198,8 +198,8 @@ Pitch F1 averaged over the 8 scored conditions within each corpus, using the sam
 ### Performance by recording condition
 
 | Tracker | Clean ↑ | level ↑ | scene ↑ | room ↑ | mic ↑ | scene+room ↑ | scene+mic ↑ | room+mic ↑ | scene+room+mic ↑ |
-|---|---|---|---|---|---|---|---|---|---|
-| SwiftF0 | **0.947** | **0.954** | **0.751** | 0.783 | **0.954** | **0.631** | **0.749** | 0.782 | **0.621** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| SwiftF0 | **0.949** | **0.956** | **0.754** | 0.784 | **0.956** | **0.636** | **0.751** | 0.783 | **0.628** |
 | RMVPE | 0.943 | 0.945 | 0.749 | **0.786** | 0.944 | 0.604 | 0.740 | **0.785** | 0.591 |
 | FCPE | 0.935 | 0.943 | 0.716 | 0.744 | 0.933 | 0.566 | 0.671 | 0.739 | 0.513 |
 | TorchCREPE | 0.909 | 0.909 | 0.670 | 0.697 | 0.908 | 0.498 | 0.659 | 0.696 | 0.493 |
@@ -224,8 +224,8 @@ Pitch F1 averaged equally over the corpora. Clean (`identity`) is the unmodified
 ### Factor effects and interactions
 
 | Tracker | scene | room | mic | scene x room | scene x mic | room x mic | scene x room x mic |
-|---|---|---|---|---|---|---|---|
-| SwiftF0 | -0.180 | -0.148 | -0.003 | 0.048 | -0.005 | -0.004 | -0.007 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SwiftF0 | -0.178 | -0.147 | -0.003 | 0.052 | -0.005 | -0.003 | -0.006 |
 | RMVPE | -0.194 | -0.153 | -0.006 | 0.012 | -0.010 | -0.003 | -0.003 |
 | FCPE | -0.223 | -0.175 | -0.028 | 0.043 | -0.041 | -0.002 | -0.014 |
 | TorchCREPE | -0.223 | -0.191 | -0.004 | 0.043 | -0.007 | 0.003 | 0.006 |
@@ -250,11 +250,11 @@ The scene, room and mic columns show the change in pitch F1 when that factor is 
 ### Pitch accuracy
 
 | Tracker | <10c ↑ | <25c ↑ | <50c ↑ | <200c ↑ | Octave up ↓ | Octave down ↓ |
-|---|---|---|---|---|---|---|
-| SwiftF0 | 68.1 | **85.1** | **91.7** | 95.6 | 0.33 | 0.43 |
+|---|---:|---:|---:|---:|---:|---:|
+| SwiftF0 | 67.7 | **84.8** | **91.4** | 95.6 | 0.34 | 0.42 |
 | RMVPE | **68.5** | 83.3 | 89.8 | 94.6 | 0.76 | 0.52 |
 | FCPE | 66.0 | 82.1 | 89.3 | 94.8 | 0.73 | 1.02 |
-| TorchCREPE | 46.4 | 80.8 | 91.4 | **96.6** | 0.97 | **0.18** |
+| TorchCREPE | 46.4 | 80.8 | **91.4** | **96.6** | 0.97 | **0.18** |
 | CREPE | 63.9 | 81.4 | 88.6 | 93.6 | 1.53 | 0.37 |
 | PESTO | 38.3 | 71.3 | 81.5 | 87.7 | 3.39 | 0.80 |
 | SHS | 58.7 | 79.0 | 85.9 | 91.5 | 1.43 | 1.65 |
@@ -282,7 +282,7 @@ Frame alignment and runtime do not contribute to the overall score.
 ### Frame alignment (chirp probe, ms)
 
 | Tracker | Worst measured alignment error (ms) ↓ |
-|---|---|
+|---|---:|
 | Praat | **0.01** |
 | DIO | 0.05 |
 | RAPT | 0.18 |
@@ -307,28 +307,28 @@ Largest absolute time offset measured across chirp bands. A larger offset (for e
 
 ### Speed
 
-| Tracker | Speed (× real time) ↑ |
-|---|---|
-| Praat | **2182.4** |
-| RAPT | 1148.2 |
-| SPICE | 469.1 |
-| SHS | 463.7 |
-| SwiftF0 | 416.6 |
-| BasicPitch | 177.0 |
-| DIO | 131.4 |
-| REAPER (crashed) | 67.7 |
-| SWIPE | 50.4 |
-| RMVPE | 50.0 |
-| FCPE | 49.6 |
-| YAAPT | 47.9 |
-| PESTO | 33.2 |
-| PENN | 20.2 |
-| HarmoF0 | 12.0 |
-| Harvest | 11.1 |
-| pYIN | 10.5 |
-| CREPE | 2.7 |
-| TorchCREPE | 2.2 |
+| Tracker | Speed (× real time, one core) ↑ |
+|---|---:|
+| RAPT | **1276.6** ± 14.8 |
+| SHS | 1080.3 ± 9.1 |
+| Praat | 525.3 ± 17.9 |
+| DIO | 211.9 ± 11.5 |
+| SwiftF0 | 179.6 ± 6.7 |
+| SPICE | 86.2 ± 2.7 |
+| REAPER (crashed) | 68.7 ± 0.7 |
+| BasicPitch | 59.7 ± 0.7 |
+| YAAPT | 50.5 ± 0.4 |
+| SWIPE | 50.3 ± 0.2 |
+| FCPE | 27.8 ± 3.2 |
+| PESTO | 20.0 ± 0.1 |
+| Harvest | 18.4 ± 0.4 |
+| RMVPE | 13.6 ± 0.8 |
+| pYIN | 9.6 ± 0.6 |
+| PENN | 4.7 ± 0.1 |
+| HarmoF0 | 4.1 ± 0.1 |
+| CREPE | 0.4 ± 0.0 |
+| TorchCREPE | 0.4 ± 0.0 |
 
-Audio duration divided by median processing time after warm-up: 20× means 20 seconds of audio processed per second. Speed is measured separately by [speed.py](speed.py), including for trackers with incomplete accuracy results. CPU: AMD Ryzen 9 8945HS w/ Radeon 780M Graphics.
+Audio duration divided by the median CPU time over five rounds: 20× means 20 seconds of audio processed per second of CPU time. Every tracker runs pinned to one CPU core, with the thread limits set to 1, after a warm-up, and the order of the trackers is shuffled in each round. The value after ± is the standard deviation over the rounds. A tracker without five successful rounds shows -. CREPE also waited for its own threads, so its wall-clock time on one core is longer. Speed is measured separately by [speed.py](speed.py), including for trackers with incomplete accuracy results. CPU: AMD Ryzen 9 8945HS w/ Radeon 780M Graphics.
 
 <!-- /report -->

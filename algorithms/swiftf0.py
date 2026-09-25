@@ -1,3 +1,5 @@
+import os
+
 from swift_f0 import SAMPLE_RATE, SwiftF0
 
 from .base import ContinuousPitchAlgorithm, resample_audio
@@ -6,7 +8,7 @@ from .base import ContinuousPitchAlgorithm, resample_audio
 class SwiftF0PitchAlgorithm(ContinuousPitchAlgorithm):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.detector = SwiftF0()
+        self.detector = SwiftF0(threads=1 if os.environ.get("OMP_NUM_THREADS") == "1" else None)
 
     def _extract_raw_pitch_and_periodicity(self, audio):
         audio = resample_audio(audio, self.sample_rate, SAMPLE_RATE)

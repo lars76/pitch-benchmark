@@ -948,7 +948,7 @@ wheels = [
 
 [[package]]
 name = "pitch-benchmark"
-version = "2.0.0"
+version = "2.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "librosa" },
@@ -1036,7 +1036,7 @@ requires-dist = [
     { name = "pyworld", marker = "extra == 'harvest'" },
     { name = "setuptools", specifier = "<81" },
     { name = "soundfile" },
-    { name = "swift-f0", marker = "extra == 'swiftf0'", specifier = ">=0.2.0" },
+    { name = "swift-f0", marker = "extra == 'swiftf0'", specifier = ">=0.3.0" },
     { name = "tensorflow", marker = "extra == 'crepe'", specifier = ">=2.19" },
     { name = "tensorflow", marker = "extra == 'spice'", specifier = ">=2.19" },
     { name = "tensorflow-hub", marker = "extra == 'spice'" },
@@ -1353,15 +1353,15 @@ wheels = [
 
 [[package]]
 name = "swift-f0"
-version = "0.2.0"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "onnxruntime" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bd/28/248db7e03c889b68e491a75bf66df7e1fcb3bef746f4ef61dd54b36587c7/swift_f0-0.2.0.tar.gz", hash = "sha256:79f2f4fa9656d4f3ce45216e483e3bfe4a19f538fb004bfc6cf674905172945d", size = 120570, upload-time = "2026-09-19T11:32:58.314Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ee/9d/bd55c39bb34c5c2bb1277e7ec6f4a969eabbf02488fa3c1f756623fa76f4/swift_f0-0.3.0.tar.gz", hash = "sha256:e3abfc52cad6a7bb738660f8e93831f9084c22301ed59d541c2d16dac7a2c1ce", size = 119608, upload-time = "2026-09-25T15:36:27.153Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/97/cb/ea55de59a0e19bb61e1f9c0c1136d47b3c5620d73cded422893308720bd4/swift_f0-0.2.0-py3-none-any.whl", hash = "sha256:449e0288996276b480885d997f9c9e3eada3e40a01e5a8384870d0ca93c579e8", size = 117920, upload-time = "2026-09-19T11:32:56.778Z" },
+    { url = "https://files.pythonhosted.org/packages/07/21/ac6c76119a776e4281da61e22828f992bb2e34b74edfcd3987dca97a6180/swift_f0-0.3.0-py3-none-any.whl", hash = "sha256:d7240c7c94b1d3e8f0e0cd2701b79be89a0f23a19cd5f944895a6518ecad72f3", size = 116429, upload-time = "2026-09-25T15:36:25.761Z" },
 ]
 
 [[package]]

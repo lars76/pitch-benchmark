@@ -192,9 +192,19 @@ def load_speed_cells(cells_dir):
 
 
 def speed_factor(cell):
-    if not cell["results"]["run_ms"]:
+    results = cell["results"]
+    if results["error"] or len(results["run_ms"]) < cell["parameters"]["rounds"]:
         return None
     return cell["parameters"]["signal_seconds"] * 1e3 / float(np.median(cell["results"]["run_ms"]))
+
+
+def speed_sd(cell):
+    return float(np.std(cell["parameters"]["signal_seconds"] * 1e3 / np.array(cell["results"]["run_ms"]), ddof=1))
+
+
+def cpu_per_wall(cell):
+    results = cell["results"]
+    return float(np.median(np.array(results["run_ms"]) / np.array(results["wall_ms"])))
 
 
 def load_cells(cells_dir):

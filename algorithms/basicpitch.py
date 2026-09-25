@@ -22,7 +22,15 @@ class BasicPitchPitchAlgorithm(ContinuousPitchAlgorithm):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.model = Model(build_icassp_2022_model_path(FilenameSuffix.onnx))
+        model_path = build_icassp_2022_model_path(FilenameSuffix.onnx)
+        self.model = Model(model_path)
+        if os.environ.get("OMP_NUM_THREADS") == "1":
+            import onnxruntime as ort
+
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 1
+            options.inter_op_num_threads = 1
+            self.model.model = ort.InferenceSession(str(model_path), options, providers=["CPUExecutionProvider"])
 
     def _extract_raw_pitch_and_periodicity(self, audio):
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
