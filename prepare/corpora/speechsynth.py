@@ -213,11 +213,10 @@ class PitchDatasetSpeechSynth(PitchDataset):
 
         try:
             self.vocoder = torch.hub.load(
-                "lars76/bigvgan-mirror",
-                state_dict.get("vocoder_name", "hifigan_universal_v1"),
+                "lars76/minimal-vocoders",
+                "vocoder",
+                name=state_dict.get("vocoder_name", "hifigan_universal_v1"),
                 trust_repo=True,
-                pretrained=True,
-                verbose=False,
             ).to(self.device)
         except Exception as e:
             raise RuntimeError(f"Error loading vocoder: {e!s}") from e
